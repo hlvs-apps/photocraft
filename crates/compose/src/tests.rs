@@ -4347,3 +4347,163 @@ fn branchless_floor_matches_floor_bitwise() {
         assert_eq!(branchless_floor(x).to_bits(), x.floor().to_bits(), "{x:e} ({:#010x})", x.to_bits());
     }
 }
+
+#[test]
+fn controlled_composite_matches_existing_rgb_cmyk_and_lab_paths() {
+    let options = RenderOptions { max_pixels: 1 << 20, max_layers: 20, max_effect_bytes: 16 << 20, max_mask_bytes: 128 << 20 };
+    for mode in [ColorMode::Rgb, ColorMode::Cmyk, ColorMode::Lab] {
+        for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+            let mut doc = Document::with_background("controlled", Size::new(300, 270), mode, depth, Color::WHITE);
+            doc.layers.push(Layer::new("levels", LayerContent::Adjustment(Adjustment::identity_levels())));
+            let expected = flatten(&doc);
+            assert_eq!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::NONE).unwrap().px, expected.px);
+            assert!(matches!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::cancel_only(&|| true)), Err(RenderError::Cancelled)));
+        }
+    }
+}
+
+#[test]
+fn controlled_composite_refuses_budgets_as_errors() {
+    let doc = fx_doc(vec![Effect::DropShadow(shadow(5.0, 90.0))]);
+    for options in [
+        RenderOptions { max_pixels: 0, max_layers: 20, max_effect_bytes: u64::MAX, max_mask_bytes: 128 << 20 },
+        RenderOptions { max_pixels: 1 << 20, max_layers: 0, max_effect_bytes: u64::MAX, max_mask_bytes: 128 << 20 },
+        RenderOptions { max_pixels: 1 << 20, max_layers: 20, max_effect_bytes: 0, max_mask_bytes: 128 << 20 },
+    ] {
+        assert!(matches!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::NONE), Err(RenderError::LimitExceeded(_))));
+    }
+}
+
+#[test]
+fn cancelled_composite_returns_no_image_and_does_not_poison_effect_cache() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let doc = fx_doc(vec![Effect::DropShadow(shadow(5.0, 90.0))]);
+    let options = RenderOptions { max_pixels: 1 << 20, max_layers: 20, max_effect_bytes: 16 << 20, max_mask_bytes: 128 << 20 };
+    let expected = flatten(&doc);
+    purge_effect_cache();
+    let count = AtomicUsize::new(0);
+    let count_checks = || {
+        count.fetch_add(1, Ordering::Relaxed);
+        false
+    };
+    flatten_with(&doc, &options, &photocraft_raster::Interrupt::cancel_only(&count_checks)).unwrap();
+    let total = count.load(Ordering::Relaxed);
+    for after in [0, total / 4, total / 2, total - 1] {
+        purge_effect_cache();
+        let checks = AtomicUsize::new(0);
+        let cancel = || checks.fetch_add(1, Ordering::Relaxed) >= after;
+        assert!(matches!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::cancel_only(&cancel)), Err(RenderError::Cancelled)));
+        assert_eq!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::NONE).unwrap().px, expected.px);
+    }
+}
+
+#[test]
+fn controlled_composite_reports_checkpoint_latency() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut doc = doc_white(4000, 6000);
+    doc.layers.push(Layer::new("levels", LayerContent::Adjustment(Adjustment::identity_levels())));
+    let options = RenderOptions { max_pixels: 24_000_000, max_layers: 20, max_effect_bytes: 128 << 20, max_mask_bytes: 128 << 20 };
+    let checks = AtomicUsize::new(0);
+    let flipped = std::sync::Mutex::new(None);
+    let cancel = || {
+        let n = checks.fetch_add(1, Ordering::Relaxed);
+        if n == 20 {
+            *flipped.lock().unwrap() = Some(std::time::Instant::now());
+        }
+        n > 20
+    };
+    assert!(matches!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::cancel_only(&cancel)), Err(RenderError::Cancelled)));
+    eprintln!("24 MP compose cancellation-to-return (after a false checkpoint): {:?}", flipped.lock().unwrap().unwrap().elapsed());
+}
+
+#[test]
+fn controlled_effect_map_reports_checkpoint_latency() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut doc = doc_white(1000, 1000);
+    doc.layers[0].effects.items.push(Effect::DropShadow(shadow(20.0, 90.0)));
+    let options = RenderOptions { max_pixels: 1_000_000, max_layers: 10, max_effect_bytes: 128 << 20, max_mask_bytes: 128 << 20 };
+    purge_effect_cache();
+    let checks = AtomicUsize::new(0);
+    let flipped = std::sync::Mutex::new(None);
+    let cancel = || {
+        let n = checks.fetch_add(1, Ordering::Relaxed);
+        if n == 6 {
+            *flipped.lock().unwrap() = Some(std::time::Instant::now());
+        }
+        n > 6
+    };
+    assert!(matches!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::cancel_only(&cancel)), Err(RenderError::Cancelled)));
+    eprintln!("1 MP shadow effect-map cancellation-to-return (after a false checkpoint): {:?}", flipped.lock().unwrap().unwrap().elapsed());
+}
+
+#[test]
+fn controlled_composite_counts_effects_below_preparation_depth() {
+    let mut doc = fx_doc(vec![Effect::DropShadow(shadow(5.0, 90.0))]);
+    for _ in 0..=crate::ctx::PREPARE_DEPTH {
+        doc.layers = vec![Layer::group("nested", std::mem::take(&mut doc.layers))];
+    }
+    let options = RenderOptions { max_pixels: 1 << 20, max_layers: 200, max_effect_bytes: 0, max_mask_bytes: 128 << 20 };
+    assert!(matches!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::NONE), Err(RenderError::LimitExceeded("effect maps"))));
+}
+
+#[test]
+fn controlled_composite_checks_depth_before_recursive_effect_bounds() {
+    let mut doc = doc_white(1, 1);
+    for _ in 0..=photocraft_doc::MAX_GROUP_DEPTH {
+        doc.layers = vec![Layer::group("nested", std::mem::take(&mut doc.layers))];
+    }
+    doc.layers[0].effects.items.push(Effect::DropShadow(shadow(5.0, 90.0)));
+    let options = RenderOptions { max_pixels: 1, max_layers: 200, max_effect_bytes: u64::MAX, max_mask_bytes: 128 << 20 };
+    assert!(matches!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::NONE), Err(RenderError::LimitExceeded("group depth"))));
+}
+
+#[test]
+fn controlled_feather_mask_matches_and_cancels_without_cached_partial_mask() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut doc = doc_white(300, 270);
+    let mut mask = LayerMask::hide_all();
+    mask.feather = 8.0;
+    mask.surface.fill_rect(Rect::new(10, 10, 200, 200), &[1.0]);
+    doc.layers[0].mask = Some(mask);
+    let mut options = RenderOptions { max_pixels: 100_000, max_layers: 10, max_effect_bytes: 0, max_mask_bytes: 4 << 20 };
+    let expected = flatten(&doc);
+    assert_eq!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::NONE).unwrap().px, expected.px);
+    let checks = AtomicUsize::new(0);
+    let flipped = std::sync::Mutex::new(None);
+    let cancel = || {
+        let n = checks.fetch_add(1, Ordering::Relaxed);
+        if n == 20 {
+            *flipped.lock().unwrap() = Some(std::time::Instant::now());
+        }
+        n > 20
+    };
+    assert!(matches!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::cancel_only(&cancel)), Err(RenderError::Cancelled)));
+    eprintln!("81k pixel feather-mask checkpoint cancellation-to-return: {:?}", flipped.lock().unwrap().unwrap().elapsed());
+    assert_eq!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::NONE).unwrap().px, expected.px);
+    options.max_mask_bytes = 0;
+    assert!(matches!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::NONE), Err(RenderError::LimitExceeded("feather masks"))));
+}
+
+#[test]
+fn controlled_feathers_keep_effect_hiding_mask_variants() {
+    use photocraft_doc::vector::{Path, Subpath, VectorMask};
+    let mut doc = doc_white(64, 64);
+    let mut layer = solid_layer("masked", Rect::new(0, 0, 64, 64), [0.0, 0.0, 0.0, 1.0]);
+    let mut pixel = LayerMask::hide_all();
+    pixel.feather = 5.0;
+    pixel.surface.fill_rect(Rect::new(0, 0, 40, 64), &[1.0]);
+    layer.mask = Some(pixel);
+    let mut vector = VectorMask::new(Path::new(vec![Subpath::polygon(&[(8.0, 8.0), (60.0, 8.0), (60.0, 60.0), (8.0, 60.0)])]));
+    vector.feather = 3.0;
+    layer.vector_mask = Some(vector);
+    layer.effects.items.push(Effect::DropShadow(shadow(5.0, 90.0)));
+    doc.layers.push(layer);
+    let options = RenderOptions { max_pixels: 10_000, max_layers: 10, max_effect_bytes: 4 << 20, max_mask_bytes: 4 << 20 };
+    for (pixel, vector) in [(false, true), (true, false), (true, true)] {
+        doc.layers[1].advanced.layer_mask_hides_effects = pixel;
+        doc.layers[1].advanced.vector_mask_hides_effects = vector;
+        let expected = flatten(&doc);
+        purge_effect_cache();
+        assert_eq!(flatten_with(&doc, &options, &photocraft_raster::Interrupt::NONE).unwrap().px, expected.px);
+    }
+}

@@ -79,8 +79,8 @@ use render::in_blend_space;
 use render::render_tiled_with;
 pub(crate) use render::visible_layers;
 pub use render::{
-    BAND_PIXELS, MAX_RENDER_PIXELS, band_rows_for, cmyk_space, composite_to_surface, flatten, flatten_to_surface, render, render_bands, render_layer,
-    render_layer_in, render_tiled,
+    BAND_PIXELS, MAX_RENDER_PIXELS, RenderError, RenderOptions, band_rows_for, cmyk_space, composite_to_surface, flatten, flatten_to_surface, flatten_with,
+    render, render_bands, render_layer, render_layer_in, render_tiled, render_with,
 };
 
 /// Straight-alpha RGBA float buffer covering a rectangle.

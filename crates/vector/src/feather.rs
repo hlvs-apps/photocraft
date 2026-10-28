@@ -174,17 +174,36 @@ pub fn gaussian(v: &mut [f32], w: usize, h: usize, sigma: f32) {
 
 /// Allocation-light reference path used if parallel transpose storage cannot be reserved.
 fn gaussian_sequential(v: &mut [f32], w: usize, h: usize, pass: BoxPass) {
+    let _ = gaussian_sequential_with(v, w, h, pass, &photocraft_raster::Interrupt::NONE);
+}
+
+/// Cancellable feather blur with identical arithmetic, checking between rows and columns.
+/// Runs on the calling thread, without creating an additional worker pool.
+/// On cancellation the input may be partially blurred and must be discarded.
+/// Like `gaussian`, invalid dimensions, nonpositive sigma, or scratch allocation
+/// refusal leave the input unchanged; allocation refusal is not cancellation.
+pub fn gaussian_with(v: &mut [f32], w: usize, h: usize, sigma: f32, ctl: &photocraft_raster::Interrupt) -> Result<(), photocraft_raster::Cancelled> {
+    ctl.check()?;
+    if w == 0 || h == 0 || v.len() != w.saturating_mul(h) {
+        return Ok(());
+    }
+    let Some(pass) = BoxPass::for_sigma(sigma) else { return Ok(()) };
+    gaussian_sequential_with(v, w, h, pass, ctl)
+}
+
+fn gaussian_sequential_with(v: &mut [f32], w: usize, h: usize, pass: BoxPass, ctl: &photocraft_raster::Interrupt) -> Result<(), photocraft_raster::Cancelled> {
     let mut line = Vec::new();
     let mut scratch = Vec::new();
     let len = w.max(h);
     if line.try_reserve_exact(len).is_err() || scratch.try_reserve_exact(len).is_err() {
-        return;
+        return Ok(());
     }
     line.resize(len, 0.0);
     scratch.resize(len, 0.0);
     for axis in [false, true] {
         let (lines, line_len) = if axis { (w, h) } else { (h, w) };
         for k in 0..lines {
+            ctl.check()?;
             for i in 0..line_len {
                 line[i] = if axis { v[i * w + k] } else { v[k * w + i] };
             }
@@ -200,11 +219,26 @@ fn gaussian_sequential(v: &mut [f32], w: usize, h: usize, pass: BoxPass) {
             }
         }
     }
+    ctl.check()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controlled_gaussian_matches_and_cancels() {
+        let (w, h) = (320, 256);
+        let source: Vec<f32> = (0..w * h).map(|i| (i % 97) as f32 / 97.0).collect();
+        let mut expected = source.clone();
+        gaussian(&mut expected, w, h, 13.0);
+        let mut actual = source.clone();
+        gaussian_with(&mut actual, w, h, 13.0, &photocraft_raster::Interrupt::NONE).unwrap();
+        assert_eq!(expected, actual);
+        let mut cancelled = source.clone();
+        assert!(gaussian_with(&mut cancelled, w, h, 13.0, &photocraft_raster::Interrupt::cancel_only(&|| true)).is_err());
+        assert_eq!(cancelled, source);
+    }
 
     /// Three passes have the variance sigma² exactly, for whole and fractional sigmas alike (whole
     /// boxes rounded a 6 px feather to 6.48 and a 3 px one to 3.46).
