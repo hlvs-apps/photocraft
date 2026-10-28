@@ -39,16 +39,22 @@ impl ser::Error for Problem {
 /// `Ok(())` when every float in `value`'s serialized form is finite; otherwise the path of the
 /// first one that is not.
 pub fn check<T: Serialize + ?Sized>(value: &T) -> Result<(), Problem> {
-    value.serialize(Check { path: String::new() })
+    check_with(value, &photocraft_raster::Interrupt::NONE)
 }
 
-struct Check {
+pub(crate) fn check_with<T: Serialize + ?Sized>(value: &T, ctl: &photocraft_raster::Interrupt) -> Result<(), Problem> {
+    ctl.check().map_err(|_| Problem::Other("cancelled".into()))?;
+    value.serialize(Check { path: String::new(), ctl: *ctl })
+}
+
+struct Check<'a> {
+    ctl: photocraft_raster::Interrupt<'a>,
     path: String,
 }
 
-impl Check {
-    fn at(&self, seg: fmt::Arguments<'_>) -> Check {
-        Check { path: format!("{}{}", self.path, seg) }
+impl Check<'_> {
+    fn at(&self, seg: fmt::Arguments<'_>) -> Check<'_> {
+        Check { ctl: self.ctl, path: format!("{}{}", self.path, seg) }
     }
     fn float(self, finite: bool) -> Result<(), Problem> {
         if finite { Ok(()) } else { Err(Problem::NonFinite { path: self.path.trim_start_matches('.').to_owned() }) }
@@ -57,16 +63,16 @@ impl Check {
 
 type R = Result<(), Problem>;
 
-impl ser::Serializer for Check {
+impl<'a> ser::Serializer for Check<'a> {
     type Ok = ();
     type Error = Problem;
-    type SerializeSeq = Seq;
-    type SerializeTuple = Seq;
-    type SerializeTupleStruct = Seq;
-    type SerializeTupleVariant = Seq;
-    type SerializeMap = Map;
-    type SerializeStruct = Struct;
-    type SerializeStructVariant = Struct;
+    type SerializeSeq = Seq<'a>;
+    type SerializeTuple = Seq<'a>;
+    type SerializeTupleStruct = Seq<'a>;
+    type SerializeTupleVariant = Seq<'a>;
+    type SerializeMap = Map<'a>;
+    type SerializeStruct = Struct<'a>;
+    type SerializeStructVariant = Struct<'a>;
 
     fn serialize_bool(self, _: bool) -> R {
         Ok(())
@@ -137,43 +143,45 @@ impl ser::Serializer for Check {
     fn serialize_newtype_variant<T: Serialize + ?Sized>(self, _: &'static str, _: u32, variant: &'static str, v: &T) -> R {
         v.serialize(self.at(format_args!(".{variant}")))
     }
-    fn serialize_seq(self, _: Option<usize>) -> Result<Seq, Problem> {
-        Ok(Seq { path: self.path, i: 0 })
+    fn serialize_seq(self, _: Option<usize>) -> Result<Seq<'a>, Problem> {
+        Ok(Seq { ctl: self.ctl, path: self.path, i: 0 })
     }
-    fn serialize_tuple(self, _: usize) -> Result<Seq, Problem> {
-        Ok(Seq { path: self.path, i: 0 })
+    fn serialize_tuple(self, _: usize) -> Result<Seq<'a>, Problem> {
+        Ok(Seq { ctl: self.ctl, path: self.path, i: 0 })
     }
-    fn serialize_tuple_struct(self, _: &'static str, _: usize) -> Result<Seq, Problem> {
-        Ok(Seq { path: self.path, i: 0 })
+    fn serialize_tuple_struct(self, _: &'static str, _: usize) -> Result<Seq<'a>, Problem> {
+        Ok(Seq { ctl: self.ctl, path: self.path, i: 0 })
     }
-    fn serialize_tuple_variant(self, _: &'static str, _: u32, variant: &'static str, _: usize) -> Result<Seq, Problem> {
-        Ok(Seq { path: format!("{}.{variant}", self.path), i: 0 })
+    fn serialize_tuple_variant(self, _: &'static str, _: u32, variant: &'static str, _: usize) -> Result<Seq<'a>, Problem> {
+        Ok(Seq { ctl: self.ctl, path: format!("{}.{variant}", self.path), i: 0 })
     }
-    fn serialize_map(self, _: Option<usize>) -> Result<Map, Problem> {
-        Ok(Map { path: self.path, key: String::new() })
+    fn serialize_map(self, _: Option<usize>) -> Result<Map<'a>, Problem> {
+        Ok(Map { ctl: self.ctl, path: self.path, key: String::new() })
     }
-    fn serialize_struct(self, _: &'static str, _: usize) -> Result<Struct, Problem> {
-        Ok(Struct { path: self.path })
+    fn serialize_struct(self, _: &'static str, _: usize) -> Result<Struct<'a>, Problem> {
+        Ok(Struct { ctl: self.ctl, path: self.path })
     }
-    fn serialize_struct_variant(self, _: &'static str, _: u32, variant: &'static str, _: usize) -> Result<Struct, Problem> {
-        Ok(Struct { path: format!("{}.{variant}", self.path) })
+    fn serialize_struct_variant(self, _: &'static str, _: u32, variant: &'static str, _: usize) -> Result<Struct<'a>, Problem> {
+        Ok(Struct { ctl: self.ctl, path: format!("{}.{variant}", self.path) })
     }
 }
 
-struct Seq {
+struct Seq<'a> {
+    ctl: photocraft_raster::Interrupt<'a>,
     path: String,
     i: usize,
 }
 
-impl Seq {
+impl Seq<'_> {
     fn next<T: Serialize + ?Sized>(&mut self, v: &T) -> R {
-        let c = Check { path: format!("{}[{}]", self.path, self.i) };
+        self.ctl.check().map_err(|_| Problem::Other("cancelled".into()))?;
+        let c = Check { ctl: self.ctl, path: format!("{}[{}]", self.path, self.i) };
         self.i += 1;
         v.serialize(c)
     }
 }
 
-impl ser::SerializeSeq for Seq {
+impl<'a> ser::SerializeSeq for Seq<'a> {
     type Ok = ();
     type Error = Problem;
     fn serialize_element<T: Serialize + ?Sized>(&mut self, v: &T) -> R {
@@ -184,7 +192,7 @@ impl ser::SerializeSeq for Seq {
     }
 }
 
-impl ser::SerializeTuple for Seq {
+impl<'a> ser::SerializeTuple for Seq<'a> {
     type Ok = ();
     type Error = Problem;
     fn serialize_element<T: Serialize + ?Sized>(&mut self, v: &T) -> R {
@@ -195,7 +203,7 @@ impl ser::SerializeTuple for Seq {
     }
 }
 
-impl ser::SerializeTupleStruct for Seq {
+impl<'a> ser::SerializeTupleStruct for Seq<'a> {
     type Ok = ();
     type Error = Problem;
     fn serialize_field<T: Serialize + ?Sized>(&mut self, v: &T) -> R {
@@ -206,7 +214,7 @@ impl ser::SerializeTupleStruct for Seq {
     }
 }
 
-impl ser::SerializeTupleVariant for Seq {
+impl<'a> ser::SerializeTupleVariant for Seq<'a> {
     type Ok = ();
     type Error = Problem;
     fn serialize_field<T: Serialize + ?Sized>(&mut self, v: &T) -> R {
@@ -217,39 +225,43 @@ impl ser::SerializeTupleVariant for Seq {
     }
 }
 
-struct Map {
+struct Map<'a> {
+    ctl: photocraft_raster::Interrupt<'a>,
     path: String,
     key: String,
 }
 
-impl ser::SerializeMap for Map {
+impl<'a> ser::SerializeMap for Map<'a> {
     type Ok = ();
     type Error = Problem;
     fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> R {
+        self.ctl.check().map_err(|_| Problem::Other("cancelled".into()))?;
         // Keys are checked like any value; their text (when they have one) names the entry.
-        key.serialize(Check { path: format!("{}.<key>", self.path) })?;
+        key.serialize(Check { ctl: self.ctl, path: format!("{}.<key>", self.path) })?;
         self.key = serde_json::to_string(key).map_or_else(|_| "?".to_owned(), |k| k.trim_matches('"').to_owned());
         Ok(())
     }
     fn serialize_value<T: Serialize + ?Sized>(&mut self, v: &T) -> R {
-        v.serialize(Check { path: format!("{}.{}", self.path, self.key) })
+        v.serialize(Check { ctl: self.ctl, path: format!("{}.{}", self.path, self.key) })
     }
     fn end(self) -> R {
         Ok(())
     }
 }
 
-struct Struct {
+struct Struct<'a> {
+    ctl: photocraft_raster::Interrupt<'a>,
     path: String,
 }
 
-impl Struct {
+impl Struct<'_> {
     fn field<T: Serialize + ?Sized>(&mut self, key: &'static str, v: &T) -> R {
-        v.serialize(Check { path: format!("{}.{key}", self.path) })
+        self.ctl.check().map_err(|_| Problem::Other("cancelled".into()))?;
+        v.serialize(Check { ctl: self.ctl, path: format!("{}.{key}", self.path) })
     }
 }
 
-impl ser::SerializeStruct for Struct {
+impl<'a> ser::SerializeStruct for Struct<'a> {
     type Ok = ();
     type Error = Problem;
     fn serialize_field<T: Serialize + ?Sized>(&mut self, key: &'static str, v: &T) -> R {
@@ -260,7 +272,7 @@ impl ser::SerializeStruct for Struct {
     }
 }
 
-impl ser::SerializeStructVariant for Struct {
+impl<'a> ser::SerializeStructVariant for Struct<'a> {
     type Ok = ();
     type Error = Problem;
     fn serialize_field<T: Serialize + ?Sized>(&mut self, key: &'static str, v: &T) -> R {
@@ -275,6 +287,14 @@ impl ser::SerializeStructVariant for Struct {
 mod tests {
     use super::*;
     use serde::Serialize;
+
+    #[test]
+    fn manifest_validation_checks_interrupt_between_values() {
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        let cancel = || count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 8;
+        let data = vec![1.0f32; 100_000];
+        assert!(matches!(check_with(&data, &photocraft_raster::Interrupt::cancel_only(&cancel)), Err(Problem::Other(m)) if m == "cancelled"));
+    }
 
     #[derive(Serialize)]
     struct Inner {
