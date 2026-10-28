@@ -87,6 +87,20 @@ pub fn plane_to_u8(bytes: &[u8], depth: u16, width: usize, height: usize) -> Res
     })
 }
 
+/// Convert samples cooperatively, including bitmap row expansion.
+pub fn plane_to_u8_with(bytes: &[u8], depth: u16, width: usize, height: usize, ctl: &crate::ReadControl) -> Result<Vec<u8>> {
+    ctl.check_layout(&crate::PlaneLayout { planes: 1, width, height, depth: 8, version: Version::Psd })?;
+    let row_bytes = crate::header::row_bytes(width, depth);
+    let mut out = try_buffer(width.checked_mul(height).ok_or(PsdError::LimitExceeded("plane size overflow"))?)?;
+    for row in 0..height {
+        ctl.check()?;
+        let start = row.checked_mul(row_bytes).ok_or(PsdError::LimitExceeded("plane size overflow"))?;
+        let bytes = bytes.get(start..start.saturating_add(row_bytes)).ok_or_else(|| PsdError::invalid("channel size mismatch"))?;
+        out.extend(plane_to_u8(bytes, depth, width, 1)?);
+    }
+    Ok(out)
+}
+
 /// An 8-bit RGBA image positioned in document coordinates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RgbaImage {
@@ -317,6 +331,12 @@ impl PsdFile {
     /// extra channel when [`PsdFile::merged_has_alpha`] is true. Removes the
     /// white matte from RGB composites before reducing precision.
     pub fn composite_rgba8(&self) -> Result<RgbaImage> {
+        self.composite_rgba8_with(&crate::ReadControl::default())
+    }
+
+    /// Extract RGBA8 with cancellation between rows and bounded conversion chunks.
+    pub fn composite_rgba8_with(&self, ctl: &crate::ReadControl) -> Result<RgbaImage> {
+        ctl.check()?;
         let h = &self.header;
         h.validate()?;
         let (w, hh) = (h.width as usize, h.height as usize);
@@ -325,11 +345,13 @@ impl PsdFile {
         if n.checked_mul(4).is_none_or(|len| len as u64 > crate::compression::MAX_DECODED_BYTES) {
             return Err(PsdError::LimitExceeded("RGBA output exceeds MAX_DECODED_BYTES"));
         }
+        ctl.check_layout(&crate::PlaneLayout { planes: 4, width: w, height: hh, depth: 8, version: h.version })?;
         let cc = color_channel_count(h.color_mode)?;
         if usize::from(h.channels) < cc {
             return Err(PsdError::invalid("fewer channels than the color mode requires"));
         }
-        let all = self.decode_merged()?;
+        let layout = crate::image_data::ImageData::layout(h);
+        let all = crate::compression::decode_planes_with(self.image_data.compression, &self.image_data.encoded()?, &layout, ctl)?;
         let plane = h.row_bytes().checked_mul(hh).ok_or(PsdError::LimitExceeded("plane size overflow"))?;
         let alpha_bytes = if self.merged_has_alpha() {
             Some(all.get(cc * plane..(cc + 1) * plane).ok_or_else(|| PsdError::invalid("alpha channel size mismatch"))?)
@@ -338,7 +360,7 @@ impl PsdFile {
         };
         let get = |i: usize| -> Result<Cow<'_, [u8]>> {
             let bytes = all.get(i * plane..(i + 1) * plane).ok_or_else(|| PsdError::invalid("channel size mismatch"))?;
-            if h.depth == 8 { Ok(Cow::Borrowed(bytes)) } else { plane_to_u8(bytes, h.depth, w, hh).map(Cow::Owned) }
+            if h.depth == 8 { Ok(Cow::Borrowed(bytes)) } else { plane_to_u8_with(bytes, h.depth, w, hh, ctl).map(Cow::Owned) }
         };
         let mut color = Vec::with_capacity(cc);
         for i in 0..cc {
@@ -348,17 +370,38 @@ impl PsdFile {
                     && let Some(alpha) = alpha_bytes
                 {
                     let bytes = all.get(i * plane..(i + 1) * plane).ok_or_else(|| PsdError::invalid("channel size mismatch"))?;
-                    Cow::Owned(unmatte_to_u8(bytes, alpha, h.depth)?)
+                    Cow::Owned({
+                        let mut out = try_buffer(n)?;
+                        for (color, alpha) in bytes.chunks(64 << 10).zip(alpha.chunks(64 << 10)) {
+                            ctl.check()?;
+                            out.extend(unmatte_to_u8(color, alpha, h.depth)?);
+                        }
+                        out
+                    })
                 } else {
                     get(i)?
                 },
             );
         }
         let alpha = if self.merged_has_alpha() { Some(get(cc)?) } else { None };
-        let mut data = interleave(h.color_mode, &color, alpha.as_deref(), &self.color_mode_data, n)?;
+        let mut data = try_buffer(n * 4)?;
+        for row in 0..hh {
+            ctl.check()?;
+            let start = row * w;
+            let end = start + w;
+            let rows: Vec<_> = color
+                .iter()
+                .map(|plane| plane.get(start..end).map(Cow::Borrowed).ok_or_else(|| PsdError::invalid("channel size mismatch")))
+                .collect::<Result<_>>()?;
+            let alpha = alpha.as_deref().and_then(|plane| plane.get(start..end));
+            data.extend(interleave(h.color_mode, &rows, alpha, &self.color_mode_data, w)?);
+        }
         if h.color_mode == ColorMode::Rgb && h.depth == 8 && alpha.is_some() {
             let table = unmatte_u8_table();
-            for pixel in data.as_chunks_mut::<4>().0 {
+            for (i, pixel) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                if i.is_multiple_of(16384) {
+                    ctl.check()?;
+                }
                 let row = &table[usize::from(pixel[3])];
                 for c in pixel.iter_mut().take(3) {
                     *c = row[usize::from(*c)];

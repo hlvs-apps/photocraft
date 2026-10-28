@@ -383,6 +383,7 @@ fn import_psd(
     name: &str,
     ctl: &photocraft_raster::Interrupt,
     damaged: &mut bool,
+    limits: Option<photocraft_psd::LoadOptions>,
     parse: impl FnOnce(&dyn Fn(&PsdFile) -> bool, &dyn Fn(&PsdFile) -> bool) -> photocraft_psd::Result<(PsdFile, Option<photocraft_psd::Result<Vec<u8>>>)>,
 ) -> Result<ImportResult, IoError> {
     // A merged image the import reads is decoded with the parse: a ZIP one is inflated once.
@@ -391,6 +392,7 @@ fn import_psd(
     let (file, merged) =
         parse(&|f| psd_import::check_group_depth(f).is_ok() && psd_import::merged_needed(f), &psd_import::can_recover_layers).map_err(|e| match e {
             photocraft_psd::PsdError::Read(msg) => IoError::Read(msg),
+            photocraft_psd::PsdError::Cancelled => IoError::Cancelled,
             e => e.into(),
         })?;
     // Nesting past the document model's cap could never be saved; reject the file with the
@@ -400,7 +402,12 @@ fn import_psd(
     ctl.progress(0.05);
     // Read before the conversion, which moves the global blocks into the document.
     let txt2 = file.global_blocks.iter().find(|b| &b.key == b"Txt2").and_then(|b| photocraft_text::psd::parse_txt2(&b.data));
-    let (mut document, warnings, psd_damaged, read_error) = psd_import::psd_to_document_owned(file, ctl, merged).ok_or(IoError::Cancelled)?;
+    let (mut document, warnings, psd_damaged, read_error) = psd_import::psd_to_document_owned(file, ctl, merged, limits)
+        .map_err(|e| match e {
+            photocraft_psd::PsdError::Cancelled => IoError::Cancelled,
+            e => e.into(),
+        })?
+        .ok_or(IoError::Cancelled)?;
     // The file became unreadable while its layers were read from it (`import_file_for_open_with`):
     // the open fails, rather than opening with those layers empty.
     if let Some(e) = read_error {
@@ -441,7 +448,7 @@ pub fn import_file_for_open_with(
 pub fn import_source_for_open_with(name: &str, source: photocraft_psd::Source, ctl: &photocraft_raster::Interrupt) -> Result<(ImportResult, bool), IoError> {
     ctl.check().map_err(|_| IoError::Cancelled)?;
     let mut damaged = false;
-    let r = import_psd(name, ctl, &mut damaged, |want, recover| PsdFile::from_source_and_merged_recovering(source, want, recover))?;
+    let r = import_psd(name, ctl, &mut damaged, None, |want, recover| PsdFile::from_source_and_merged_recovering(source, want, recover))?;
     ctl.check().map_err(|_| IoError::Cancelled)?;
     ctl.progress(1.0);
     Ok((r, damaged))
@@ -451,6 +458,27 @@ pub fn import_source_for_open_with(name: &str, source: photocraft_psd::Source, c
 #[cfg(any(unix, windows))]
 pub fn import_file(name: &str, path: &std::path::Path, opts: &ImportOptions, ctl: &photocraft_raster::Interrupt) -> Result<ImportResult, IoError> {
     import_file_for_open_with(name, path, opts, ctl).map(|(result, _)| result)
+}
+
+/// Import PSD/PSB bytes under explicit parser/decode budgets and cancellation.
+///
+/// Pattern and smart-filter cache payloads share `max_auxiliary_bytes`; their source
+/// and padded layouts also obey pixel and per-decode limits. Declared layer and
+/// merged payloads use `max_total_decoded_bytes`. These are payload limits, not a
+/// process-memory quota. Native channel work uses the caller's Rayon pool.
+/// Metadata preparation runs between checks. Embedded-source size fallback remains
+/// subject to the flat codec's cancellation support.
+pub fn import_psd_with_limits(
+    name: &str,
+    bytes: &[u8],
+    limits: photocraft_psd::LoadOptions,
+    ctl: &photocraft_raster::Interrupt,
+) -> Result<ImportResult, IoError> {
+    let control = photocraft_psd::ReadControl { limits, cancelled: &|| ctl.cancelled() };
+    let mut damaged = false;
+    let result = import_psd(name, ctl, &mut damaged, Some(limits), |want, recover| PsdFile::from_bytes_controlled(bytes, want, recover, &control))?;
+    ctl.check().map_err(|_| IoError::Cancelled)?;
+    Ok(result)
 }
 
 /// Dispatches format-specific importers and propagates a structured PSD damage
@@ -464,7 +492,9 @@ fn import_stages(name: &str, bytes: &[u8], ctl: &photocraft_raster::Interrupt, o
     // Magic first: an Affinity file renamed .psd is still Affinity (#5258 corpus
     // preview_never_saves_back_to_its_native_or_renamed_source).
     if is_psd(bytes) {
-        return import_psd(name, ctl, damaged, |want, recover| PsdFile::from_bytes_and_merged_recovering(bytes, want, recover));
+        return import_psd(name, ctl, damaged, None, |want, recover| {
+            PsdFile::from_bytes_controlled(bytes, want, recover, &photocraft_psd::ReadControl { cancelled: &|| ctl.cancelled(), ..Default::default() })
+        });
     }
     if affinity::is_affinity(bytes) || affinity::has_extension(name) {
         return affinity::import(name, bytes);
@@ -497,7 +527,9 @@ fn import_stages(name: &str, bytes: &[u8], ctl: &photocraft_raster::Interrupt, o
     // A `.psd`/`.psb`/`.psdt` with no raster signature keeps the PSD error instead of
     // `codec: unrecognized image format` (#5258). Magic already returned above.
     if is_psd_input(name, bytes) {
-        return import_psd(name, ctl, damaged, |want, recover| PsdFile::from_bytes_and_merged_recovering(bytes, want, recover));
+        return import_psd(name, ctl, damaged, None, |want, recover| {
+            PsdFile::from_bytes_controlled(bytes, want, recover, &photocraft_psd::ReadControl { cancelled: &|| ctl.cancelled(), ..Default::default() })
+        });
     }
     flat::import_flat(name, bytes)
 }
@@ -731,6 +763,22 @@ pub fn merged_composite(file: &PsdFile) -> Result<Vec<[f32; 4]>, IoError> {
 mod tests {
     use super::{ImportOptions, import, import_for_open, is_psd_input, is_svg_input};
     use photocraft_psd::{Compression, Version, testgen};
+
+    #[test]
+    fn controlled_psd_import_returns_typed_cancellation_and_budget_errors() {
+        let bytes = testgen::small(Version::Psd, Compression::Zip).to_bytes().unwrap();
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        let cancel = || count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 10;
+        assert!(matches!(
+            super::import_psd_with_limits("test.psd", &bytes, Default::default(), &photocraft_raster::Interrupt::cancel_only(&cancel)),
+            Err(super::IoError::Cancelled)
+        ));
+        let limits = photocraft_psd::LoadOptions { max_total_decoded_bytes: 1, ..Default::default() };
+        assert!(matches!(
+            super::import_psd_with_limits("test.psd", &bytes, limits, &photocraft_raster::Interrupt::NONE),
+            Err(super::IoError::Psd(photocraft_psd::PsdError::LimitExceeded(_)))
+        ));
+    }
 
     /// Verifies a valid PSD remains editable after import.
     #[test]

@@ -1,6 +1,6 @@
 //! The top-level [`PsdFile`] model, parser and writer.
 
-use crate::compression::{Compression, MAX_DECODED_BYTES, decode_planes, put_widened_rle, rle_widening, validate_planes};
+use crate::compression::{Compression, MAX_DECODED_BYTES, put_widened_rle, rle_widening};
 use crate::error::{PsdError, Result};
 use crate::header::{ColorMode, Header, Version};
 use crate::image_data::ImageData;
@@ -133,8 +133,33 @@ impl PsdFile {
         want: impl FnOnce(&PsdFile) -> bool,
         recover: impl FnOnce(&PsdFile) -> bool,
     ) -> Result<(Self, Option<Result<Vec<u8>>>)> {
-        let mut r = Reader::new(data);
+        Self::from_bytes_controlled(data, want, recover, &crate::ReadControl::default())
+    }
+
+    /// Parse with caller budgets and cancellation, including merged-image validation.
+    ///
+    /// `want` selects whether to return the decoded merged pixels in the inner result;
+    /// `recover` permits ordinary merged-image damage when layers remain usable.
+    /// Cancellation and caller-budget refusal are fatal. All-default limits retain
+    /// legacy handling of opaque oversized merged data and malformed global layers.
+    /// Nondefault limits validate declared merged and layer layouts before decoding.
+    /// Metadata parsing and allocation run between cooperative checks; this is not
+    /// a hard deadline or a total process-memory quota.
+    pub fn from_bytes_controlled(
+        data: &[u8],
+        want: impl FnOnce(&PsdFile) -> bool,
+        recover: impl FnOnce(&PsdFile) -> bool,
+        ctl: &crate::ReadControl,
+    ) -> Result<(Self, Option<Result<Vec<u8>>>)> {
+        ctl.check()?;
+        if data.len() > ctl.limits.max_input_bytes {
+            return Err(PsdError::LimitExceeded("encoded input byte budget"));
+        }
+        let mut r = Reader::with_control(data, *ctl);
         let header = Header::read(&mut r)?;
+        if u64::from(header.width) * u64::from(header.height) > ctl.limits.max_pixels {
+            return Err(PsdError::LimitExceeded("canvas pixel budget"));
+        }
         let psb = header.version.is_psb();
         let cmd_len = r.u32()?;
         let color_mode_data = r.bytes_u64(u64::from(cmd_len))?.to_vec();
@@ -150,7 +175,7 @@ impl PsdFile {
         if !s.is_empty() {
             let li_len = s.len_field(psb)?;
             if li_len > 0 {
-                layer_info = Some(LayerInfo::read_body(s.bytes_u64(li_len)?, header.version)?);
+                layer_info = Some(LayerInfo::read_body_with(s.bytes_u64(li_len)?, header.version, ctl)?);
             }
             if s.remaining() >= 4 {
                 let n = s.u32()?;
@@ -164,6 +189,7 @@ impl PsdFile {
                     Some(_) => false,
                     None => layer_info.as_ref().is_some_and(|i| !i.layers.is_empty()),
                 };
+                let mut fatal = None;
                 let (blocks, trailing) = read_blocks_with(&mut s, header.version, 4, |index, signature, key, data, padding| {
                     let is_candidate = match target_key {
                         Some(k) => &key == k,
@@ -173,16 +199,25 @@ impl PsdFile {
                         return false;
                     }
                     candidate_seen = true;
-                    let Ok(info) = LayerInfo::read_body(data, header.version) else {
-                        if target_key.is_some() {
-                            layer_info = None;
+                    let info = match LayerInfo::read_body_with(data, header.version, ctl) {
+                        Ok(info) => info,
+                        Err(e) => {
+                            if matches!(e, PsdError::Cancelled) || (ctl.limits != crate::LoadOptions::default() && matches!(e, PsdError::LimitExceeded(_))) {
+                                fatal = Some(e);
+                            }
+                            if target_key.is_some() {
+                                layer_info = None;
+                            }
+                            return false;
                         }
-                        return false;
                     };
                     layer_info = Some(info);
                     layer_info_placement = LayerInfoPlacement::GlobalBlock { index, signature, key, padding: padding.clone() };
                     true
                 })?;
+                if let Some(e) = fatal {
+                    return Err(e);
+                }
                 global_blocks = blocks;
                 layer_mask_trailing = trailing;
             } else {
@@ -202,8 +237,29 @@ impl PsdFile {
             image_data,
             write_as_psb: false,
         };
+        ctl.check()?;
+        // Account every declared channel before any channel is decoded. Mask rectangles can
+        // differ from their layer bounds, so use the channel's own rectangle.
+        if ctl.limits != crate::LoadOptions::default() {
+            let merged_layout = ImageData::layout(&file.header);
+            ctl.check_layout(&merged_layout)?;
+            let mut total = merged_layout.total_bytes()?;
+            for layer in file.layers() {
+                ctl.check()?;
+                for channel in &layer.channels {
+                    let (width, height) = layer.channel_rect(channel.id).size()?;
+                    let layout = crate::PlaneLayout { planes: 1, width, height, depth: file.header.depth, version: file.header.version };
+                    ctl.check_layout(&layout)?;
+                    total = total.saturating_add(layout.total_bytes()?);
+                }
+            }
+            if total > ctl.limits.max_total_decoded_bytes {
+                return Err(PsdError::LimitExceeded("total decoded byte budget"));
+            }
+        }
         let want = want(&file);
         let merged = file.read_merged_section(&mut r, want, recover)?;
+        ctl.check()?;
         Ok((file, merged))
     }
 
@@ -227,7 +283,7 @@ impl PsdFile {
         let merged = match merged {
             Ok(merged) => merged,
             Err(error) => {
-                if matches!(error, PsdError::LimitExceeded(_)) || !recover(file) {
+                if matches!(error, PsdError::LimitExceeded(_) | PsdError::Cancelled) || !recover(file) {
                     return Err(error);
                 }
                 let compression = Compression::from_u16(encoded.u16()?);
@@ -254,13 +310,16 @@ impl PsdFile {
             // Nothing is inflated twice here: the parse's check reads sizes only (or skips an
             // over-limit stream, which the decode then refuses).
             self.image_data = ImageData::read(r, &self.header)?;
-            return Ok(self.decode_merged());
+            return Ok(crate::compression::decode_planes_with(self.image_data.compression, &self.image_data.encoded()?, &layout, &r.ctl));
         }
         r.u16()?;
         let data = r.peek_rest();
-        let decoded = decode_planes(compression, data, &layout);
+        let decoded = crate::compression::decode_planes_with(compression, data, &layout, &r.ctl);
+        if matches!(decoded, Err(PsdError::Cancelled)) {
+            return Err(PsdError::Cancelled);
+        }
         if decoded.is_err() {
-            validate_planes(compression, data, &layout)?;
+            crate::compression::validate_planes_with(compression, data, &layout, &r.ctl)?;
         }
         self.image_data = ImageData::new(compression, data.to_vec());
         r.skip(data.len())?;

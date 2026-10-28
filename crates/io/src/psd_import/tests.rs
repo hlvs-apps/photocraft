@@ -10,8 +10,8 @@ fn flat_fallback_refuses_an_output_over_the_cap() {
     let file = testgen::merged_only(Version::Psd, PsdMode::Multichannel, 8, Compression::Raw, 2, 2);
     assert!(file.composite_rgba8().is_err(), "Multichannel goes through the fallback");
     let merged = file.decode_merged();
-    assert!(matches!(flat_composite(&file, Some(&merged), 15), Err(PsdError::LimitExceeded(_))));
-    let img = flat_composite(&file, Some(&merged), 16).unwrap();
+    assert!(matches!(flat_composite(&file, Some(&merged), 15, &photocraft_raster::Interrupt::NONE), Err(PsdError::LimitExceeded(_))));
+    let img = flat_composite(&file, Some(&merged), 16, &photocraft_raster::Interrupt::NONE).unwrap();
     assert_eq!(img.data.len(), 16);
 }
 
@@ -27,7 +27,7 @@ fn flat_fallback_does_not_retry_an_over_budget_composite() {
     file.header.height = 60_000;
     let merged = Ok(vec![0u8; 16]);
     let cap = photocraft_psd::compression::MAX_DECODED_BYTES;
-    assert!(matches!(flat_composite(&file, Some(&merged), cap), Err(PsdError::LimitExceeded(_))));
+    assert!(matches!(flat_composite(&file, Some(&merged), cap, &photocraft_raster::Interrupt::NONE), Err(PsdError::LimitExceeded(_))));
 }
 
 /// #5202: a hostile name length ends the list instead of overflowing.
@@ -387,4 +387,49 @@ fn layer_bands_end_on_tile_rows_and_cover_the_layer() {
     }
     // A small layer is one band.
     assert_eq!(band_rows(0, 2000, 8000), vec![(0, 2000)]);
+}
+
+#[test]
+fn explicit_import_budgets_cover_patterns_and_filter_caches() {
+    use photocraft_psd::filter_effects::{EffectsPlane, FilterEffects, FilterEffectsItem};
+    use photocraft_psd::patterns::{PsdPattern, write_pattern_block};
+    let pattern = PsdPattern {
+        mode: 3,
+        width: 64,
+        height: 64,
+        name: "large".into(),
+        id: "pattern".into(),
+        palette: None,
+        depth: 8,
+        channels: vec![vec![42; 4096]; 3],
+        alpha: None,
+    };
+    let cache = FilterEffects {
+        version: 3,
+        items: vec![FilterEffectsItem {
+            id: "cache".into(),
+            version: 1,
+            rect: photocraft_psd::Rect::from_xywh(0, 0, 64, 64),
+            depth: 8,
+            max_channels: 1,
+            slots: vec![Some(EffectsPlane::encode(Compression::Zip, &[42; 4096], 64, 64, 8).unwrap()), None, None],
+            mask: None,
+        }],
+    };
+    for block in [TaggedBlock::new(*b"Patt", write_pattern_block(&[pattern]).unwrap()), TaggedBlock::new(*b"FEid", cache.to_bytes())] {
+        let mut file = testgen::merged_only(Version::Psd, PsdMode::Rgb, 8, Compression::Raw, 1, 1);
+        file.global_blocks.push(block);
+        let bytes = file.to_bytes().unwrap();
+        assert!(crate::import_psd_with_limits("x.psd", &bytes, Default::default(), &photocraft_raster::Interrupt::NONE).is_ok());
+        for limits in [
+            photocraft_psd::LoadOptions { max_pixels: 4, ..Default::default() },
+            photocraft_psd::LoadOptions { max_decoded_bytes: 16, ..Default::default() },
+            photocraft_psd::LoadOptions { max_auxiliary_bytes: 16, ..Default::default() },
+        ] {
+            assert!(matches!(
+                crate::import_psd_with_limits("x.psd", &bytes, limits, &photocraft_raster::Interrupt::NONE),
+                Err(crate::IoError::Psd(PsdError::LimitExceeded(_)))
+            ));
+        }
+    }
 }

@@ -114,9 +114,14 @@ pub mod packbits {
     /// `-128` no-op bytes (which are always permitted). Errors, rather than
     /// overflowing, when `out.len() + expected` does not fit in `usize`.
     pub(crate) fn decode_into(src: &[u8], expected: usize, out: &mut Vec<u8>) -> Result<()> {
+        decode_into_with(src, expected, out, &crate::ReadControl::default())
+    }
+
+    pub(crate) fn decode_into_with(src: &[u8], expected: usize, out: &mut Vec<u8>, ctl: &crate::ReadControl) -> Result<()> {
         let target = out.len().checked_add(expected).ok_or(PsdError::LimitExceeded("PackBits output length overflows usize"))?;
         let mut i = 0;
         while out.len() < target {
+            ctl.check()?;
             let Some(&h) = src.get(i) else {
                 return Err(PsdError::Decompress("PackBits row ended early".into()));
             };
@@ -203,7 +208,12 @@ impl PlaneLayout {
 
 /// Decodes planar data (excluding the 2-byte compression field).
 pub fn decode_planes(compression: Compression, data: &[u8], layout: &PlaneLayout) -> Result<Vec<u8>> {
-    let total = layout.decoded_len()?;
+    decode_planes_with(compression, data, layout, &crate::ReadControl::default())
+}
+
+/// Decode with explicit budgets and a cancellation hook.
+pub fn decode_planes_with(compression: Compression, data: &[u8], layout: &PlaneLayout, ctl: &crate::ReadControl) -> Result<Vec<u8>> {
+    let total = ctl.check_layout(layout)?;
     match compression {
         Compression::Raw => {
             if data.len() < total {
@@ -211,14 +221,17 @@ pub fn decode_planes(compression: Compression, data: &[u8], layout: &PlaneLayout
             }
             let mut out = Vec::new();
             out.try_reserve_exact(total).map_err(|_| PsdError::LimitExceeded("not enough memory for the decoded channel data"))?;
-            out.extend_from_slice(&data[..total]);
+            for chunk in data[..total].chunks(64 << 10) {
+                ctl.check()?;
+                out.extend_from_slice(chunk);
+            }
             Ok(out)
         }
-        Compression::Rle => decode_rle(data, layout, total),
-        Compression::Zip => inflate_checked(data, total as u64, true),
+        Compression::Rle => decode_rle(data, layout, total, ctl),
+        Compression::Zip => inflate_checked_with(data, total as u64, true, ctl),
         Compression::ZipPrediction => {
-            let mut v = inflate_checked(data, total as u64, true)?;
-            unpredict(&mut v, layout)?;
+            let mut v = inflate_checked_with(data, total as u64, true, ctl)?;
+            unpredict_with(&mut v, layout, ctl)?;
             Ok(v)
         }
         Compression::Unknown(c) => Err(PsdError::Unsupported(format!("compression method {c}"))),
@@ -274,8 +287,17 @@ pub fn encode_planes(compression: Compression, decoded: &[u8], layout: &PlaneLay
 /// untrusted file before the same error. The bytes are kept verbatim, like an
 /// unknown compression method, so a layered file whose merged composite is
 /// too large still opens.
+#[cfg(test)]
 pub(crate) fn validate_planes(compression: Compression, data: &[u8], layout: &PlaneLayout) -> Result<()> {
+    validate_planes_with(compression, data, layout, &crate::ReadControl::default())
+}
+
+pub(crate) fn validate_planes_with(compression: Compression, data: &[u8], layout: &PlaneLayout, ctl: &crate::ReadControl) -> Result<()> {
+    ctl.check()?;
     let total = layout.total_bytes()?;
+    if total > ctl.limits.max_decoded_bytes && ctl.limits.max_decoded_bytes < MAX_DECODED_BYTES {
+        return Err(PsdError::LimitExceeded("decoded byte budget"));
+    }
     match compression {
         Compression::Raw => {
             if (data.len() as u64) < total {
@@ -285,7 +307,7 @@ pub(crate) fn validate_planes(compression: Compression, data: &[u8], layout: &Pl
         }
         Compression::Rle => {
             let rows = layout.rows()?;
-            let mut r = Reader::new(data);
+            let mut r = Reader::with_control(data, *ctl);
             r.check_count(rows as u64, layout.count_size() as u64)?;
             let mut sum: u64 = 0;
             for _ in 0..rows {
@@ -297,7 +319,7 @@ pub(crate) fn validate_planes(compression: Compression, data: &[u8], layout: &Pl
             Ok(())
         }
         Compression::Zip | Compression::ZipPrediction if total > MAX_DECODED_BYTES => Ok(()),
-        Compression::Zip | Compression::ZipPrediction => inflate_checked(data, total, false).map(|_| ()),
+        Compression::Zip | Compression::ZipPrediction => inflate_checked_with(data, total, false, ctl).map(|_| ()),
         Compression::Unknown(_) => Ok(()),
     }
 }
@@ -310,7 +332,8 @@ thread_local! {
 
 // Keep only the requested pixels, but consume the trailer to verify Adler-32.
 // A bounded surplus tolerates padding without unbounded decompression work.
-fn inflate_checked(data: &[u8], expected: u64, keep: bool) -> Result<Vec<u8>> {
+fn inflate_checked_with(data: &[u8], expected: u64, keep: bool, ctl: &crate::ReadControl) -> Result<Vec<u8>> {
+    ctl.check()?;
     const OOM: PsdError = PsdError::LimitExceeded("not enough memory for the decoded channel data");
     #[cfg(test)]
     INFLATES.with(|n| n.set(n.get() + 1));
@@ -319,10 +342,12 @@ fn inflate_checked(data: &[u8], expected: u64, keep: bool) -> Result<Vec<u8>> {
     if keep {
         out.try_reserve_exact(expected.min(data.len().saturating_mul(1032) as u64) as usize).map_err(|_| OOM)?;
     }
-    let mut buf = vec![0; expected.saturating_add(1).clamp(8192, 1 << 20) as usize];
+    let mut buf = vec![0; expected.saturating_add(1).clamp(8192, 64 << 10) as usize];
     loop {
+        ctl.check()?;
         let before = (decoder.total_in(), decoder.total_out());
         let input = data.get(before.0 as usize..).ok_or_else(|| PsdError::Decompress("zlib input overflow".into()))?;
+        let input = &input[..input.len().min(64 << 10)];
         let status = decoder.decompress(input, &mut buf, flate2::FlushDecompress::None).map_err(|e| PsdError::Decompress(e.to_string()))?;
         let got = decoder.total_out();
         if got > expected.saturating_add(1 << 20) {
@@ -349,10 +374,10 @@ fn read_count(r: &mut Reader<'_>, v: Version) -> Result<usize> {
     Ok(if v.is_psb() { r.u32()? as usize } else { r.u16()? as usize })
 }
 
-fn decode_rle(data: &[u8], layout: &PlaneLayout, total: usize) -> Result<Vec<u8>> {
+fn decode_rle(data: &[u8], layout: &PlaneLayout, total: usize, ctl: &crate::ReadControl) -> Result<Vec<u8>> {
     let rows = layout.rows()?;
     let rb = layout.row_bytes();
-    let mut r = Reader::new(data);
+    let mut r = Reader::with_control(data, *ctl);
     r.check_count(rows as u64, layout.count_size() as u64)?;
     let mut counts = Vec::with_capacity(rows);
     for _ in 0..rows {
@@ -367,7 +392,7 @@ fn decode_rle(data: &[u8], layout: &PlaneLayout, total: usize) -> Result<Vec<u8>
     out.try_reserve_exact(total).map_err(|_| PsdError::LimitExceeded("not enough memory for the decoded channel data"))?;
     for c in counts {
         let row = r.bytes(c)?;
-        packbits::decode_into(row, rb, &mut out)?;
+        packbits::decode_into_with(row, rb, &mut out, ctl)?;
     }
     Ok(out)
 }
@@ -522,6 +547,10 @@ pub fn predict(buf: &mut [u8], layout: &PlaneLayout) -> Result<()> {
 
 /// Reverses [`predict`] in place (decoder side).
 pub fn unpredict(buf: &mut [u8], layout: &PlaneLayout) -> Result<()> {
+    unpredict_with(buf, layout, &crate::ReadControl::default())
+}
+
+fn unpredict_with(buf: &mut [u8], layout: &PlaneLayout, ctl: &crate::ReadControl) -> Result<()> {
     let rb = layout.row_bytes();
     if rb == 0 {
         return Ok(());
@@ -529,6 +558,7 @@ pub fn unpredict(buf: &mut [u8], layout: &PlaneLayout) -> Result<()> {
     let w = layout.width;
     let mut scratch = Vec::new();
     for row in buf.chunks_exact_mut(rb) {
+        ctl.check()?;
         match layout.depth {
             1 | 8 => {
                 for i in 1..row.len() {

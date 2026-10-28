@@ -3,6 +3,7 @@
 mod builder;
 mod corpus;
 mod corpus_atn;
+mod interrupt;
 mod layer_block_order;
 mod malformed;
 mod merged_recovery;

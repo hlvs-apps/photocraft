@@ -160,21 +160,39 @@ pub fn filter_stack(fx: &Descriptor) -> FilterStack {
 /// (`filterMaskExtendWithWhite`), as a grayscale mask of `sample` depth. `Ok(None)` when the
 /// item has no mask or it is all white (no mask); `Err` when it can't be decoded.
 pub fn mask_from_item(item: &FilterEffectsItem, sample: SampleType, stack: &FilterStack) -> Result<Option<LayerMask>, String> {
+    mask_from_item_with(item, sample, stack, &photocraft_raster::Interrupt::NONE)
+}
+
+pub(crate) fn mask_from_item_with(
+    item: &FilterEffectsItem,
+    sample: SampleType,
+    stack: &FilterStack,
+    ctl: &photocraft_raster::Interrupt,
+) -> Result<Option<LayerMask>, String> {
     if item.mask.is_none() {
         return Ok(None);
     }
-    let (rect, plane) = item.decoded_mask().ok_or("the smart filter mask could not be decoded")?;
+    let (rect, plane) = item
+        .decoded_mask_with(&photocraft_psd::ReadControl { cancelled: &|| ctl.cancelled(), ..Default::default() })
+        .ok_or("the smart filter mask could not be decoded")?;
     if item.depth != u32::from(crate::pixels::psd_depth(sample)) {
         return Err(format!("the smart filter mask is {}-bit in a {:?} document", item.depth, sample));
     }
     let (w, h) = rect.size().map_err(|e| e.to_string())?;
     let fmt = PixelFormat::new(ColorMode::Grayscale, sample, false);
     let mut surface = Surface::with_default(fmt, &[1.0]);
-    let n = w.checked_mul(h).ok_or("the smart filter mask is too large")?;
-    let bytes = crate::pixels::interleave(&[Some(&plane)], &[crate::pixels::zero_sample(sample)], n, sample, &[false]);
-    surface.write_interleaved(GeomRect::new(rect.left, rect.top, rect.right, rect.bottom), &bytes);
-    surface.prune();
-    if surface.content_bounds().is_empty() {
+    let _ = w.checked_mul(h).ok_or("the smart filter mask is too large")?;
+    crate::pixels::write_planar(
+        &mut surface,
+        GeomRect::new(rect.left, rect.top, rect.right, rect.bottom),
+        &[Some(&plane)],
+        &[crate::pixels::zero_sample(sample)],
+        &[false],
+        ctl,
+        true,
+    )
+    .map_err(|e| e.to_string())?;
+    if surface.tile_count() == 0 {
         return Ok(None);
     }
     Ok(Some(LayerMask { surface, enabled: stack.mask_enabled, linked: stack.mask_linked, density: 1.0, feather: 0.0 }))
@@ -184,17 +202,21 @@ pub fn mask_from_item(item: &FilterEffectsItem, sample: SampleType, stack: &Filt
 /// channels from slot 0, transparency from the last slot (opaque without it). `None` when the
 /// item has no colour planes, its depth isn't `fmt`'s, or a plane doesn't decode.
 pub fn unfiltered_from_item(item: &FilterEffectsItem, fmt: PixelFormat) -> Option<Surface> {
+    unfiltered_from_item_with(item, fmt, &photocraft_raster::Interrupt::NONE)
+}
+
+pub(crate) fn unfiltered_from_item_with(item: &FilterEffectsItem, fmt: PixelFormat, ctl: &photocraft_raster::Interrupt) -> Option<Surface> {
     let depth = u16::try_from(item.depth).ok()?;
     if u32::from(crate::pixels::psd_depth(fmt.sample)) != item.depth || !fmt.alpha {
         return None;
     }
     let (w, h) = item.rect.size().ok()?;
-    let n = w.checked_mul(h)?;
+    let _ = w.checked_mul(h)?;
     let cc = fmt.mode.color_channels();
     let mut planes = Vec::with_capacity(cc + 1);
     for slot in (0..cc).chain(std::iter::once(item.slots.len().saturating_sub(1))) {
         planes.push(match item.slots.get(slot).and_then(Option::as_ref) {
-            Some(p) => Some(p.decode(w, h, depth).ok()?),
+            Some(p) => Some(p.decode_with(w, h, depth, &photocraft_psd::ReadControl { cancelled: &|| ctl.cancelled(), ..Default::default() }).ok()?),
             None if slot < cc => return None,
             None => None,
         });
@@ -209,13 +231,17 @@ pub fn unfiltered_from_item(item: &FilterEffectsItem, fmt: PixelFormat) -> Optio
     });
     let mut invert = vec![fmt.mode == ColorMode::Cmyk; cc];
     invert.push(false);
-    let mut bytes = crate::pixels::interleave(&refs, &fill, n, fmt.sample, &invert);
-    if fmt.mode == ColorMode::Lab && fmt.sample == SampleType::U16 {
-        crate::pixels::lab16_chroma(&mut bytes, cc + 1, true);
-    }
     let mut surface = Surface::new(fmt);
-    surface.write_interleaved(GeomRect::new(item.rect.left, item.rect.top, item.rect.right, item.rect.bottom), &bytes);
-    surface.prune();
+    crate::pixels::write_planar(
+        &mut surface,
+        GeomRect::new(item.rect.left, item.rect.top, item.rect.right, item.rect.bottom),
+        &refs,
+        &fill,
+        &invert,
+        ctl,
+        true,
+    )
+    .ok()?;
     Some(surface)
 }
 

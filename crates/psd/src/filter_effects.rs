@@ -20,7 +20,7 @@
 //! last slot) and the trailing image is the filter mask, in document coordinates. RLE row counts
 //! are four bytes wide (PSB style) in every file version.
 
-use crate::compression::{Compression, PlaneLayout, decode_planes, encode_planes};
+use crate::compression::{Compression, PlaneLayout, encode_planes};
 use crate::error::{PsdError, Result};
 use crate::header::Version;
 use crate::io::{Reader, WriteExt, read_pascal, write_pascal};
@@ -49,6 +49,11 @@ impl EffectsPlane {
     /// possibly hold (PackBits expands at most 64×, zlib about 1032×) is refused before any
     /// allocation, so a tiny corrupt block can't ask for gigabytes.
     pub fn decode(&self, w: usize, h: usize, depth: u16) -> Result<Vec<u8>> {
+        self.decode_with(w, h, depth, &crate::ReadControl::default())
+    }
+
+    /// Decode a cached filter plane with explicit limits and cancellation.
+    pub fn decode_with(&self, w: usize, h: usize, depth: u16, ctl: &crate::ReadControl) -> Result<Vec<u8>> {
         let layout = PlaneLayout { planes: 1, width: w, height: h, depth, version: Version::Psb };
         let n = self.data.len() as u64;
         let most = match self.compression {
@@ -59,7 +64,7 @@ impl EffectsPlane {
         if layout.total_bytes()? > most {
             return Err(PsdError::invalid("filter effects: plane larger than its data can hold"));
         }
-        decode_planes(self.compression, &self.data, &layout)
+        crate::compression::decode_planes_with(self.compression, &self.data, &layout, ctl)
     }
 }
 
@@ -85,10 +90,15 @@ pub struct FilterEffectsItem {
 impl FilterEffectsItem {
     /// The decoded filter mask (8/16/32-bit big-endian samples) with its bounds.
     pub fn decoded_mask(&self) -> Option<(Rect, Vec<u8>)> {
+        self.decoded_mask_with(&crate::ReadControl::default())
+    }
+
+    /// Decode the mask cooperatively; cancellation is visible through `ctl`.
+    pub fn decoded_mask_with(&self, ctl: &crate::ReadControl) -> Option<(Rect, Vec<u8>)> {
         let (r, p) = self.mask.as_ref()?;
         let (w, h) = r.size().ok()?;
         let depth = u16::try_from(self.depth).ok()?;
-        Some((*r, p.decode(w, h, depth).ok()?))
+        Some((*r, p.decode_with(w, h, depth, ctl).ok()?))
     }
 }
 
@@ -154,7 +164,12 @@ fn write_plane(out: &mut Vec<u8>, p: &EffectsPlane) {
 impl FilterEffects {
     /// Parses block data. Trailing zero padding is allowed.
     pub fn parse(data: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(data);
+        Self::parse_with(data, &crate::ReadControl::default())
+    }
+
+    /// Parse cache records cooperatively under the caller's cancellation hook.
+    pub fn parse_with(data: &[u8], ctl: &crate::ReadControl) -> Result<Self> {
+        let mut r = Reader::with_control(data, *ctl);
         let version = r.u32()?;
         if !(1..=3).contains(&version) {
             return Err(PsdError::invalid(format!("filter effects version {version}")));
