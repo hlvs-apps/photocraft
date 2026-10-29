@@ -9,6 +9,9 @@ use thiserror::Error;
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PsdError {
+    /// The caller cancelled this operation.
+    #[error("cancelled")]
+    Cancelled,
     /// The input ended before a structure was complete.
     #[error("unexpected end of data at offset {offset} (needed {needed} more bytes)")]
     UnexpectedEof {

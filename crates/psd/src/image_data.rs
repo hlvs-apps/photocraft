@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use crate::compression::{Compression, PlaneLayout, decode_planes, encode_planes, validate_planes};
+use crate::compression::{Compression, PlaneLayout, decode_planes, encode_planes};
 use crate::error::Result;
 use crate::header::Header;
 use crate::io::Reader;
@@ -90,7 +90,7 @@ impl ImageData {
     pub(crate) fn read(r: &mut Reader<'_>, header: &Header) -> Result<Self> {
         let compression = Compression::from_u16(r.u16()?);
         let data = r.peek_rest();
-        validate_planes(compression, data, &Self::layout(header))?;
+        crate::compression::validate_planes_with(compression, data, &Self::layout(header), &r.ctl)?;
         let data = data.to_vec();
         r.skip(data.len())?;
         Ok(ImageData::new(compression, data))

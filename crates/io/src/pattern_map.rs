@@ -12,7 +12,7 @@ use photocraft_geom::Rect;
 use photocraft_psd::patterns::{PatternBudget, PsdPattern, block_has_user_mask, block_key, mode_channels, parse_pattern_block_with, write_pattern_block};
 use photocraft_raster::Surface;
 
-use crate::pixels::{deinterleave, interleave, max_sample, psd_depth, sample_for_depth, zero_sample};
+use crate::pixels::{deinterleave, max_sample, psd_depth, sample_for_depth, zero_sample};
 
 /// Global block keys holding patterns.
 pub const PATTERN_KEYS: [[u8; 4]; 3] = [*b"Patt", *b"Pat2", *b"Pat3"];
@@ -28,6 +28,11 @@ fn psd_mode(m: ColorMode) -> u32 {
 
 /// A PSD pattern as a document pattern (indexed patterns become RGB through their palette).
 pub fn from_psd(p: &PsdPattern) -> Option<Pattern> {
+    from_psd_with(p, &photocraft_raster::Interrupt::NONE)
+}
+
+fn from_psd_with(p: &PsdPattern, ctl: &photocraft_raster::Interrupt) -> Option<Pattern> {
+    ctl.check().ok()?;
     let (w, h) = (p.width as usize, p.height as usize);
     if w == 0 || h == 0 {
         return None;
@@ -35,19 +40,40 @@ pub fn from_psd(p: &PsdPattern) -> Option<Pattern> {
     // 1-bit patterns: expand to 8-bit grey.
     let (channels, depth): (Vec<Vec<u8>>, u16) = if p.depth == 1 {
         let row = w.div_ceil(8);
-        let expand = |plane: &Vec<u8>| -> Vec<u8> {
-            (0..w * h).map(|i| if plane.get((i / w) * row + (i % w) / 8).is_some_and(|b| b & (0x80 >> (i % w % 8)) != 0) { 0 } else { 255 }).collect()
+        let expand = |plane: &Vec<u8>| -> Option<Vec<u8>> {
+            let mut out = Vec::new();
+            for y in 0..h {
+                ctl.check().ok()?;
+                out.extend((0..w).map(|x| if plane.get(y * row + x / 8).is_some_and(|b| b & (0x80 >> (x % 8)) != 0) { 0 } else { 255 }));
+            }
+            Some(out)
         };
-        (p.channels.iter().map(expand).collect(), 8)
+        (p.channels.iter().map(expand).collect::<Option<_>>()?, 8)
     } else {
-        (p.channels.clone(), p.depth)
+        let copy = |plane: &Vec<u8>| -> Option<Vec<u8>> {
+            let mut out = Vec::new();
+            for chunk in plane.chunks(64 << 10) {
+                ctl.check().ok()?;
+                out.extend_from_slice(chunk);
+            }
+            Some(out)
+        };
+        (p.channels.iter().map(copy).collect::<Option<_>>()?, p.depth)
     };
     let (mode, channels) = match p.mode {
         1 | 8 => (ColorMode::Grayscale, channels),
         2 => {
             let pal = p.palette.as_deref()?;
             let idx = channels.first()?;
-            let ch: Vec<Vec<u8>> = (0..3).map(|c| idx.iter().map(|i| pal.get(usize::from(*i) * 3 + c).copied().unwrap_or(0)).collect()).collect();
+            let mut ch = Vec::new();
+            for c in 0..3 {
+                let mut plane = Vec::new();
+                for chunk in idx.chunks(64 << 10) {
+                    ctl.check().ok()?;
+                    plane.extend(chunk.iter().map(|i| pal.get(usize::from(*i) * 3 + c).copied().unwrap_or(0)));
+                }
+                ch.push(plane);
+            }
             (ColorMode::Rgb, ch)
         }
         4 => (ColorMode::Cmyk, channels),
@@ -69,11 +95,8 @@ pub fn from_psd(p: &PsdPattern) -> Option<Pattern> {
         fill.push(max_sample(s));
         invert.push(false);
     }
-    let mut bytes = interleave(&refs, &fill, w * h, s, &invert);
-    if mode == ColorMode::Lab && s == SampleType::U16 {
-        crate::pixels::lab16_chroma(&mut bytes, refs.len(), true);
-    }
-    let surface = Surface::from_interleaved(fmt, Rect::new(0, 0, w as i32, h as i32), &bytes);
+    let mut surface = Surface::new(fmt);
+    crate::pixels::write_planar(&mut surface, Rect::new(0, 0, w as i32, h as i32), &refs, &fill, &invert, ctl, false).ok()?;
     Some(Pattern { id: p.id.clone(), name: p.name.clone(), width: p.width, height: p.height, surface })
 }
 
@@ -113,15 +136,45 @@ pub fn to_psd(p: &Pattern) -> PsdPattern {
 /// Patterns decoded from the document's raw pattern blocks (malformed blocks are skipped). All
 /// blocks share one memory budget, so repeating a block can't multiply it.
 pub fn from_global_blocks(doc: &Document) -> Vec<Pattern> {
-    let mut budget = PatternBudget::default();
-    doc.metadata
-        .psd_global_blocks
-        .iter()
-        .filter(|(_, k, _)| PATTERN_KEYS.contains(k))
-        .filter_map(|(_, _, d)| parse_pattern_block_with(d, &mut budget).ok())
-        .flatten()
-        .filter_map(|p| from_psd(&p))
-        .collect()
+    let mut control = crate::psd_import::ImportControl { interrupt: photocraft_raster::Interrupt::NONE, limits: None, auxiliary_left: u64::MAX };
+    from_global_blocks_with(doc, &mut control).unwrap_or_default()
+}
+
+pub(crate) fn from_global_blocks_with(doc: &Document, control: &mut crate::psd_import::ImportControl) -> photocraft_psd::Result<Vec<Pattern>> {
+    let mut budget = PatternBudget::with_decoded_limit(control.auxiliary_left);
+    let mut out = Vec::new();
+    for (_, _, data) in doc.metadata.psd_global_blocks.iter().filter(|(_, key, _)| PATTERN_KEYS.contains(key)) {
+        let before = budget.decoded_left();
+        let result = photocraft_psd::patterns::parse_pattern_block_controlled(
+            data,
+            &mut budget,
+            &photocraft_psd::ReadControl { limits: control.limits.unwrap_or_default(), cancelled: &|| control.interrupt.cancelled() },
+        );
+        control.auxiliary_left = control.auxiliary_left.saturating_sub(before.saturating_sub(budget.decoded_left()));
+        match result {
+            Ok(patterns) => {
+                for pattern in patterns {
+                    if control.interrupt.cancelled() {
+                        return Err(photocraft_psd::PsdError::Cancelled);
+                    }
+                    if let Some(pattern) = from_psd_with(&pattern, &control.interrupt) {
+                        out.push(pattern);
+                    }
+                }
+            }
+            Err(error)
+                if matches!(error, photocraft_psd::PsdError::Cancelled)
+                    || (control.limits.is_some() && matches!(error, photocraft_psd::PsdError::LimitExceeded(_))) =>
+            {
+                return Err(error);
+            }
+            Err(_) => {}
+        }
+    }
+    if control.interrupt.cancelled() {
+        return Err(photocraft_psd::PsdError::Cancelled);
+    }
+    Ok(out)
 }
 
 /// Global blocks to write: the raw ones while they still match [`Document::patterns`] (see

@@ -27,16 +27,21 @@ pub(crate) struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
     little: bool,
+    pub(crate) ctl: crate::ReadControl<'a>,
 }
 
 impl<'a> Reader<'a> {
     pub(crate) fn new(data: &'a [u8]) -> Self {
-        Reader { data, pos: 0, little: false }
+        Self::with_control(data, crate::ReadControl::default())
+    }
+
+    pub(crate) fn with_control(data: &'a [u8], ctl: crate::ReadControl<'a>) -> Self {
+        Reader { data, pos: 0, little: false, ctl }
     }
 
     /// A reader of little-endian integers (Photoshop data inside an Intel-order TIFF).
     pub(crate) fn new_little(data: &'a [u8]) -> Self {
-        Reader { data, pos: 0, little: true }
+        Reader { data, pos: 0, little: true, ctl: crate::ReadControl::default() }
     }
 
     pub(crate) fn pos(&self) -> usize {
@@ -57,6 +62,7 @@ impl<'a> Reader<'a> {
     }
 
     pub(crate) fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
+        self.ctl.check()?;
         if n > self.remaining() {
             return Err(PsdError::UnexpectedEof { offset: self.pos, needed: n - self.remaining() });
         }
@@ -73,7 +79,8 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn sub(&mut self, n: u64) -> Result<Reader<'a>> {
         let little = self.little;
-        Ok(Reader { data: self.bytes_u64(n)?, pos: 0, little })
+        let ctl = self.ctl;
+        Ok(Reader { data: self.bytes_u64(n)?, pos: 0, little, ctl })
     }
 
     pub(crate) fn skip(&mut self, n: usize) -> Result<()> {

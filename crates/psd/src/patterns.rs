@@ -22,7 +22,7 @@
 //! leaves the user mask unwritten (psd-tools multichannel-pattern-fill.psd, Photoshop CC 2019); a
 //! file with transparency in the user mask array is refused by Photoshop (#8054).
 
-use crate::compression::{Compression, MAX_DECODED_BYTES, PlaneLayout, decode_planes, encode_planes};
+use crate::compression::{Compression, MAX_DECODED_BYTES, PlaneLayout, encode_planes};
 use crate::error::{PsdError, Result};
 use crate::header::Version;
 
@@ -192,7 +192,7 @@ fn read_vma_body<'a>(r: &mut Rd<'a>) -> Result<&'a [u8]> {
     r.take(len)
 }
 
-fn read_pattern(r: &mut Rd, budget: &mut PatternBudget) -> Result<PsdPattern> {
+fn read_pattern(r: &mut Rd, budget: &mut PatternBudget, ctl: &crate::ReadControl) -> Result<PsdPattern> {
     let PatternHeader { mode, name, id, palette } = read_header(r)?;
     let body = read_vma_body(r)?;
     let mut v = Rd { b: body, p: 0 };
@@ -249,8 +249,10 @@ fn read_pattern(r: &mut Rd, budget: &mut PatternBudget) -> Result<PsdPattern> {
         let ch = usize::try_from(cb.checked_sub(ct).ok_or(PsdError::LimitExceeded("pattern channel height overflow"))?)
             .map_err(|_| PsdError::invalid("negative pattern channel height"))?;
         let channel_layout = PlaneLayout { planes: 1, width: cw, height: ch, depth: d, version: Version::Psd };
+        ctl.check_layout(&channel_layout)?;
         let channel_bytes = channel_layout.total_bytes()?;
         let layout = PlaneLayout { planes: 1, width: w as usize, height: h as usize, depth: d, version: Version::Psd };
+        ctl.check_layout(&layout)?;
         let plane_bytes = layout.total_bytes()?;
         budget.decoded_left = budget.decoded_left.checked_sub(plane_bytes).ok_or(PsdError::LimitExceeded("pattern data exceeds MAX_DECODED_BYTES"))?;
         if cw != w as usize || ch != h as usize {
@@ -291,8 +293,8 @@ fn read_pattern(r: &mut Rd, budget: &mut PatternBudget) -> Result<PsdPattern> {
     }
     let mut planes = Vec::new();
     for channel in channels {
-        let plane = decode_planes(channel.compression, channel.data, &channel.source)?;
-        planes.push(place_channel_plane(plane, &channel.source, channel.x, channel.y, &channel.destination)?);
+        let plane = crate::compression::decode_planes_with(channel.compression, channel.data, &channel.source, ctl)?;
+        planes.push(place_channel_plane_with(plane, &channel.source, channel.x, channel.y, &channel.destination, ctl)?);
     }
     let alpha = (planes.len() > nc).then(|| planes.remove(nc));
     planes.truncate(nc);
@@ -300,7 +302,20 @@ fn read_pattern(r: &mut Rd, budget: &mut PatternBudget) -> Result<PsdPattern> {
     Ok(PsdPattern { mode, width: w, height: h, name, id, palette, depth, channels: planes, alpha })
 }
 
-fn place_channel_plane(mut plane: Vec<u8>, source: &PlaneLayout, x: usize, y: usize, destination: &PlaneLayout) -> Result<Vec<u8>> {
+#[cfg(test)]
+fn place_channel_plane(plane: Vec<u8>, source: &PlaneLayout, x: usize, y: usize, destination: &PlaneLayout) -> Result<Vec<u8>> {
+    place_channel_plane_with(plane, source, x, y, destination, &crate::ReadControl::default())
+}
+
+fn place_channel_plane_with(
+    mut plane: Vec<u8>,
+    source: &PlaneLayout,
+    x: usize,
+    y: usize,
+    destination: &PlaneLayout,
+    ctl: &crate::ReadControl,
+) -> Result<Vec<u8>> {
+    ctl.check_layout(destination)?;
     if source.planes != 1 || destination.planes != 1 || source.depth != destination.depth {
         return Err(PsdError::invalid("incompatible pattern channel layouts"));
     }
@@ -320,6 +335,7 @@ fn place_channel_plane(mut plane: Vec<u8>, source: &PlaneLayout, x: usize, y: us
         if source.depth == 1 && !source.width.is_multiple_of(8) {
             let mask = u8::MAX << (8 - source.width % 8);
             for row in plane.chunks_exact_mut(source.row_bytes()) {
+                ctl.check()?;
                 if let Some(last) = row.last_mut() {
                     *last &= mask;
                 }
@@ -327,11 +343,12 @@ fn place_channel_plane(mut plane: Vec<u8>, source: &PlaneLayout, x: usize, y: us
         }
         return Ok(plane);
     }
-    let mut out = zeroed_pattern_plane(destination_len)?;
+    let mut out = zeroed_pattern_plane(destination_len, ctl)?;
     if source.depth == 1 {
         let source_row_bytes = source.row_bytes();
         let destination_row_bytes = destination.row_bytes();
         for row in 0..source.height {
+            ctl.check()?;
             for col in 0..source.width {
                 let source_pos = row
                     .checked_mul(source_row_bytes)
@@ -358,6 +375,7 @@ fn place_channel_plane(mut plane: Vec<u8>, source: &PlaneLayout, x: usize, y: us
         let row_bytes = source.width.checked_mul(bytes_per_sample).ok_or(PsdError::LimitExceeded("pattern channel row size overflow"))?;
         let x_bytes = x.checked_mul(bytes_per_sample).ok_or(PsdError::LimitExceeded("pattern channel x offset overflow"))?;
         for row in 0..source.height {
+            ctl.check()?;
             let source_start = row.checked_mul(source_row_bytes).ok_or(PsdError::LimitExceeded("pattern channel source offset overflow"))?;
             let destination_start = y
                 .checked_add(row)
@@ -375,10 +393,13 @@ fn place_channel_plane(mut plane: Vec<u8>, source: &PlaneLayout, x: usize, y: us
     Ok(out)
 }
 
-fn zeroed_pattern_plane(len: usize) -> Result<Vec<u8>> {
+fn zeroed_pattern_plane(len: usize, ctl: &crate::ReadControl) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.try_reserve_exact(len).map_err(|_| PsdError::LimitExceeded("not enough memory for the padded pattern channel"))?;
-    out.resize(len, 0);
+    while out.len() < len {
+        ctl.check()?;
+        out.resize(out.len().saturating_add(64 << 10).min(len), 0);
+    }
     Ok(out)
 }
 
@@ -457,15 +478,21 @@ pub fn parse_pattern_block(data: &[u8]) -> Result<Vec<PsdPattern>> {
 /// [`parse_pattern_block`] charging `budget`, so several blocks of one document share one limit.
 /// Charges are monotonic even when a later record in the block fails.
 pub fn parse_pattern_block_with(data: &[u8], budget: &mut PatternBudget) -> Result<Vec<PsdPattern>> {
+    parse_pattern_block_controlled(data, budget, &crate::ReadControl::default())
+}
+
+/// Parse pattern planes with a shared budget and cooperative cancellation.
+pub fn parse_pattern_block_controlled(data: &[u8], budget: &mut PatternBudget, ctl: &crate::ReadControl) -> Result<Vec<PsdPattern>> {
     let mut r = Rd { b: data, p: 0 };
     let mut out = Vec::new();
     while r.p + 4 <= data.len() {
+        ctl.check()?;
         let len = r.u32()? as usize;
         if len == 0 {
             break;
         }
         let body = r.take(len)?;
-        out.push(read_pattern(&mut Rd { b: body, p: 0 }, budget)?);
+        out.push(read_pattern(&mut Rd { b: body, p: 0 }, budget, ctl)?);
         let pad = (4 - len % 4) % 4;
         r.p = (r.p + pad).min(data.len());
     }
@@ -555,7 +582,7 @@ pub fn parse_pat_file(data: &[u8]) -> Result<Vec<PsdPattern>> {
     let mut out = Vec::new();
     let mut budget = PatternBudget::default();
     for _ in 0..count {
-        out.push(read_pattern(&mut r, &mut budget)?);
+        out.push(read_pattern(&mut r, &mut budget, &crate::ReadControl::default())?);
     }
     Ok(out)
 }
