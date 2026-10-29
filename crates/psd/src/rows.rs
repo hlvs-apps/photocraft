@@ -9,7 +9,7 @@
 
 use std::borrow::Cow;
 
-use crate::compression::{Compression, MAX_DECODED_BYTES, PlaneLayout, decode_planes, packbits};
+use crate::compression::{Compression, MAX_DECODED_BYTES, PlaneLayout, packbits};
 use crate::error::{PsdError, Result};
 use crate::header::Version;
 use crate::layer::ChannelData;
@@ -67,6 +67,7 @@ pub struct RowDecoder<'a> {
     kind: Kind<'a>,
     row_bytes: usize,
     height: usize,
+    ctl: crate::ReadControl<'a>,
 }
 
 impl ChannelData {
@@ -74,8 +75,13 @@ impl ChannelData {
     /// [`Self::decode`] would on everything it can check without decoding the rows (sizes, the
     /// RLE count table, the whole of a ZIP stream); a damaged row fails when its band is decoded.
     pub fn row_decoder(&self, width: usize, height: usize, depth: u16, version: Version) -> Result<RowDecoder<'_>> {
+        self.row_decoder_with(width, height, depth, version, crate::ReadControl::default())
+    }
+
+    /// Decode rows with explicit budgets and cooperative cancellation.
+    pub fn row_decoder_with<'a>(&'a self, width: usize, height: usize, depth: u16, version: Version, ctl: crate::ReadControl<'a>) -> Result<RowDecoder<'a>> {
         let layout = PlaneLayout { planes: 1, width, height, depth, version };
-        let total = layout.decoded_len()?;
+        let total = ctl.check_layout(&layout)?;
         let row_bytes = layout.row_bytes();
         let bytes = match &self.stored {
             Some(s) => Bytes::Source(s),
@@ -102,6 +108,7 @@ impl ChannelData {
                 let mut at = table_len;
                 offsets.push(at);
                 for c in table.chunks_exact(size as usize) {
+                    ctl.check()?;
                     let n = match *c {
                         [a, b] => u64::from(u16::from_be_bytes([a, b])),
                         [a, b, c, d] => u64::from(u32::from_be_bytes([a, b, c, d])),
@@ -123,9 +130,9 @@ impl ChannelData {
                 }
                 Kind::Rle { bytes, offsets }
             }
-            Some(c) => Kind::Decoded(decode_planes(c, &self.encoded()?, &layout)?),
+            Some(c) => Kind::Decoded(crate::compression::decode_planes_with(c, &self.encoded()?, &layout, &ctl)?),
         };
-        Ok(RowDecoder { kind, row_bytes, height })
+        Ok(RowDecoder { kind, row_bytes, height, ctl })
     }
 }
 
@@ -142,6 +149,7 @@ impl RowDecoder<'_> {
 
     /// Rows `r0..r1` as planar big-endian samples (`(r1 - r0) × row_bytes` bytes).
     pub fn rows(&self, r0: usize, r1: usize) -> Result<Vec<u8>> {
+        self.ctl.check()?;
         if r0 > r1 || r1 > self.height {
             return Err(PsdError::invalid(format!("rows {r0}..{r1} outside 0..{}", self.height)));
         }
@@ -153,9 +161,19 @@ impl RowDecoder<'_> {
         out.try_reserve_exact(n).map_err(|_| PsdError::LimitExceeded("not enough memory for the decoded channel data"))?;
         match &self.kind {
             Kind::Empty => {}
-            Kind::Raw(bytes) => out.extend_from_slice(&bytes.get((r0 * self.row_bytes) as u64, n as u64)?),
+            Kind::Raw(bytes) => {
+                let bytes = bytes.get((r0 * self.row_bytes) as u64, n as u64)?;
+                for chunk in bytes.chunks(64 << 10) {
+                    self.ctl.check()?;
+                    out.extend_from_slice(chunk);
+                }
+            }
             Kind::Decoded(plane) => {
-                out.extend_from_slice(plane.get(r0 * self.row_bytes..r1 * self.row_bytes).ok_or_else(|| PsdError::invalid("decoded plane too short"))?)
+                let bytes = plane.get(r0 * self.row_bytes..r1 * self.row_bytes).ok_or_else(|| PsdError::invalid("decoded plane too short"))?;
+                for chunk in bytes.chunks(64 << 10) {
+                    self.ctl.check()?;
+                    out.extend_from_slice(chunk);
+                }
             }
             Kind::Rle { bytes, offsets } => {
                 let (Some(&start), Some(&end)) = (offsets.get(r0), offsets.get(r1)) else {
@@ -163,11 +181,12 @@ impl RowDecoder<'_> {
                 };
                 let band = bytes.get(start, end - start)?;
                 for r in r0..r1 {
+                    self.ctl.check()?;
                     let (Some(&a), Some(&b)) = (offsets.get(r), offsets.get(r + 1)) else {
                         return Err(PsdError::invalid("RLE row table too short"));
                     };
                     let row = band.get((a - start) as usize..(b - start) as usize).ok_or_else(|| PsdError::invalid("RLE row outside its band"))?;
-                    packbits::decode_into(row, self.row_bytes, &mut out)?;
+                    packbits::decode_into_with(row, self.row_bytes, &mut out, &self.ctl)?;
                 }
             }
         }

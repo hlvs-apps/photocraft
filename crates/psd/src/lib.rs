@@ -49,6 +49,8 @@ pub mod atn;
 pub mod blend;
 pub mod builder;
 pub mod compression;
+pub mod control;
+pub use control::{LoadOptions, ReadControl};
 pub mod descriptor;
 pub mod error;
 pub mod file;

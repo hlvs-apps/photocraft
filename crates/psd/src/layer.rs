@@ -734,10 +734,17 @@ pub struct LayerInfo {
 impl LayerInfo {
     /// Parses a layer info body (the bytes covered by its length field).
     pub(crate) fn read_body(data: &[u8], version: Version) -> Result<Self> {
-        let mut r = Reader::new(data);
+        Self::read_body_with(data, version, &crate::ReadControl::default())
+    }
+
+    pub(crate) fn read_body_with(data: &[u8], version: Version, ctl: &crate::ReadControl) -> Result<Self> {
+        let mut r = Reader::with_control(data, *ctl);
         let count = r.i16()?;
         let merged_alpha = count < 0;
         let n = count.unsigned_abs();
+        if usize::from(n) > ctl.limits.max_layers {
+            return Err(PsdError::LimitExceeded("layer count budget"));
+        }
         // Minimum record size: 16 rect + 2 + 4 sig + 4 key + 4 + 4 extra len.
         r.check_count(u64::from(n), 34)?;
         let mut layers = Vec::with_capacity(usize::from(n));

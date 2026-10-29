@@ -25,21 +25,12 @@ const ALPHA_IDENTIFIERS: u16 = 1053;
 /// selection ids (1069) and layer groups enabled (1072). A Multichannel document has no layers.
 const LAYER_ONLY_RESOURCES: [u16; 4] = [ids::LAYER_STATE, ids::LAYER_GROUP_INFO, 1069, 1072];
 
-/// Value of sample `i` of a big-endian plane.
-fn decode(plane: &[u8], i: usize, s: SampleType) -> f32 {
-    match s {
-        SampleType::U8 => f32::from(plane[i]) / 255.0,
-        SampleType::U16 => f32::from(u16::from_be_bytes([plane[2 * i], plane[2 * i + 1]])) / 65535.0,
-        SampleType::F32 => f32::from_be_bytes([plane[4 * i], plane[4 * i + 1], plane[4 * i + 2], plane[4 * i + 3]]),
-    }
-}
-
 /// Fills `doc` (already in Multichannel mode at the file depth) from the merged planes `all`.
-pub(crate) fn import(file: &PsdFile, all: &[u8], doc: &mut Document, names: &[String], warnings: &mut Vec<String>) {
+pub(crate) fn import(file: &PsdFile, all: &[u8], doc: &mut Document, names: &[String], warnings: &mut Vec<String>, ctl: &photocraft_raster::Interrupt) {
     let h = &file.header;
     let depth = doc.depth;
     let (w, hh) = (h.width as usize, h.height as usize);
-    let n = w * hh;
+    let _ = w;
     let plane = h.row_bytes() * hh;
     let canvas = Rect::new(0, 0, h.width as i32, h.height as i32);
     let fmt = PixelFormat::new(ColorMode::Grayscale, depth, false);
@@ -48,10 +39,10 @@ pub(crate) fn import(file: &PsdFile, all: &[u8], doc: &mut Document, names: &[St
             warnings.push(format!("multichannel: channel {} is missing", k + 1));
             break;
         };
-        let vals: Vec<f32> = (0..n).map(|i| 1.0 - decode(p, i, depth)).collect();
         let mut s = Surface::new(fmt);
-        s.write_region(canvas, &vals);
-        s.prune();
+        if crate::pixels::write_planar(&mut s, canvas, &[Some(p)], &[crate::pixels::zero_sample(depth)], &[true], ctl, true).is_err() {
+            return;
+        }
         let name = names.get(k).cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| format!("Channel {}", k + 1));
         // Without DisplayInfo the channels print in black, as Photoshop shows them. DisplayInfo
         // turns alpha-type channels (selected / masked areas) back into alpha channels.
@@ -64,10 +55,18 @@ pub(crate) fn import(file: &PsdFile, all: &[u8], doc: &mut Document, names: &[St
     }
     // Alpha-type planes are stored as-is, not as ink: undo the inversion for them.
     for ch in doc.channels.iter_mut().filter(|c| c.spot.is_none()) {
-        let vals: Vec<f32> = ch.surface.read_region(canvas).chunks_exact(ch.surface.channels()).map(|v| 1.0 - v[0]).collect();
         let mut s = Surface::new(fmt);
-        s.write_region(canvas, &vals);
-        s.prune();
+        for tile in canvas.tiles() {
+            if ctl.cancelled() {
+                return;
+            }
+            let area = tile.rect().intersect(&canvas);
+            let vals: Vec<_> = ch.surface.read_region(area).into_iter().map(|v| 1.0 - v).collect();
+            let mut part = Surface::new(fmt);
+            part.write_region(area, &vals);
+            part.prune();
+            s.put_tiles(part.tiles().map(|(coord, tile)| (*coord, tile.clone())));
+        }
         ch.surface = s;
     }
 }

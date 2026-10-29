@@ -33,6 +33,7 @@ impl RenderVectorMasks {
 
 /// Rendering context shared down the tree.
 pub(crate) struct Ctx<'a> {
+    pub(crate) ctl: photocraft_raster::Interrupt<'a>,
     /// Document canvas: fill layers and gradients are laid out relative to it, never to the render rect.
     pub(crate) canvas: Rect,
     /// Tone transfer used by adjustments that work in linear light.
@@ -47,6 +48,7 @@ pub(crate) struct Ctx<'a> {
     /// At most 1 MiB of tone tables, initialized once and shared by this render's tiles and bands.
     pub(crate) tone_luts: Vec<(&'a photocraft_doc::Adjustment, std::sync::OnceLock<[Vec<f32>; 4]>)>,
     pub(crate) vector_masks: RenderVectorMasks,
+    pub(crate) controlled_masks: Option<std::sync::Mutex<std::collections::HashMap<u64, photocraft_raster::Surface>>>,
     /// Effect maps used by this render, by cache key: built before the parallel tiles (see
     /// [`prepare_effects`]) and held for the whole render (or band, for maps clipped to it: the
     /// `bool`), so eviction can't force a rebuild.
@@ -117,6 +119,7 @@ fn doc_layer_addresses(doc: &Document) -> std::collections::HashSet<usize> {
 impl<'a> Ctx<'a> {
     pub(crate) fn for_doc(doc: &'a Document, patterns: &'a pattern::PreparedPatterns<'a>) -> Self {
         Self {
+            ctl: photocraft_raster::Interrupt::NONE,
             doc: Some(doc),
             canvas: doc.bounds(),
             transfer: adjust::Transfer::for_document(doc.mode, doc.depth),
@@ -125,6 +128,7 @@ impl<'a> Ctx<'a> {
             mode: doc.mode,
             depth: doc.depth,
             vector_masks: RenderVectorMasks::default(),
+            controlled_masks: None,
             fx_maps: Default::default(),
             fx_clip: Default::default(),
             fx_over_budget: fx_over_budget(&doc.layers, doc.bounds()),
@@ -188,6 +192,9 @@ pub(crate) fn prepare_effects(layers: &[Layer], rect: Rect, cx: &Ctx, setting: i
     let mut todo = Vec::new();
     effect_layers(layers, rect, 0, &mut todo);
     let build = |l: &std::borrow::Cow<Layer>| {
+        if cx.ctl.cancelled() {
+            return;
+        }
         setting(&mut || {
             let _ = effect_maps(l, rect, cx);
         });

@@ -38,6 +38,9 @@ pub fn render_tiled(doc: &Document, rect: Rect, tile: i32) -> Buffer {
 }
 
 pub(crate) fn render_tiled_with(doc: &Document, rect: Rect, tile: i32, cx: &Ctx) -> Buffer {
+    if cx.ctl.cancelled() {
+        return Buffer::transparent(Rect::EMPTY);
+    }
     let tile = tile.max(1);
     // Lab documents mix Normal blending in CIELAB, as Photoshop does (psblend::LAB_MIX); 32-bit
     // documents don't clip Add / Divide or Hue / Saturation / Color / Luminosity at 1 (psblend::HDR).
@@ -54,11 +57,11 @@ pub(crate) fn render_tiled_with(doc: &Document, rect: Rect, tile: i32, cx: &Ctx)
         return Buffer::transparent(Rect::EMPTY);
     }
     // A CMYK stack with adjustment layers the inks carry exactly composites on its inks.
-    if let Some(buf) = native::render_cmyk(doc, rect, tile) {
+    if let Some(buf) = native::render_cmyk_with(doc, rect, tile, &cx.ctl) {
         return buf;
     }
     // A Lab stack with adjustment layers that work on L, a and b composites on its stored values.
-    if let Some(buf) = native_lab::render_lab(doc, rect, tile) {
+    if let Some(buf) = native_lab::render_lab_with(doc, rect, tile, &cx.ctl) {
         return buf;
     }
     cx.set_fx_clip(rect);
@@ -74,6 +77,9 @@ pub(crate) fn render_tiled_with(doc: &Document, rect: Rect, tile: i32, cx: &Ctx)
         photocraft_color::convert::with_cmyk_space(cmyk, || in_blend_space(lab, hdr, f));
     });
     let run = |t: Rect| {
+        if cx.ctl.cancelled() {
+            return Buffer::transparent(Rect::EMPTY);
+        }
         photocraft_color::convert::with_cmyk_space(cmyk, || {
             let mut b = multichannel::backdrop(doc, t);
             in_blend_space(lab, hdr, || composite_stack_at(&doc.layers, &mut b, cx, advanced::Scope::ROOT));
@@ -96,6 +102,9 @@ pub(crate) fn render_tiled_with(doc: &Document, rect: Rect, tile: i32, cx: &Ctx)
         v
     };
     let put = |band: &mut [[f32; 4]], y0: i32, part: &Buffer| {
+        if cx.ctl.cancelled() || part.rect.is_empty() {
+            return;
+        }
         let pw = part.rect.width() as usize;
         for (row, src) in part.px.chunks_exact(pw).enumerate() {
             let o = ((part.rect.y0 - y0) as usize + row) * w + (part.rect.x0 - rect.x0) as usize;
@@ -315,6 +324,7 @@ pub fn render_layer(layer: &Layer, rect: Rect) -> Buffer {
         std::slice::from_ref(layer),
         &mut buf,
         &Ctx {
+            ctl: photocraft_raster::Interrupt::NONE,
             canvas: rect,
             transfer: adjust::Transfer::Srgb,
             light: photocraft_doc::GlobalLight::default(),
@@ -322,6 +332,7 @@ pub fn render_layer(layer: &Layer, rect: Rect) -> Buffer {
             mode: photocraft_color::ColorMode::Rgb,
             depth: photocraft_color::SampleType::F32,
             vector_masks: RenderVectorMasks::default(),
+            controlled_masks: None,
             fx_maps: Default::default(),
             fx_clip: Default::default(),
             fx_over_budget: false,
@@ -357,4 +368,102 @@ pub fn render_layer_in(doc: &Document, layer: &Layer, rect: Rect) -> Buffer {
         in_blend_space(lab, hdr, || composite_stack_at(std::slice::from_ref(layer), &mut buf, &cx, advanced::Scope::ROOT));
         buf
     })
+}
+
+/// Caller-selected limits for an in-memory composite. Scratch/cache memory is additional.
+#[derive(Clone, Copy, Debug)]
+pub struct RenderOptions {
+    /// Maximum output pixels (16 bytes per RGBA float pixel).
+    pub max_pixels: u64,
+    /// Maximum layer records, including group children.
+    pub max_layers: usize,
+    /// Maximum estimated whole-region effect-map bytes.
+    pub max_effect_bytes: u64,
+    /// Conservative canvas-sized feather-mask planes and mask subsets, summed over layers.
+    pub max_mask_bytes: u64,
+}
+
+/// A composite is returned only when the operation completes within its limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderError {
+    /// The caller cancelled the operation; no partial image is returned.
+    Cancelled,
+    /// A caller-selected limit was exceeded before rendering.
+    LimitExceeded(&'static str),
+}
+
+impl std::fmt::Display for RenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::LimitExceeded(what) => write!(f, "render limit exceeded: {what}"),
+        }
+    }
+}
+impl std::error::Error for RenderError {}
+
+/// Composite with explicit budgets and cooperative checks between layers and render tiles.
+/// A single layer's effect-map build remains a work unit, bounded by `max_effect_bytes`.
+/// Pattern preparation and vector-path compilation remain whole work units. These limits do not represent total
+/// process memory or provide a wall-clock cancellation deadline.
+/// Cancellation discards the result and never publishes partially built effect maps.
+/// Effect blur and distance passes and legacy feather blurs start scoped threads of their own,
+/// outside any Rayon pool; [`photocraft_raster::set_max_kernel_threads`] bounds them.
+pub fn render_with(doc: &Document, rect: Rect, opts: &RenderOptions, ctl: &photocraft_raster::Interrupt) -> Result<Buffer, RenderError> {
+    let check = || ctl.check().map_err(|_| RenderError::Cancelled);
+    check()?;
+    let pixels = u64::from(rect.width()) * u64::from(rect.height());
+    if pixels > opts.max_pixels.min(MAX_RENDER_PIXELS) {
+        return Err(RenderError::LimitExceeded("output pixels"));
+    }
+    let mut stack = vec![(doc.layers.as_slice(), 0usize)];
+    let mut count = 0usize;
+    let mut checked_layers = Vec::new();
+    while let Some((layers, depth)) = stack.pop() {
+        check()?;
+        if depth > photocraft_doc::MAX_GROUP_DEPTH {
+            return Err(RenderError::LimitExceeded("group depth"));
+        }
+        for layer in layers {
+            check()?;
+            count = count.saturating_add(1);
+            if count > opts.max_layers {
+                return Err(RenderError::LimitExceeded("layer count"));
+            }
+            checked_layers.push(layer);
+            if let Some(children) = layer.children() {
+                stack.push((children, depth + 1));
+            }
+        }
+    }
+    let mut effect_bytes = 0u64;
+    let mut mask_bytes = 0u64;
+    for &layer in &checked_layers {
+        check()?;
+        if super::masks::has_feather(layer) {
+            let canvas = doc.bounds();
+            let working = u64::from(canvas.width()).saturating_mul(u64::from(canvas.height())).saturating_mul(12);
+            mask_bytes = mask_bytes.saturating_add(working.saturating_mul(3));
+            if working > 512 << 20 || mask_bytes > opts.max_mask_bytes {
+                return Err(RenderError::LimitExceeded("feather masks"));
+            }
+        }
+        effect_bytes = effect_bytes.saturating_add(super::fx_cache::fx_layer_region_bytes(layer, doc.bounds()));
+        if effect_bytes > opts.max_effect_bytes {
+            return Err(RenderError::LimitExceeded("effect maps"));
+        }
+    }
+    let patterns = pattern::PreparedPatterns::new(&doc.patterns, pattern::PREPARED_PATTERN_BYTES).in_mode(doc.pixel_format().mode);
+    check()?;
+    let mut cx = Ctx::for_doc(doc, &patterns);
+    cx.ctl = *ctl;
+    cx.controlled_masks = Some(Default::default());
+    let result = render_tiled_with(doc, rect, RENDER_TILE, &cx);
+    check()?;
+    Ok(result)
+}
+
+/// Composite the full canvas with caller limits and cancellation.
+pub fn flatten_with(doc: &Document, opts: &RenderOptions, ctl: &photocraft_raster::Interrupt) -> Result<Buffer, RenderError> {
+    render_with(doc, doc.bounds(), opts, ctl)
 }

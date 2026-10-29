@@ -77,6 +77,57 @@ pub fn interleave(planes: &[Option<&[u8]>], fill: &[Vec<u8>], n: usize, s: Sampl
     out
 }
 
+/// Convert planar samples one tile at a time, retaining no full interleaved image.
+pub(crate) fn write_planar(
+    surface: &mut photocraft_raster::Surface,
+    rect: photocraft_geom::Rect,
+    planes: &[Option<&[u8]>],
+    fill: &[Vec<u8>],
+    invert: &[bool],
+    ctl: &photocraft_raster::Interrupt,
+    prune: bool,
+) -> Result<(), photocraft_raster::Cancelled> {
+    let fmt = surface.format();
+    let sample = fmt.sample;
+    let channels = planes.len();
+    let bytes_per_sample = sample.bytes();
+    for tile in rect.tiles() {
+        ctl.check()?;
+        let area = tile.rect().intersect(&rect);
+        let row_bytes = area.width() as usize * channels * bytes_per_sample;
+        let mut bytes = vec![0; row_bytes * area.height() as usize];
+        for (row, out) in bytes.chunks_exact_mut(row_bytes.max(1)).enumerate() {
+            ctl.check()?;
+            let pixel = ((i64::from(area.y0) - i64::from(rect.y0)) as usize + row) * rect.width() as usize + (i64::from(area.x0) - i64::from(rect.x0)) as usize;
+            for (c, plane) in planes.iter().enumerate() {
+                let src = plane.and_then(|p| p.get(pixel * bytes_per_sample..)).unwrap_or_default();
+                let inv = src.len() >= bytes_per_sample && invert.get(c).copied().unwrap_or(false);
+                let fill = fill.get(c).map(Vec::as_slice).unwrap_or_default();
+                match sample {
+                    SampleType::U8 => write_channel(out, channels, c, src, fill, |[v]| [if inv { 255 - v } else { v }]),
+                    SampleType::U16 => write_channel(out, channels, c, src, fill, |v| {
+                        let v = u16::from_be_bytes(v);
+                        (if inv { 65535 - v } else { v }).to_ne_bytes()
+                    }),
+                    SampleType::F32 => write_channel(out, channels, c, src, fill, |v| {
+                        if inv { (1.0 - f32::from_be_bytes(v)).to_ne_bytes() } else { u32::from_be_bytes(v).to_ne_bytes() }
+                    }),
+                }
+            }
+        }
+        if fmt.mode == photocraft_color::ColorMode::Lab && sample == SampleType::U16 {
+            lab16_chroma(&mut bytes, channels, true);
+        }
+        let mut part = photocraft_raster::Surface::with_default(fmt, &surface.default_pixel());
+        part.write_interleaved(area, &bytes);
+        if prune {
+            part.prune();
+        }
+        surface.put_tiles(part.tiles().map(|(coord, tile)| (*coord, tile.clone())));
+    }
+    ctl.check()
+}
+
 fn write_channel<const N: usize>(out: &mut [u8], ch: usize, c: usize, src: &[u8], fill: &[u8], decode: impl Fn([u8; N]) -> [u8; N]) {
     let mut samples = src.as_chunks::<N>().0.iter();
     for pixel in out.chunks_exact_mut(ch * N) {
@@ -219,21 +270,17 @@ pub fn unmatte(m: f32, a: f32, white: f32) -> f32 {
     if a <= 0.0 { white } else { (m - white * (1.0 - a)) / a }
 }
 
-/// `items.map(f)` on scoped threads (one per item; callers pass a handful of channels or
-/// bands), in order; sequential on wasm or for a single item.
+/// `items.map(f)` in order, using the caller's Rayon pool on native and sequentially on wasm.
 pub fn par_map<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
-    if cfg!(target_arch = "wasm32") || items.len() < 2 {
-        return items.into_iter().map(f).collect();
+    #[cfg(target_arch = "wasm32")]
+    {
+        items.into_iter().map(f).collect()
     }
-    std::thread::scope(|sc| {
-        let f = &f;
-        let hs: Vec<_> = items.into_iter().map(|t| sc.spawn(move || f(t))).collect();
-        // Join every worker first (an unjoined panicked thread would make the scope panic),
-        // then hand a worker's panic to the caller exactly as the sequential path would, so
-        // the shell's last-resort guard reports it instead of the scope aborting the join.
-        let joined: Vec<_> = hs.into_iter().map(|h| h.join()).collect();
-        joined.into_iter().map(|r| r.unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
-    })
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        items.into_par_iter().map(&f).collect()
+    }
 }
 
 /// `0..n` split into about one band per core.
@@ -428,4 +475,53 @@ mod measurement {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn controlled_planar_tiles_match_whole_image_conversion_and_cancel() {
+    use photocraft_color::{ColorMode, PixelFormat};
+    use photocraft_geom::Rect;
+    use photocraft_raster::{Interrupt, Surface};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let rect = Rect::new(-3, -5, 259, 258);
+    let count = rect.width() as usize * rect.height() as usize;
+    for mode in [ColorMode::Rgb, ColorMode::Cmyk, ColorMode::Lab, ColorMode::Grayscale] {
+        for sample in [SampleType::U8, SampleType::U16, SampleType::F32] {
+            let fmt = PixelFormat::new(mode, sample, true);
+            let plane = photocraft_psd::testgen::pattern_plane(rect.width() as usize, rect.height() as usize, psd_depth(sample), 3);
+            let mut planes = vec![Some(plane.as_slice()); fmt.channels()];
+            *planes.last_mut().unwrap() = None;
+            let mut fill = vec![zero_sample(sample); fmt.channels()];
+            *fill.last_mut().unwrap() = max_sample(sample);
+            let mut invert = vec![mode == ColorMode::Cmyk; fmt.channels()];
+            *invert.last_mut().unwrap() = false;
+            let mut bytes = interleave(&planes, &fill, count, sample, &invert);
+            if mode == ColorMode::Lab && sample == SampleType::U16 {
+                lab16_chroma(&mut bytes, fmt.channels(), true);
+            }
+            let mut expected = Surface::from_interleaved(fmt, rect, &bytes);
+            expected.prune();
+            let mut actual = Surface::new(fmt);
+            write_planar(&mut actual, rect, &planes, &fill, &invert, &Interrupt::NONE, true).unwrap();
+            assert_eq!(actual, expected, "{mode:?}/{sample:?}");
+            let calls = AtomicUsize::new(0);
+            let cancel = || calls.fetch_add(1, Ordering::Relaxed) > 20;
+            assert!(write_planar(&mut Surface::new(fmt), rect, &planes, &fill, &invert, &Interrupt::cancel_only(&cancel), true).is_err());
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[test]
+fn channel_tasks_use_the_callers_capped_pool() {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+    let result = pool.install(|| {
+        par_map((0..64).collect(), |n| {
+            assert_eq!(rayon::current_num_threads(), 2);
+            assert!(rayon::current_thread_index().unwrap() < 2);
+            n * n
+        })
+    });
+    assert_eq!(result, (0..64).map(|n| n * n).collect::<Vec<_>>());
 }
