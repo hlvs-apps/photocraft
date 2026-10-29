@@ -54,6 +54,8 @@ pub const EXTENSION: &str = "pcraft";
 
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {
+    #[error("cancelled")]
+    Cancelled(#[from] photocraft_raster::Cancelled),
     #[error("corrupt .pcraft bundle: {0}")]
     Corrupt(String),
     #[error("unsupported .pcraft feature: {0}")]
@@ -158,8 +160,22 @@ pub fn load_from_bytes(bytes: &[u8]) -> Result<Document> {
 }
 
 pub fn load_from_bytes_with(bytes: &[u8], opts: &LoadOptions) -> Result<Document> {
-    let src = store::ZipSource::new(bytes)?;
-    store::load(&src, opts)
+    load_from_bytes_interruptible(bytes, opts, &photocraft_raster::Interrupt::NONE)
+}
+
+/// Load with explicit budgets and cooperative cancellation.
+///
+/// Checks the interrupt before starting, at each ZIP entry, layer and tile, and
+/// every 64 KiB while copying, inflating, hashing or parsing manifest bytes.
+/// Cancellation returns [`FormatError::Cancelled`], never a partial document.
+/// Owned manifest conversion, validation and cleanup run between checks; their
+/// work is bounded by `max_manifest_bytes`, not a wall-clock deadline. Budgets
+/// limit decoded payloads, not total process memory. Callers handling untrusted
+/// input should cap the input size and supply their own [`LoadOptions`].
+pub fn load_from_bytes_interruptible(bytes: &[u8], opts: &LoadOptions, ctl: &photocraft_raster::Interrupt) -> Result<Document> {
+    ctl.check()?;
+    let src = store::ZipSource::new_interruptible(bytes, *ctl)?;
+    store::load_interruptible(&src, opts, ctl)
 }
 
 /// Load a bundle from a path: a directory bundle or a ZIP file.
@@ -195,5 +211,43 @@ pub fn read_thumbnail(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     match m.thumbnail {
         Some(p) => Ok(Some(src.get(&p, 64 << 20)?)),
         None => Ok(None),
+    }
+}
+
+pub(crate) struct InterruptReader<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) offset: usize,
+    pub(crate) ctl: photocraft_raster::Interrupt<'a>,
+    pub(crate) cancelled: bool,
+}
+
+impl std::io::Read for InterruptReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.offset.is_multiple_of(64 << 10) && self.ctl.cancelled() {
+            self.cancelled = true;
+            return Err(std::io::Error::other("cancelled"));
+        }
+        let len = out.len().min(self.bytes.len()).min((64 << 10) - self.offset % (64 << 10));
+        let (chunk, rest) = self.bytes.split_at(len);
+        out.get_mut(..len).ok_or_else(|| std::io::Error::other("invalid read buffer"))?.copy_from_slice(chunk);
+        self.bytes = rest;
+        self.offset += len;
+        Ok(len)
+    }
+}
+
+impl std::io::BufRead for InterruptReader<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.ctl.cancelled() {
+            self.cancelled = true;
+            return Err(std::io::Error::other("cancelled"));
+        }
+        Ok(self.bytes.get(..self.bytes.len().min(64 << 10)).unwrap_or_default())
+    }
+
+    fn consume(&mut self, amount: usize) {
+        let amount = amount.min(self.bytes.len());
+        self.bytes = self.bytes.get(amount..).unwrap_or_default();
+        self.offset += amount;
     }
 }
