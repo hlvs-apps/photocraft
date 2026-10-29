@@ -113,11 +113,7 @@ fn blur_rows(v: &mut [f32], w: usize, pass: BoxPass) {
         return;
     }
     let h = v.len() / w;
-    let threads = if cfg!(target_arch = "wasm32") || v.len() < 1 << 16 {
-        1
-    } else {
-        std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 16).min(h.max(1))
-    };
+    let threads = if v.len() < 1 << 16 { 1 } else { photocraft_raster::kernel_threads(16).min(h.max(1)) };
     if threads == 1 {
         blur_rows_chunk(v, w, pass);
         return;
@@ -151,7 +147,7 @@ fn transpose_into(v: &[f32], out: &mut [f32], w: usize, h: usize) {
 /// constant mask regions). Whole-pixel boxes rounded the variance (a 6 px feather blurred like
 /// 6.48 px, a 3 px one like 3.46) and missed Photoshop's feathered edges by up to 4 levels
 /// (psd-tools mask-parameters-no-real-channel.psd); the exact variance is within 1.5. The axes
-/// are processed in parallel on bounded OS threads, preserving each line's floating-point
+/// are processed in parallel on bounded OS threads ([`photocraft_raster::kernel_threads`]), preserving each line's floating-point
 /// operation order.
 pub fn gaussian(v: &mut [f32], w: usize, h: usize, sigma: f32) {
     if w == 0 || h == 0 || v.len() != w.saturating_mul(h) {

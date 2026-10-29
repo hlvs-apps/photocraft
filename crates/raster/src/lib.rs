@@ -8,7 +8,9 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod interrupt;
+mod threads;
 pub use interrupt::{Cancelled, Interrupt};
+pub use threads::{kernel_threads, set_max_kernel_threads};
 
 use std::collections::BTreeMap;
 use std::fmt;

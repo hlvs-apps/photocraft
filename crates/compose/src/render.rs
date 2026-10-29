@@ -407,6 +407,8 @@ impl std::error::Error for RenderError {}
 /// Pattern preparation and vector-path compilation remain whole work units. These limits do not represent total
 /// process memory or provide a wall-clock cancellation deadline.
 /// Cancellation discards the result and never publishes partially built effect maps.
+/// Effect blur and distance passes and legacy feather blurs start scoped threads of their own,
+/// outside any Rayon pool; [`photocraft_raster::set_max_kernel_threads`] bounds them.
 pub fn render_with(doc: &Document, rect: Rect, opts: &RenderOptions, ctl: &photocraft_raster::Interrupt) -> Result<Buffer, RenderError> {
     let check = || ctl.check().map_err(|_| RenderError::Cancelled);
     check()?;

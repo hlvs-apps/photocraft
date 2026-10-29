@@ -407,7 +407,10 @@ covering the original and effect-hiding mask subsets. A single mask's working-pl
 is also capped at 512 MiB; exceeding either cap returns `LimitExceeded` before rendering.
 
 Run calls inside a caller-owned Rayon `ThreadPool::install` to cap rendering concurrency.
-Controlled feather blurs use the calling thread and preserve the legacy blur arithmetic.
+Effect blur and distance passes (and the feather blur of soft vector shapes, which PSD import
+also renders) start scoped threads outside any Rayon pool so they never wait inside a tile:
+cap them with `photocraft_raster::set_max_kernel_threads` (`1` runs them on the calling
+thread). Controlled feather blurs use the calling thread and preserve the legacy blur arithmetic.
 Cancellation checks occur between layers, tiles, native colour bands/conversion chunks, and
 feather-mask rows/columns. Cancelled mask results stay local and are discarded; cancelled
 partial effect maps are not published to the shared cache.
