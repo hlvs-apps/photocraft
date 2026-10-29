@@ -156,7 +156,7 @@ pub fn purge_cache() -> usize {
     cache().lock().unwrap_or_else(|e| e.into_inner()).clear()
 }
 
-fn key(layer: &Layer, canvas: Rect) -> u64 {
+pub(crate) fn key(layer: &Layer, canvas: Rect) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     layer.id.0.hash(&mut h);
     (canvas.x0, canvas.y0, canvas.x1, canvas.y1).hash(&mut h);
@@ -192,6 +192,12 @@ pub fn combined_mask(layer: &Layer, canvas: Rect) -> Option<Surface> {
 }
 
 fn build_mask(layer: &Layer, canvas: Rect) -> Surface {
+    build_mask_with(layer, canvas, None).unwrap_or_else(|_| Surface::new(FORMAT))
+}
+
+pub(crate) fn build_mask_with(layer: &Layer, canvas: Rect, interrupt: Option<&photocraft_raster::Interrupt>) -> Result<Surface, photocraft_raster::Cancelled> {
+    let ctl = interrupt.copied().unwrap_or(photocraft_raster::Interrupt::NONE);
+    ctl.check()?;
     let vm = layer.vector_mask.as_ref().filter(|v| v.enabled);
     let pixel = layer.mask.as_ref().filter(|m| m.enabled);
     let (sv, sp) = (vm.map_or(0.0, |v| feather_sigma(v.feather)), pixel.map_or(0.0, |m| feather_sigma(m.feather)));
@@ -232,22 +238,45 @@ fn build_mask(layer: &Layer, canvas: Rect) -> Surface {
         let (w, h) = (area.width() as usize, area.height() as usize);
         // A slot initializer must not enter Rayon: another tile requesting the
         // same mask could be stolen onto its stack and wait for its own build.
-        let mut v = match &compiled {
-            Some(vm) => vm.render_sequential(area),
-            None => vec![1.0; w * h],
+        let rows = (65_536 / w).max(1);
+        let bands = || (0..h).step_by(rows).map(|y| Rect::new(area.x0, area.y0 + y as i32, area.x1, area.y0 + (y + rows).min(h) as i32));
+        let mut v = Vec::with_capacity(w * h);
+        for band in bands() {
+            ctl.check()?;
+            match &compiled {
+                Some(vm) => v.extend(vm.render_sequential(band)),
+                None => v.resize(v.len() + w * band.height() as usize, 1.0),
+            }
+        }
+        let blur = |values: &mut [f32], sigma| {
+            if interrupt.is_some() {
+                photocraft_vector::feather::gaussian_with(values, w, h, sigma, &ctl)
+            } else {
+                gaussian(values, w, h, sigma);
+                Ok(())
+            }
         };
-        gaussian(&mut v, w, h, sv);
+        blur(&mut v, sv)?;
         if let Some(m) = pixel {
             let mut pm = Vec::new();
-            m.values_into(area, &mut pm);
-            gaussian(&mut pm, w, h, sp);
+            let mut values = Vec::new();
+            for band in bands() {
+                ctl.check()?;
+                m.values_into(band, &mut values);
+                pm.extend_from_slice(&values);
+            }
+            blur(&mut pm, sp)?;
             for (a, b) in v.iter_mut().zip(pm) {
                 *a *= b;
             }
         }
-        s.write_region(area, &v);
+        for (band, values) in bands().zip(v.chunks(w * rows)) {
+            ctl.check()?;
+            s.write_region(band, values);
+        }
     }
-    s
+    ctl.check()?;
+    Ok(s)
 }
 
 #[cfg(test)]

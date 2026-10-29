@@ -8,12 +8,12 @@ use std::time::SystemTime;
 
 use photocraft_color::{PixelFormat, SampleType};
 use photocraft_doc::Document;
-use photocraft_raster::{Rgba8Image, Tile};
+use photocraft_raster::{Interrupt, Rgba8Image, Tile};
 
 use crate::convert::{self, Fetch, Loader, Sink, is_valid_hash, swap_to_le};
 use crate::manifest::{ContentM, FORMAT_VERSION, Hash, LayerM, Manifest};
 use crate::zip::{ZipReader, ZipWriter};
-use crate::{FormatError, LoadOptions, Result, SaveOptions};
+use crate::{FormatError, LoadOptions, Result, SaveLimits, SaveOptions};
 
 pub(crate) const MANIFEST: &str = "manifest.json";
 pub(crate) const THUMB: &str = "thumb.png";
@@ -37,12 +37,24 @@ fn compress(data: &[u8]) -> Vec<u8> {
 /// Decodes a zstd frame of at most `max` bytes (`LimitExceeded` beyond). With `exact`, the
 /// decoded length must be exactly that (`Corrupt` otherwise).
 fn decompress_bounded(data: &[u8], max: usize, exact: Option<usize>, what: &str) -> Result<Vec<u8>> {
-    let zstd = |e: &dyn std::fmt::Display| FormatError::corrupt(format!("{what}: zstd: {e}"));
-    let mut dec = ruzstd::decoding::StreamingDecoder::new(data).map_err(|e| zstd(&e))?;
+    decompress_bounded_with(data, max, exact, what, &Interrupt::NONE)
+}
+
+fn decompress_bounded_with(data: &[u8], max: usize, exact: Option<usize>, what: &str, ctl: &Interrupt) -> Result<Vec<u8>> {
+    ctl.check()?;
+    let zstd = |e: &dyn std::fmt::Display| {
+        if ctl.cancelled() { FormatError::Cancelled(photocraft_raster::Cancelled) } else { FormatError::corrupt(format!("{what}: zstd: {e}")) }
+    };
+    let input = crate::InterruptReader { bytes: data, offset: 0, ctl: *ctl, cancelled: false };
+    let mut dec = ruzstd::decoding::StreamingDecoder::new(input).map_err(|e| zstd(&e))?;
     let mut out = Vec::with_capacity(exact.unwrap_or(0).min(max).min(64 << 20));
     // `max` may be `usize::MAX`: one byte past it must not overflow.
     let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
-    (&mut dec).take(limit).read_to_end(&mut out).map_err(|e| zstd(&e))?;
+    let mut reader = (&mut dec).take(limit);
+    while reader.by_ref().take(64 << 10).read_to_end(&mut out).map_err(|e| zstd(&e))? > 0 {
+        ctl.check()?;
+    }
+    ctl.check()?;
     match exact {
         Some(n) if out.len() != n => Err(FormatError::corrupt(format!("{what}: expected {n} bytes, got {}", out.len()))),
         None if out.len() > max => Err(FormatError::LimitExceeded(format!("{what} exceeds {max} bytes"))),
@@ -58,7 +70,19 @@ fn hash_bytes(b: &[u8]) -> Hash {
     blake3::hash(b).to_hex().to_string()
 }
 
+fn hash_bytes_interruptible(bytes: &[u8], ctl: &Interrupt) -> Result<Hash> {
+    let mut hash = blake3::Hasher::new();
+    for chunk in bytes.chunks(64 << 10) {
+        ctl.check()?;
+        hash.update(chunk);
+    }
+    Ok(hash.finalize().to_hex().to_string())
+}
+
 fn png(img: &Rgba8Image) -> Result<Vec<u8>> {
+    if u64::from(img.width).checked_mul(u64::from(img.height)).and_then(|n| n.checked_mul(4)) != Some(img.pixels.len() as u64) {
+        return Err(FormatError::Unsupported("preview: invalid RGBA dimensions".into()));
+    }
     let image = photocraft_codecs::Image::from_u8(img.width, img.height, photocraft_codecs::ChannelLayout::Rgba, img.pixels.clone())
         .map_err(|e| FormatError::Unsupported(format!("preview: {e}")))?;
     photocraft_codecs::encode(&image, photocraft_codecs::Format::Png, &Default::default()).map_err(|e| FormatError::Unsupported(format!("preview: {e}")))
@@ -102,17 +126,23 @@ pub trait ByteSource {
 
 pub(crate) struct ZipSource<'a> {
     zip: ZipReader<'a>,
+    ctl: Interrupt<'a>,
 }
 
 impl<'a> ZipSource<'a> {
     pub fn new(bytes: &'a [u8]) -> Result<Self> {
-        Ok(ZipSource { zip: ZipReader::new(bytes)? })
+        Self::new_interruptible(bytes, Interrupt::NONE)
+    }
+
+    pub fn new_interruptible(bytes: &'a [u8], ctl: Interrupt<'a>) -> Result<Self> {
+        Ok(ZipSource { zip: ZipReader::new_interruptible(bytes, &ctl)?, ctl })
     }
 }
 
 impl ByteSource for ZipSource<'_> {
     fn get(&self, path: &str, max: usize) -> Result<Vec<u8>> {
-        self.zip.read_by_name(path, max)
+        let e = self.zip.find(path).ok_or_else(|| FormatError::corrupt(format!("missing `{path}`")))?;
+        self.zip.read_interruptible(e, max, &self.ctl)
     }
 }
 
@@ -163,9 +193,13 @@ const MAX_MANIFEST_ITEMS: usize = 4 << 20;
 /// Rejects JSON nested deeper than [`MAX_MANIFEST_DEPTH`] or holding more than
 /// [`MAX_MANIFEST_ITEMS`] items with a linear scan (no recursion), so parsing with serde_json's
 /// recursion limit disabled can't exhaust the stack, nor tiny values the memory, on hostile input.
-fn check_manifest_depth(json: &[u8]) -> Result<()> {
+fn check_manifest_depth_with(json: &[u8], ctl: &Interrupt) -> Result<()> {
+    ctl.check()?;
     let (mut depth, mut items, mut in_str, mut escaped) = (0usize, 0usize, false, false);
-    for &b in json {
+    for (i, &b) in json.iter().enumerate() {
+        if i.is_multiple_of(64 << 10) {
+            ctl.check()?;
+        }
         if in_str {
             match b {
                 _ if escaped => escaped = false,
@@ -197,17 +231,31 @@ fn check_manifest_depth(json: &[u8]) -> Result<()> {
 }
 
 pub(crate) fn read_manifest(src: &dyn ByteSource, opts: &LoadOptions) -> Result<Manifest> {
+    read_manifest_interruptible(src, opts, &Interrupt::NONE)
+}
+
+fn read_manifest_interruptible(src: &dyn ByteSource, opts: &LoadOptions, ctl: &Interrupt) -> Result<Manifest> {
+    ctl.check()?;
     let raw = src.get(MANIFEST, opts.max_manifest_bytes)?;
+    ctl.check()?;
     // serde_json stops at 128 levels (about 40 nested groups); the bounded check replaces that limit.
-    check_manifest_depth(&raw)?;
-    let mut de = serde_json::Deserializer::from_slice(&raw);
+    check_manifest_depth_with(&raw, ctl)?;
+    // serde's reader parser asks for individual bytes. Check at bounded intervals,
+    // including inside a single large string, without calling the callback per byte.
+    let mut reader = crate::InterruptReader { bytes: &raw, offset: 0, ctl: *ctl, cancelled: false };
+    let mut de = serde_json::Deserializer::from_reader(&mut reader);
     de.disable_recursion_limit();
-    let mut v = <serde_json::Value as serde::Deserialize>::deserialize(&mut de)?;
-    de.end()?;
+    let parsed = <serde_json::Value as serde::Deserialize>::deserialize(&mut de).and_then(|v| de.end().map(|()| v));
+    if reader.cancelled {
+        return Err(photocraft_raster::Cancelled.into());
+    }
+    let mut v = parsed?;
+    ctl.check()?;
     crate::migrate::migrate(&mut v)?;
     let layers = take_array(&mut v, "/document/layers");
     let mut m: Manifest = serde_json::from_value(v)?;
-    m.document.layers = layers_from_json(layers)?;
+    m.document.layers = layers_from_json(layers, ctl)?;
+    ctl.check()?;
     // A number past f32's range decodes as infinity, which no save could write back (#6862).
     if let Err(crate::finite::Problem::NonFinite { path }) = crate::finite::check(&m) {
         return Err(FormatError::corrupt(format!("`{path}` is out of range")));
@@ -217,10 +265,11 @@ pub(crate) fn read_manifest(src: &dyn ByteSource, opts: &LoadOptions) -> Result<
 
 /// Decodes layers one at a time, group children first. Decoding the whole tree in one go costs
 /// kilobytes of stack per nesting level; here each level only holds a few pointers.
-fn layers_from_json(values: Vec<serde_json::Value>) -> Result<Vec<LayerM>> {
+fn layers_from_json(values: Vec<serde_json::Value>, ctl: &Interrupt) -> Result<Vec<LayerM>> {
     let mut out = Vec::with_capacity(values.len());
     for mut v in values {
-        let children = layers_from_json(take_array(&mut v, "/content/children"))?;
+        ctl.check()?;
+        let children = layers_from_json(take_array(&mut v, "/content/children"), ctl)?;
         out.push(layer_from_json(v, children)?);
     }
     Ok(out)
@@ -246,6 +295,7 @@ fn take_array(v: &mut serde_json::Value, pointer: &str) -> Vec<serde_json::Value
 
 struct LoadFetch<'a> {
     src: &'a dyn ByteSource,
+    ctl: Interrupt<'a>,
     opts: LoadOptions,
     total: u64,
     blobs: HashMap<String, Arc<Vec<u8>>>,
@@ -253,7 +303,8 @@ struct LoadFetch<'a> {
 
 impl LoadFetch<'_> {
     fn account(&mut self, n: usize) -> Result<()> {
-        self.total += n as u64;
+        self.ctl.check()?;
+        self.total = self.total.saturating_add(n as u64);
         if self.total > self.opts.max_total_bytes {
             return Err(FormatError::LimitExceeded(format!("bundle expands beyond {} bytes", self.opts.max_total_bytes)));
         }
@@ -262,6 +313,10 @@ impl LoadFetch<'_> {
 }
 
 impl Fetch for LoadFetch<'_> {
+    fn check(&self) -> Result<()> {
+        self.ctl.check().map_err(Into::into)
+    }
+
     fn tile(&mut self, hash: &str, len: usize) -> Result<Vec<u8>> {
         if !is_valid_hash(hash) {
             return Err(FormatError::corrupt(format!("invalid tile hash `{hash}`")));
@@ -269,14 +324,15 @@ impl Fetch for LoadFetch<'_> {
         self.account(len)?;
         let path = tile_path(hash);
         let z = self.src.get(&path, len + len / 8 + 4096)?;
-        let data = decompress(&z, len, &path)?;
-        if hash_bytes(&data) != hash {
+        let data = decompress_bounded_with(&z, len, Some(len), &path, &self.ctl)?;
+        if hash_bytes_interruptible(&data, &self.ctl)? != hash {
             return Err(FormatError::corrupt(format!("{path}: content does not match its hash")));
         }
         Ok(data)
     }
 
     fn blob(&mut self, hash: &str) -> Result<Arc<Vec<u8>>> {
+        self.ctl.check()?;
         if let Some(b) = self.blobs.get(hash) {
             return Ok(b.clone());
         }
@@ -287,9 +343,11 @@ impl Fetch for LoadFetch<'_> {
         let z = self.src.get(&path, self.opts.max_blob_bytes)?;
         // Blob length is not in the manifest; the frame header bounds it and
         // we cap at max_blob_bytes.
-        let data = decompress_bounded(&z, self.opts.max_blob_bytes, None, &path)?;
+        let remaining = usize::try_from(self.opts.max_total_bytes.saturating_sub(self.total)).unwrap_or(usize::MAX);
+        let max = self.opts.max_blob_bytes.min(remaining);
+        let data = decompress_bounded_with(&z, max, None, &path, &self.ctl)?;
         self.account(data.len())?;
-        if hash_bytes(&data) != hash {
+        if hash_bytes_interruptible(&data, &self.ctl)? != hash {
             return Err(FormatError::corrupt(format!("{path}: content does not match its hash")));
         }
         let data = Arc::new(data);
@@ -314,9 +372,13 @@ fn admit_canvas(size: photocraft_geom::Size, opts: &LoadOptions) -> Result<()> {
 }
 
 pub(crate) fn load(src: &dyn ByteSource, opts: &LoadOptions) -> Result<Document> {
-    let m = read_manifest(src, opts)?;
+    load_interruptible(src, opts, &Interrupt::NONE)
+}
+
+pub(crate) fn load_interruptible(src: &dyn ByteSource, opts: &LoadOptions, ctl: &Interrupt) -> Result<Document> {
+    let m = read_manifest_interruptible(src, opts, ctl)?;
     admit_canvas(m.document.size, opts)?;
-    let mut fetch = LoadFetch { src, opts: *opts, total: 0, blobs: HashMap::new() };
+    let mut fetch = LoadFetch { src, ctl: *ctl, opts: *opts, total: 0, blobs: HashMap::new() };
     let mut loader = Loader {
         fetch: &mut fetch,
         preserve_ids: opts.preserve_ids,
@@ -325,7 +387,9 @@ pub(crate) fn load(src: &dyn ByteSource, opts: &LoadOptions) -> Result<Document>
         legacy_linked_contents: HashMap::new(),
         tiles: HashMap::new(),
     };
-    loader.document(&m.document)
+    let doc = loader.document(&m.document)?;
+    ctl.check()?;
+    Ok(doc)
 }
 
 // ---------------------------------------------------------------------------
@@ -354,49 +418,90 @@ type TileHashCache = HashMap<(usize, SampleType), (Weak<Tile>, Hash)>;
 
 #[derive(Default)]
 struct Collect<'c> {
+    ctl: Interrupt<'c>,
+    limits: SaveLimits,
+    total: u64,
     tiles: BTreeMap<Hash, (Arc<Tile>, SampleType)>,
     blobs: BTreeMap<Hash, Arc<Vec<u8>>>,
     hash_cache: Option<&'c mut TileHashCache>,
     blob_hash_cache: Option<&'c mut BlobHashCache>,
 }
 
+impl Collect<'_> {
+    fn account(&mut self, bytes: usize) -> Result<()> {
+        self.total = self.total.saturating_add(bytes as u64);
+        if self.total > self.limits.max_total_bytes {
+            return Err(FormatError::LimitExceeded("save payload bytes".into()));
+        }
+        Ok(())
+    }
+}
+
+fn hash_for_save(bytes: &[u8], ctl: &Interrupt) -> Result<Hash> {
+    let mut h = blake3::Hasher::new();
+    for chunk in bytes.chunks(64 << 10) {
+        ctl.check()?;
+        h.update(chunk);
+    }
+    ctl.check()?;
+    Ok(h.finalize().to_hex().to_string())
+}
+
 impl Sink for Collect<'_> {
+    fn check(&self) -> Result<()> {
+        self.ctl.check().map_err(Into::into)
+    }
+
     /// Reuses hashes by allocation and sample byte order without upgrading weak references.
-    fn tile(&mut self, format: PixelFormat, tile: &Arc<Tile>) -> Hash {
+    fn tile(&mut self, format: PixelFormat, tile: &Arc<Tile>) -> Result<Hash> {
+        self.ctl.check()?;
         let key = (Arc::as_ptr(tile) as usize, format.sample);
         if let Some(cache) = self.hash_cache.as_deref_mut()
             && let Some((w, h)) = cache.get(&key)
             && std::ptr::eq(w.as_ptr(), Arc::as_ptr(tile))
         {
             let h = h.clone();
+            if !self.tiles.contains_key(&h) {
+                self.account(tile.bytes().len())?;
+            }
             self.tiles.entry(h.clone()).or_insert_with(|| (tile.clone(), format.sample));
-            return h;
+            return Ok(h);
         }
-        let h = hash_bytes(&tile_le(tile, format.sample));
+        let h = hash_for_save(&tile_le(tile, format.sample), &self.ctl)?;
+        if !self.tiles.contains_key(&h) {
+            self.account(tile.bytes().len())?;
+        }
         if let Some(cache) = self.hash_cache.as_deref_mut() {
             cache.insert(key, (Arc::downgrade(tile), h.clone()));
         }
         self.tiles.entry(h.clone()).or_insert_with(|| (tile.clone(), format.sample));
-        h
+        Ok(h)
     }
 
     /// Reuses hashes for the same allocation without upgrading weak references.
-    fn blob(&mut self, data: &Arc<Vec<u8>>) -> Hash {
+    fn blob(&mut self, data: &Arc<Vec<u8>>) -> Result<Hash> {
+        self.ctl.check()?;
         let key = Arc::as_ptr(data) as usize;
         if let Some(cache) = self.blob_hash_cache.as_deref_mut()
             && let Some((w, h)) = cache.get(&key)
             && std::ptr::eq(w.as_ptr(), Arc::as_ptr(data))
         {
             let h = h.clone();
+            if !self.blobs.contains_key(&h) {
+                self.account(data.len())?;
+            }
             self.blobs.entry(h.clone()).or_insert_with(|| data.clone());
-            return h;
+            return Ok(h);
         }
-        let h = hash_bytes(data);
+        let h = hash_for_save(data, &self.ctl)?;
+        if !self.blobs.contains_key(&h) {
+            self.account(data.len())?;
+        }
         if let Some(cache) = self.blob_hash_cache.as_deref_mut() {
             cache.insert(key, (Arc::downgrade(data), h.clone()));
         }
         self.blobs.entry(h.clone()).or_insert_with(|| data.clone());
-        h
+        Ok(h)
     }
 }
 
@@ -847,10 +952,12 @@ fn existing_object_is_valid(path: &Path, object: &Object, what: &str) -> Result<
 type Compressed<'a> = (&'a String, Arc<Vec<u8>>);
 
 /// Compresses `objects` on scoped worker threads (sequentially on wasm).
-fn par_compress<'a>(objects: &[(&'a String, &'a Object)]) -> Result<Vec<Compressed<'a>>> {
+fn par_compress_with<'a>(objects: &[(&'a String, &'a Object)], limits: &SaveLimits, ctl: &Interrupt) -> Result<Vec<Compressed<'a>>> {
+    ctl.check()?;
     let threads = if cfg!(target_arch = "wasm32") { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 32) };
+    let threads = threads.min(limits.max_workers).max(1);
     if threads < 2 || objects.len() < 2 {
-        return Ok(objects.iter().map(|(p, o)| (*p, Arc::new(o.compressed()))).collect());
+        return objects.iter().map(|(p, o)| o.compressed_with(limits.max_output_bytes, ctl).map(|b| (*p, Arc::new(b)))).collect();
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|sc| {
@@ -859,11 +966,12 @@ fn par_compress<'a>(objects: &[(&'a String, &'a Object)]) -> Result<Vec<Compress
                 sc.spawn(|| {
                     let mut out = Vec::new();
                     loop {
+                        ctl.check()?;
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some((p, o)) = objects.get(i) else { break };
-                        out.push((*p, Arc::new(o.compressed())));
+                        out.push((*p, Arc::new(o.compressed_with(limits.max_output_bytes, ctl)?)));
                     }
-                    out
+                    Ok::<_, FormatError>(out)
                 })
             })
             .collect();
@@ -872,7 +980,10 @@ fn par_compress<'a>(objects: &[(&'a String, &'a Object)]) -> Result<Vec<Compress
         let joined: Vec<_> = hs.into_iter().map(|h| h.join()).collect();
         let mut out = Vec::with_capacity(objects.len());
         for r in joined {
-            out.extend(r.map_err(|_| FormatError::Io(std::io::Error::other("compression worker panicked")))?);
+            for object in r.map_err(|_| FormatError::Io(std::io::Error::other("compression worker panicked")))?? {
+                ctl.check()?;
+                out.push(object);
+            }
         }
         Ok(out)
     })
@@ -904,11 +1015,28 @@ impl PcraftWriter {
     }
 
     fn prepare(&mut self, doc: &Document, opts: &SaveOptions) -> Result<Prepared> {
-        self.hash_cache.retain(|_, (w, _)| w.strong_count() > 0);
-        self.blob_hash_cache.retain(|_, (w, _)| w.strong_count() > 0);
-        convert::check_nesting(&doc.layers)?;
-        let mut c = Collect { hash_cache: Some(&mut self.hash_cache), blob_hash_cache: Some(&mut self.blob_hash_cache), ..Default::default() };
-        let document = convert::doc_m(doc, &mut c);
+        self.prepare_interruptible(doc, opts, &SaveLimits::default(), &Interrupt::NONE)
+    }
+
+    fn prepare_interruptible(&mut self, doc: &Document, opts: &SaveOptions, limits: &SaveLimits, ctl: &Interrupt) -> Result<Prepared> {
+        ctl.check()?;
+        // extract_if can stop early, unlike retain. Losing a reuse entry on cancellation
+        // changes only the cache, never the document or archive.
+        for _ in self.hash_cache.extract_if(|_, (w, _)| ctl.cancelled() || w.strong_count() == 0) {
+            ctl.check()?;
+        }
+        for _ in self.blob_hash_cache.extract_if(|_, (w, _)| ctl.cancelled() || w.strong_count() == 0) {
+            ctl.check()?;
+        }
+        convert::check_nesting(&doc.layers, ctl)?;
+        let mut c = Collect {
+            hash_cache: Some(&mut self.hash_cache),
+            blob_hash_cache: Some(&mut self.blob_hash_cache),
+            ctl: *ctl,
+            limits: *limits,
+            ..Default::default()
+        };
+        let document = convert::doc_m(doc, &mut c)?;
         let manifest = Manifest {
             format_version: FORMAT_VERSION,
             generator: format!("photocraft-format {}", env!("CARGO_PKG_VERSION")),
@@ -918,18 +1046,34 @@ impl PcraftWriter {
         };
         // serde_json writes NaN and the infinities as `null`, which the manifest's float fields
         // refuse on load (issue #1101): refuse the save instead, naming the value.
-        crate::finite::check(&manifest).map_err(|e| match e {
-            crate::finite::Problem::NonFinite { path } => FormatError::NonFinite { path },
-            crate::finite::Problem::Other(m) => FormatError::Unsupported(format!("manifest: {m}")),
+        crate::finite::check_with(&manifest, ctl).map_err(|e| {
+            if ctl.cancelled() {
+                return FormatError::Cancelled(photocraft_raster::Cancelled);
+            }
+            match e {
+                crate::finite::Problem::NonFinite { path } => FormatError::NonFinite { path },
+                crate::finite::Problem::Other(m) => FormatError::Unsupported(format!("manifest: {m}")),
+            }
         })?;
-        let manifest = serde_json::to_vec_pretty(&manifest)?;
-        check_manifest_depth(&manifest)?;
+        ctl.check()?;
+        let mut writer = ManifestOutput { bytes: Vec::new(), max: limits.max_manifest_bytes, ctl: *ctl, full: false };
+        if let Err(e) = serde_json::to_writer_pretty(&mut writer, &manifest) {
+            ctl.check()?;
+            if writer.full {
+                return Err(FormatError::LimitExceeded("save manifest bytes".into()));
+            }
+            return Err(e.into());
+        }
+        let manifest = writer.bytes;
+        check_manifest_depth_with(&manifest, ctl)?;
         let stats = SaveStats { tiles_total: c.tiles.len(), blobs_total: c.blobs.len(), manifest_bytes: manifest.len(), ..Default::default() };
         let mut objects = BTreeMap::new();
         for (h, (t, s)) in c.tiles {
+            ctl.check()?;
             objects.insert(tile_path(&h), Object::Tile(t, s));
         }
         for (h, b) in c.blobs {
+            ctl.check()?;
             objects.insert(blob_path(&h), Object::Blob(b));
         }
         Ok(Prepared { manifest, objects, stats })
@@ -937,20 +1081,41 @@ impl PcraftWriter {
 
     /// Save as a ZIP bundle in memory.
     pub fn save_zip(&mut self, doc: &Document, opts: &SaveOptions) -> Result<(Vec<u8>, SaveStats)> {
-        // Another thread encodes the previews while the document is collected and its new
-        // objects are compressed on all cores (zstd dominates a full save).
-        let (previews, prepared) = beside(
-            opts.thumbnail.is_some() || opts.composite.is_some(),
-            || previews(opts),
-            || -> Result<_> {
-                let p = self.prepare(doc, opts)?;
-                let todo: Vec<(&String, &Object)> = p.objects.iter().filter(|(path, _)| !self.compressed.contains_key(*path)).collect();
-                let fresh: HashMap<String, Arc<Vec<u8>>> = par_compress(&todo)?.into_iter().map(|(path, data)| (path.clone(), data)).collect();
-                Ok((p, fresh))
-            },
-        );
-        let (p, mut fresh) = prepared?;
-        let previews = previews?;
+        self.save_zip_interruptible(doc, opts, &SaveLimits::default(), &Interrupt::NONE)
+    }
+
+    /// Save an archive with caller budgets and cooperative cancellation.
+    pub fn save_zip_interruptible(&mut self, doc: &Document, opts: &SaveOptions, limits: &SaveLimits, ctl: &Interrupt) -> Result<(Vec<u8>, SaveStats)> {
+        ctl.check()?;
+        if limits.max_workers == 0 {
+            return Err(FormatError::LimitExceeded("save needs at least one compression worker".into()));
+        }
+        for preview in [&opts.thumbnail, &opts.composite].into_iter().flatten() {
+            if u64::from(preview.width) * u64::from(preview.height) > limits.max_preview_pixels {
+                return Err(FormatError::LimitExceeded("save preview pixels".into()));
+            }
+        }
+        let mut previews = Vec::new();
+        for (name, preview) in [(THUMB, &opts.thumbnail), (COMPOSITE, &opts.composite)] {
+            ctl.check()?;
+            if let Some(preview) = preview {
+                previews.push((name, png(preview)?));
+            }
+        }
+        let p = self.prepare_interruptible(doc, opts, limits, ctl)?;
+        let mut todo = Vec::new();
+        for (path, object) in &p.objects {
+            ctl.check()?;
+            if !self.compressed.contains_key(path) {
+                todo.push((path, object));
+            }
+        }
+        let mut fresh = HashMap::new();
+        for (path, data) in par_compress_with(&todo, limits, ctl)? {
+            ctl.check()?;
+            fresh.insert(path.clone(), data);
+        }
+        ctl.check()?;
         let mut stats = p.stats;
         let mut next = HashMap::with_capacity(p.objects.len());
         let mut cached_bytes = 0usize;
@@ -961,12 +1126,13 @@ impl PcraftWriter {
                 let size = self.compressed.get(path).or_else(|| fresh.get(path)).map_or(0, |data| data.len());
                 (path.as_str(), size)
             }));
-        let mut z = ZipWriter::with_entries(entries)?;
-        z.add(MANIFEST, &p.manifest)?;
+        let mut z = ZipWriter::with_entries(entries, limits.max_output_bytes, ctl)?;
+        z.add_interruptible(MANIFEST, &p.manifest, ctl)?;
         for (name, data) in &previews {
-            z.add(name, data)?;
+            z.add_interruptible(name, data, ctl)?;
         }
         for (path, obj) in &p.objects {
+            ctl.check()?;
             let (key, data) = match self.compressed.remove_entry(path) {
                 Some((key, data)) => {
                     if matches!(obj, Object::Tile(..)) {
@@ -979,17 +1145,18 @@ impl PcraftWriter {
                         Object::Tile(..) => stats.tiles_written += 1,
                         Object::Blob(_) => stats.blobs_written += 1,
                     }
-                    (None, fresh.remove(path).unwrap_or_else(|| Arc::new(obj.compressed())))
+                    (None, fresh.remove(path).ok_or_else(|| FormatError::corrupt("missing prepared save object"))?)
                 }
             };
-            z.add(path, &data)?;
+            z.add_interruptible(path, &data, ctl)?;
             if data.capacity() <= self.compressed_budget.saturating_sub(cached_bytes) {
                 cached_bytes += data.capacity();
                 next.insert(key.unwrap_or_else(|| path.clone()), data);
             }
         }
+        ctl.check()?;
         self.compressed = next;
-        Ok((z.finish()?, stats))
+        Ok((z.finish_interruptible(ctl)?, stats))
     }
 
     /// Save into a directory bundle: reuses only valid existing objects,
@@ -1167,7 +1334,7 @@ fn tile_hash_cache_keeps_sample_byte_order_in_its_identity() {
     let mut collect = Collect { hash_cache: Some(&mut cache), ..Default::default() };
     for sample in [SampleType::U8, SampleType::U16] {
         let format = if sample == SampleType::U8 { PixelFormat::RGBA8 } else { PixelFormat::new(photocraft_color::ColorMode::Grayscale, sample, true) };
-        assert_eq!(collect.tile(format, tile), hash_bytes(&tile_le(tile, sample)));
+        assert_eq!(collect.tile(format, tile).unwrap(), hash_bytes(&tile_le(tile, sample)));
     }
     drop(collect);
     assert_eq!(cache.len(), 2);
@@ -1180,12 +1347,12 @@ fn blob_hash_cache_tracks_arc_identity_without_retaining_payloads() {
     let original = Arc::new(vec![1, 2, 3]);
     let weak = Arc::downgrade(&original);
     let mut collect = Collect { blob_hash_cache: Some(&mut cache), ..Default::default() };
-    let hash = collect.blob(&original);
-    assert_eq!(collect.blob(&original), hash);
+    let hash = collect.blob(&original).unwrap();
+    assert_eq!(collect.blob(&original).unwrap(), hash);
     let mut edited = original.clone();
     Arc::make_mut(&mut edited)[0] = 7;
-    assert_eq!(collect.blob(&edited), hash_bytes(&[7, 2, 3]));
-    assert_ne!(collect.blob(&edited), hash);
+    assert_eq!(collect.blob(&edited).unwrap(), hash_bytes(&[7, 2, 3]));
+    assert_ne!(collect.blob(&edited).unwrap(), hash);
     drop(collect);
     assert_eq!(cache.len(), 2);
     drop(original);
@@ -1410,3 +1577,144 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 
 #[cfg(all(test, windows))]
 mod durability_tests;
+
+#[cfg(test)]
+#[test]
+fn manifest_reader_interrupts_inside_a_string() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let json = format!("\"{}\"", "x".repeat(1 << 20));
+    let calls = AtomicUsize::new(0);
+    let cancel = || calls.fetch_add(1, Ordering::Relaxed) >= 2;
+    let mut reader = crate::InterruptReader { bytes: json.as_bytes(), offset: 0, ctl: Interrupt::cancel_only(&cancel), cancelled: false };
+    let result = serde_json::from_reader::<_, serde_json::Value>(&mut reader);
+    assert!(result.is_err());
+    assert!(reader.cancelled);
+    assert_eq!(reader.offset, 128 << 10);
+}
+
+struct ManifestOutput<'a> {
+    bytes: Vec<u8>,
+    max: usize,
+    ctl: Interrupt<'a>,
+    full: bool,
+}
+impl Write for ManifestOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.ctl.cancelled() {
+            return Err(std::io::Error::other("cancelled"));
+        }
+        if bytes.len() > self.max.saturating_sub(self.bytes.len()) {
+            self.full = true;
+            return Err(std::io::Error::other("manifest budget exceeded"));
+        }
+        for chunk in bytes.chunks(64 << 10) {
+            if self.ctl.cancelled() {
+                return Err(std::io::Error::other("cancelled"));
+            }
+            self.bytes.try_reserve(chunk.len()).map_err(|e| std::io::Error::other(e.to_string()))?;
+            self.bytes.extend_from_slice(chunk);
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct CompressionSource<'a> {
+    bytes: &'a [u8],
+    ctl: Interrupt<'a>,
+    full: &'a std::cell::Cell<bool>,
+}
+impl Read for CompressionSource<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        // ruzstd's encoder unwraps I/O errors. End its input on interruption and discard the
+        // resulting truncated object below; never inject an I/O error that would panic.
+        if self.ctl.cancelled() || self.full.get() {
+            return Ok(0);
+        }
+        let n = output.len().min(self.bytes.len()).min(64 << 10);
+        output[..n].copy_from_slice(&self.bytes[..n]);
+        self.bytes = &self.bytes[n..];
+        Ok(n)
+    }
+}
+struct CompressionOutput<'a> {
+    bytes: Vec<u8>,
+    max: usize,
+    full: &'a std::cell::Cell<bool>,
+}
+impl Write for CompressionOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.max.saturating_sub(self.bytes.len()) || self.bytes.try_reserve(bytes.len()).is_err() {
+            self.full.set(true);
+        }
+        if !self.full.get() {
+            self.bytes.extend_from_slice(bytes);
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl Object {
+    fn compressed_with(&self, max: usize, ctl: &Interrupt) -> Result<Vec<u8>> {
+        ctl.check()?;
+        let bytes = self.content();
+        let full = std::cell::Cell::new(false);
+        let source = CompressionSource { bytes: &bytes, ctl: *ctl, full: &full };
+        let mut output = CompressionOutput { bytes: Vec::new(), max, full: &full };
+        ruzstd::encoding::compress(source, &mut output, ruzstd::encoding::CompressionLevel::Fastest);
+        ctl.check()?;
+        if full.get() {
+            return Err(FormatError::LimitExceeded("compressed save object bytes or memory".into()));
+        }
+        Ok(output.bytes)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn empty_zstd_blocks_still_check_cancellation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Single-segment frame of zero bytes, followed by empty raw blocks.
+    let mut data = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, 0];
+    data.extend(std::iter::repeat_n(0, 300_000));
+    data.extend([1, 0, 0]);
+    assert!(decompress_bounded(&data, 0, None, "empty").unwrap().is_empty());
+    let checks = AtomicUsize::new(0);
+    let cancel = || checks.fetch_add(1, Ordering::Relaxed) >= 3;
+    assert!(matches!(decompress_bounded_with(&data, 0, None, "empty", &Interrupt::cancel_only(&cancel)), Err(FormatError::Cancelled(_))));
+}
+
+#[cfg(test)]
+#[test]
+fn controlled_compression_matches_existing_bytes_and_stops_inside_an_object() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let object = Object::Blob(Arc::new((0..(4 << 20)).map(|i| (i * 13) as u8).collect()));
+    assert_eq!(object.compressed_with(usize::MAX, &Interrupt::NONE).unwrap(), object.compressed());
+    assert!(matches!(object.compressed_with(1, &Interrupt::NONE), Err(FormatError::LimitExceeded(_))));
+    let checks = AtomicUsize::new(0);
+    let flipped = std::sync::Mutex::new(None);
+    let cancel = || {
+        let n = checks.fetch_add(1, Ordering::Relaxed);
+        if n == 3 {
+            *flipped.lock().unwrap() = Some(std::time::Instant::now());
+        }
+        n > 3
+    };
+    assert!(matches!(object.compressed_with(usize::MAX, &Interrupt::cancel_only(&cancel)), Err(FormatError::Cancelled(_))));
+    eprintln!("zstd save compression cancellation-to-return after false checkpoint: {:?}", flipped.lock().unwrap().unwrap().elapsed());
+}
+
+#[cfg(test)]
+#[test]
+fn manifest_depth_scan_can_stop_inside_a_long_string() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut bytes = vec![b'a'; 1 << 20];
+    bytes[0] = b'"';
+    let calls = AtomicUsize::new(0);
+    let cancel = || calls.fetch_add(1, Ordering::Relaxed) >= 4;
+    assert!(matches!(check_manifest_depth_with(&bytes, &Interrupt::cancel_only(&cancel)), Err(FormatError::Cancelled(_))));
+}

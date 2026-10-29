@@ -26,22 +26,34 @@ fn too_deep() -> FormatError {
 }
 
 /// Refuses to save a document the loader would reject for its group nesting.
-pub(crate) fn check_nesting(layers: &[Layer]) -> Result<()> {
-    // Bounded recursion: it stops at the first layer past the limit.
-    fn too_deep_at(layers: &[Layer], depth: usize) -> bool {
-        (depth > MAX_GROUP_DEPTH && !layers.is_empty())
-            || layers.iter().any(|l| matches!(&l.content, LayerContent::Group(g) if too_deep_at(&g.children, depth + 1)))
+pub(crate) fn check_nesting(layers: &[Layer], ctl: &photocraft_raster::Interrupt) -> Result<()> {
+    fn check_at(layers: &[Layer], depth: usize, ctl: &photocraft_raster::Interrupt) -> Result<()> {
+        ctl.check()?;
+        if depth > MAX_GROUP_DEPTH && !layers.is_empty() {
+            return Err(too_deep());
+        }
+        for layer in layers {
+            ctl.check()?;
+            if let LayerContent::Group(group) = &layer.content {
+                check_at(&group.children, depth + 1, ctl)?;
+            }
+        }
+        Ok(())
     }
-    if too_deep_at(layers, 0) { Err(too_deep()) } else { Ok(()) }
+    check_at(layers, 0, ctl)
 }
 
 pub(crate) trait Sink {
+    fn check(&self) -> Result<()>;
     /// Register a tile, returning its hash.
-    fn tile(&mut self, format: PixelFormat, tile: &Arc<Tile>) -> Hash;
-    fn blob(&mut self, data: &Arc<Vec<u8>>) -> Hash;
+    fn tile(&mut self, format: PixelFormat, tile: &Arc<Tile>) -> Result<Hash>;
+    fn blob(&mut self, data: &Arc<Vec<u8>>) -> Result<Hash>;
 }
 
 pub(crate) trait Fetch {
+    fn check(&self) -> Result<()> {
+        Ok(())
+    }
     /// Canonical (little-endian) tile bytes of the given expected length.
     fn tile(&mut self, hash: &str, len: usize) -> Result<Vec<u8>>;
     fn blob(&mut self, hash: &str) -> Result<Arc<Vec<u8>>>;
@@ -103,37 +115,60 @@ pub(crate) fn tile_len(format: &PixelFormat) -> usize {
 // Save
 // ---------------------------------------------------------------------------
 
-fn surface_m(s: &Surface, sink: &mut dyn Sink) -> SurfaceM {
+fn surface_m(s: &Surface, sink: &mut dyn Sink) -> Result<SurfaceM> {
+    sink.check()?;
     let f = s.format();
     let mut dp = vec![0u8; f.bytes_per_pixel()];
     encode_pixel(&f, &s.default_pixel(), &mut dp);
     swap_to_le(&mut dp, f.sample);
-    SurfaceM { format: f, default: hex(&dp), tiles: s.tiles().map(|(c, t)| TileRef { tx: c.tx, ty: c.ty, hash: sink.tile(f, t) }).collect() }
+    Ok(SurfaceM {
+        format: f,
+        default: hex(&dp),
+        tiles: s.tiles().map(|(c, t)| Ok(TileRef { tx: c.tx, ty: c.ty, hash: sink.tile(f, t)? })).collect::<Result<_>>()?,
+    })
 }
 
-fn opt_blob(b: &Option<Arc<Vec<u8>>>, sink: &mut dyn Sink) -> Option<Hash> {
-    b.as_ref().map(|b| sink.blob(b))
+fn opt_blob(b: &Option<Arc<Vec<u8>>>, sink: &mut dyn Sink) -> Result<Option<Hash>> {
+    b.as_ref().map(|b| sink.blob(b)).transpose()
 }
 
-fn video_m(v: &photocraft_doc::VideoData, sink: &mut dyn Sink) -> crate::manifest::VideoDataM {
-    crate::manifest::VideoDataM {
-        frames: v.frames.iter().map(|f| surface_m(f, sink)).collect(),
-        original_frames: v.original_frames.as_ref().map(|frames| frames.iter().map(|f| surface_m(f, sink)).collect()),
+fn video_m(v: &photocraft_doc::VideoData, sink: &mut dyn Sink) -> Result<crate::manifest::VideoDataM> {
+    sink.check()?;
+    Ok(crate::manifest::VideoDataM {
+        frames: v.frames.iter().map(|f| surface_m(f, sink)).collect::<Result<_>>()?,
+        original_frames: v.original_frames.as_ref().map(|frames| frames.iter().map(|f| surface_m(f, sink)).collect::<Result<_>>()).transpose()?,
         source: v.source.clone(),
         fps: v.fps,
         show_altered: v.show_altered,
-    }
+    })
 }
 
-fn layer_m(l: &Layer, sink: &mut dyn Sink) -> LayerM {
+// Keep the large LayerM result and its fallible construction off recursive frames.
+fn layers_m(layers: &[Layer], sink: &mut dyn Sink) -> Result<Vec<LayerM>> {
+    let mut out = Vec::with_capacity(layers.len());
+    for layer in layers {
+        sink.check()?;
+        let children = match &layer.content {
+            LayerContent::Group(group) => layers_m(&group.children, sink)?,
+            _ => Vec::new(),
+        };
+        push_layer(&mut out, layer, children, sink)?;
+    }
+    Ok(out)
+}
+
+#[inline(never)]
+fn push_layer(out: &mut Vec<LayerM>, layer: &Layer, children: Vec<LayerM>, sink: &mut dyn Sink) -> Result<()> {
+    out.push(layer_m(layer, children, sink)?);
+    Ok(())
+}
+
+#[inline(never)]
+fn layer_m(l: &Layer, children: Vec<LayerM>, sink: &mut dyn Sink) -> Result<LayerM> {
+    sink.check()?;
     let content = match &l.content {
-        LayerContent::Raster(s) => ContentM::Raster { surface: surface_m(s, sink) },
-        LayerContent::Group(g) => ContentM::Group {
-            children: g.children.iter().map(|c| layer_m(c, sink)).collect(),
-            expanded: g.expanded,
-            artboard: g.artboard.clone(),
-            frame_stroke: g.frame_stroke.clone(),
-        },
+        LayerContent::Raster(s) => ContentM::Raster { surface: surface_m(s, sink)? },
+        LayerContent::Group(g) => ContentM::Group { children, expanded: g.expanded, artboard: g.artboard.clone(), frame_stroke: g.frame_stroke.clone() },
         LayerContent::Adjustment(a) => ContentM::Adjustment { adjustment: a.clone() },
         LayerContent::Fill(f) => ContentM::Fill { fill: f.clone() },
         LayerContent::Text(t) => ContentM::Text {
@@ -142,8 +177,8 @@ fn layer_m(l: &Layer, sink: &mut dyn Sink) -> LayerM {
             size_pt: t.size_pt,
             color: t.color,
             transform: t.transform,
-            cache: t.cache.as_ref().map(|s| surface_m(s, sink)),
-            psd_raw: opt_blob(&t.psd_raw, sink),
+            cache: t.cache.as_ref().map(|s| surface_m(s, sink)).transpose()?,
+            psd_raw: opt_blob(&t.psd_raw, sink)?,
             runs: t.runs.clone(),
             paragraphs: t.paragraphs.clone(),
             shape: t.shape.clone(),
@@ -153,8 +188,8 @@ fn layer_m(l: &Layer, sink: &mut dyn Sink) -> LayerM {
         },
         LayerContent::Shape(s) => ContentM::Shape {
             fill: s.fill.clone(),
-            cache: s.cache.as_ref().map(|c| surface_m(c, sink)),
-            psd_raw: opt_blob(&s.psd_raw, sink),
+            cache: s.cache.as_ref().map(|c| surface_m(c, sink)).transpose()?,
+            psd_raw: opt_blob(&s.psd_raw, sink)?,
             path: s.path.clone(),
             stroke: s.stroke.clone(),
             live: s.live.clone(),
@@ -164,27 +199,33 @@ fn layer_m(l: &Layer, sink: &mut dyn Sink) -> LayerM {
         LayerContent::Smart(s) => ContentM::Smart {
             contents_id: Some(s.contents_id.0),
             source: match &s.source {
-                SmartSource::Embedded { file_name, bytes } => SmartSourceM::Embedded { file_name: file_name.clone(), blob: sink.blob(bytes) },
+                SmartSource::Embedded { file_name, bytes } => SmartSourceM::Embedded { file_name: file_name.clone(), blob: sink.blob(bytes)? },
                 SmartSource::Linked { path } => SmartSourceM::Linked { path: path.clone() },
             },
             transform: s.transform,
             smart_filters: s.smart_filters.clone(),
-            cache: s.cache.as_ref().map(|c| surface_m(c, sink)),
-            psd_raw: opt_blob(&s.psd_raw, sink),
+            cache: s.cache.as_ref().map(|c| surface_m(c, sink)).transpose()?,
+            psd_raw: opt_blob(&s.psd_raw, sink)?,
             filters_enabled: s.filters_enabled,
-            filter_mask: s.filter_mask.as_ref().map(|m| MaskM {
-                surface: surface_m(&m.surface, sink),
-                enabled: m.enabled,
-                linked: m.linked,
-                density: m.density,
-                feather: m.feather,
-            }),
+            filter_mask: s
+                .filter_mask
+                .as_ref()
+                .map(|m| {
+                    Ok::<_, FormatError>(MaskM {
+                        surface: surface_m(&m.surface, sink)?,
+                        enabled: m.enabled,
+                        linked: m.linked,
+                        density: m.density,
+                        feather: m.feather,
+                    })
+                })
+                .transpose()?,
             warp: s.warp.clone(),
             stack_mode: s.stack_mode,
             perspective: s.perspective,
         },
     };
-    LayerM {
+    Ok(LayerM {
         id: l.id.0,
         name: l.name.clone(),
         visible: l.visible,
@@ -193,95 +234,113 @@ fn layer_m(l: &Layer, sink: &mut dyn Sink) -> LayerM {
         opacity: l.opacity,
         fill_opacity: l.fill_opacity,
         clipped: l.clipped,
-        mask: l.mask.as_ref().map(|m| MaskM {
-            surface: surface_m(&m.surface, sink),
-            enabled: m.enabled,
-            linked: m.linked,
-            density: m.density,
-            feather: m.feather,
-        }),
+        mask: l
+            .mask
+            .as_ref()
+            .map(|m| {
+                Ok::<_, FormatError>(MaskM {
+                    surface: surface_m(&m.surface, sink)?,
+                    enabled: m.enabled,
+                    linked: m.linked,
+                    density: m.density,
+                    feather: m.feather,
+                })
+            })
+            .transpose()?,
         vector_mask: l.vector_mask.clone(),
         effects: EffectsM {
             enabled: l.effects.enabled,
             items: l.effects.items.clone(),
-            psd_raw: opt_blob(&l.effects.psd_raw, sink),
+            psd_raw: opt_blob(&l.effects.psd_raw, sink)?,
             reference: l.effects.reference,
         },
         label: l.label,
         content,
-        psd_blocks: l.psd_blocks.iter().map(|(k, d)| (hex(k), sink.blob(d))).collect(),
+        psd_blocks: l.psd_blocks.iter().map(|(k, d)| Ok((hex(k), sink.blob(d)?))).collect::<Result<_>>()?,
         psd_id: l.psd_id,
-        fill_cache: l.fill_cache.as_ref().map(|fc| FillCacheM { fill: fc.fill.clone(), surface: surface_m(&fc.surface, sink) }),
+        fill_cache: l
+            .fill_cache
+            .as_ref()
+            .map(|fc| Ok::<_, FormatError>(FillCacheM { fill: fc.fill.clone(), surface: surface_m(&fc.surface, sink)? }))
+            .transpose()?,
         link_group: l.link_group,
         excluded_channels: l.excluded_channels,
         blend_if: l.blend_if.clone(),
         advanced: l.advanced,
-        video: l.video.as_ref().map(|v| video_m(v, sink)),
+        video: l.video.as_ref().map(|v| video_m(v, sink)).transpose()?,
         xmp: l.xmp.as_deref().map(str::to_string),
-    }
+    })
 }
 
-fn channel_m(c: &AlphaChannel, sink: &mut dyn Sink) -> ChannelM {
+fn channel_m(c: &AlphaChannel, sink: &mut dyn Sink) -> Result<ChannelM> {
+    sink.check()?;
     // Destructured so a new `AlphaChannel` field fails to compile here until it is saved.
     let AlphaChannel { name, surface, spot, color, opacity, indicates } = c;
-    ChannelM { name: name.clone(), surface: surface_m(surface, sink), spot: *spot, color: *color, opacity: *opacity, indicates: *indicates }
+    Ok(ChannelM { name: name.clone(), surface: surface_m(surface, sink)?, spot: *spot, color: *color, opacity: *opacity, indicates: *indicates })
 }
 
-pub(crate) fn doc_m(d: &Document, sink: &mut dyn Sink) -> DocM {
-    DocM {
+pub(crate) fn doc_m(d: &Document, sink: &mut dyn Sink) -> Result<DocM> {
+    sink.check()?;
+    Ok(DocM {
         id: d.id.0,
         name: d.name.clone(),
         size: d.size,
         resolution_dpi: d.resolution_dpi,
         mode: d.mode,
         depth: d.depth,
-        icc_profile: opt_blob(&d.icc_profile, sink),
-        layers: d.layers.iter().map(|l| layer_m(l, sink)).collect(),
-        channels: d.channels.iter().map(|c| channel_m(c, sink)).collect(),
+        icc_profile: opt_blob(&d.icc_profile, sink)?,
+        layers: layers_m(&d.layers, sink)?,
+        channels: d.channels.iter().map(|c| channel_m(c, sink)).collect::<Result<_>>()?,
         guides: d.guides.clone(),
         ruler_origin: d.ruler_origin,
-        selection: d.selection.as_ref().map(|s| surface_m(s, sink)),
+        selection: d.selection.as_ref().map(|s| surface_m(s, sink)).transpose()?,
         metadata: MetadataM {
             xmp: d.metadata.xmp.as_deref().map(str::to_owned),
-            exif: opt_blob(&d.metadata.exif, sink),
+            exif: opt_blob(&d.metadata.exif, sink)?,
             text: d.metadata.text.clone(),
-            psd_resources: d.metadata.psd_resources.iter().map(|(id, n, b)| (*id, n.clone(), sink.blob(b))).collect(),
-            psd_global_blocks: d.metadata.psd_global_blocks.iter().map(|(s, k, b)| (hex(s), hex(k), sink.blob(b))).collect(),
+            psd_resources: d.metadata.psd_resources.iter().map(|(id, n, b)| Ok((*id, n.clone(), sink.blob(b)?))).collect::<Result<_>>()?,
+            psd_global_blocks: d.metadata.psd_global_blocks.iter().map(|(s, k, b)| Ok((hex(s), hex(k), sink.blob(b)?))).collect::<Result<_>>()?,
         },
         global_light: d.global_light,
-        paths: d.paths.iter().map(|p| NamedPathM { name: p.name.clone(), path: p.path.clone(), psd_raw: opt_blob(&p.psd_raw, sink) }).collect(),
+        paths: d
+            .paths
+            .iter()
+            .map(|p| Ok(NamedPathM { name: p.name.clone(), path: p.path.clone(), psd_raw: opt_blob(&p.psd_raw, sink)? }))
+            .collect::<Result<_>>()?,
         work_path: d.work_path.clone(),
         clipping_path: d.clipping_path.clone(),
-        quick_mask: d.quick_mask.as_ref().map(|c| channel_m(c, sink)),
+        quick_mask: d.quick_mask.as_ref().map(|c| channel_m(c, sink)).transpose()?,
         quick_mask_unselected: d.quick_mask_unselected,
         patterns: d
             .patterns
             .iter()
-            .map(|p| PatternM { id: p.id.clone(), name: p.name.clone(), width: p.width, height: p.height, surface: surface_m(&p.surface, sink) })
-            .collect(),
+            .map(|p| Ok(PatternM { id: p.id.clone(), name: p.name.clone(), width: p.width, height: p.height, surface: surface_m(&p.surface, sink)? }))
+            .collect::<Result<_>>()?,
         color_table: d.color_table.clone(),
         duotone: d.duotone.clone(),
         variables: d.variables.clone(),
         timeline: d.timeline.clone(),
         file_encoding: d.file_encoding,
-        layer_comps: d.layer_comps.iter().map(|c| comp_m(c, sink)).collect(),
+        layer_comps: d.layer_comps.iter().map(|c| comp_m(c, sink)).collect::<Result<_>>()?,
         last_applied_comp: d.last_applied_comp,
-        last_document_state: d.last_document_state.as_ref().map(|c| comp_m(c, sink)),
+        last_document_state: d.last_document_state.as_ref().map(|c| comp_m(c, sink)).transpose()?,
         measurement: d.measurement.clone(),
         notes: d.notes.clone(),
         text_styles: d.text_styles.clone(),
         slices: d.slices.clone(),
-    }
+    })
 }
 
-fn effects_m(e: &Effects, sink: &mut dyn Sink) -> EffectsM {
-    EffectsM { enabled: e.enabled, items: e.items.clone(), psd_raw: opt_blob(&e.psd_raw, sink), reference: e.reference }
+fn effects_m(e: &Effects, sink: &mut dyn Sink) -> Result<EffectsM> {
+    sink.check()?;
+    Ok(EffectsM { enabled: e.enabled, items: e.items.clone(), psd_raw: opt_blob(&e.psd_raw, sink)?, reference: e.reference })
 }
 
-fn comp_m(c: &LayerComp, sink: &mut dyn Sink) -> LayerCompM {
+fn comp_m(c: &LayerComp, sink: &mut dyn Sink) -> Result<LayerCompM> {
+    sink.check()?;
     // Destructured so a new `LayerComp` field fails to compile here until it is saved.
     let LayerComp { id, name, comment, apply_visibility, apply_position, apply_appearance, states } = c;
-    LayerCompM {
+    Ok(LayerCompM {
         id: *id,
         name: name.clone(),
         comment: comment.clone(),
@@ -291,19 +350,28 @@ fn comp_m(c: &LayerComp, sink: &mut dyn Sink) -> LayerCompM {
         states: states
             .iter()
             .map(|s| {
+                sink.check()?;
                 let CompLayerState { layer, visible, position, appearance } = s;
-                CompStateM {
+                Ok(CompStateM {
                     layer: layer.0,
                     visible: *visible,
                     position: *position,
-                    appearance: appearance.as_ref().map(|a| {
-                        let CompAppearance { blend, opacity, fill_opacity, effects } = a;
-                        CompAppearanceM { blend: *blend, opacity: *opacity, fill_opacity: *fill_opacity, effects: effects_m(effects, sink) }
-                    }),
-                }
+                    appearance: appearance
+                        .as_ref()
+                        .map(|a| {
+                            let CompAppearance { blend, opacity, fill_opacity, effects } = a;
+                            Ok::<_, FormatError>(CompAppearanceM {
+                                blend: *blend,
+                                opacity: *opacity,
+                                fill_opacity: *fill_opacity,
+                                effects: effects_m(effects, sink)?,
+                            })
+                        })
+                        .transpose()?,
+                })
             })
-            .collect(),
-    }
+            .collect::<Result<_>>()?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +403,7 @@ impl Loader<'_> {
     }
 
     fn surface(&mut self, m: &SurfaceM) -> Result<Surface> {
+        self.fetch.check()?;
         let f = m.format;
         let mut dp = unhex(&m.default)?;
         if dp.len() != f.bytes_per_pixel() {
@@ -347,6 +416,7 @@ impl Loader<'_> {
         // tile size): -8388608 ..= 8388606. A damaged manifest can name any index (#938).
         let fits = |i: i32| i.checked_mul(TILE_SIZE).is_some() && i.checked_add(1).and_then(|e| e.checked_mul(TILE_SIZE)).is_some();
         for t in &m.tiles {
+            self.fetch.check()?;
             if !fits(t.tx) || !fits(t.ty) {
                 return Err(FormatError::corrupt(format!("tile ({}, {}) is outside the coordinate range", t.tx, t.ty)));
             }
@@ -435,6 +505,7 @@ impl Loader<'_> {
     }
 
     fn layer(&mut self, m: &LayerM, depth: usize) -> Result<Layer> {
+        self.fetch.check()?;
         if depth > MAX_GROUP_DEPTH {
             return Err(too_deep());
         }
@@ -561,6 +632,7 @@ impl Loader<'_> {
     }
 
     pub(crate) fn document(&mut self, m: &DocM) -> Result<Document> {
+        self.fetch.check()?;
         // Reserve every stored id before allocating identities missing from older bundles. If an
         // id is implausibly large, remap the whole document while retaining shared contents groups.
         if self.preserve_ids {
@@ -700,6 +772,39 @@ pub(crate) fn reserve_ids_through(max: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CancelAfter(std::cell::Cell<usize>);
+    impl Sink for CancelAfter {
+        fn check(&self) -> Result<()> {
+            let n = self.0.get();
+            self.0.set(n + 1);
+            if n >= 8 { Err(FormatError::Cancelled(photocraft_raster::Cancelled)) } else { Ok(()) }
+        }
+        fn tile(&mut self, _: PixelFormat, _: &Arc<Tile>) -> Result<Hash> {
+            Err(FormatError::Unsupported("no surfaces in this fixture".into()))
+        }
+        fn blob(&mut self, _: &Arc<Vec<u8>>) -> Result<Hash> {
+            Err(FormatError::Unsupported("no blobs in this fixture".into()))
+        }
+    }
+
+    #[test]
+    fn empty_layers_and_comp_states_remain_interruptible() {
+        let layers: Vec<_> = (0..100).map(|_| Layer::group("empty", vec![])).collect();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let cancel = || calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 8;
+        assert!(matches!(check_nesting(&layers, &photocraft_raster::Interrupt::cancel_only(&cancel)), Err(FormatError::Cancelled(_))));
+        let comp = LayerComp {
+            id: 1,
+            name: String::new(),
+            comment: String::new(),
+            apply_visibility: true,
+            apply_position: false,
+            apply_appearance: false,
+            states: layers.iter().map(|l| CompLayerState { layer: l.id, visible: Some(true), position: None, appearance: None }).collect(),
+        };
+        assert!(matches!(comp_m(&comp, &mut CancelAfter(std::cell::Cell::new(0))), Err(FormatError::Cancelled(_))));
+    }
 
     #[test]
     fn unhex_rejects_leading_plus() {

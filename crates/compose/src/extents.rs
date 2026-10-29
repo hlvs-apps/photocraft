@@ -281,7 +281,20 @@ pub fn shape_bounds(sh: &photocraft_doc::ShapeLayer) -> Option<Rect> {
 pub(crate) fn mask_vals(layer: &Layer, rect: Rect, cx: &Ctx) -> Option<Vec<f32>> {
     // Feathers blur across tiles: read the cached, canvas-wide combined mask.
     if masks::has_feather(layer)
-        && let Some(s) = masks::combined_mask(layer, cx.canvas)
+        && let Some(s) = match &cx.controlled_masks {
+            Some(prepared) => {
+                let mut prepared = prepared.lock().unwrap_or_else(|e| e.into_inner());
+                let key = masks::key(layer, cx.canvas);
+                if let Some(mask) = prepared.get(&key) {
+                    Some(mask.clone())
+                } else {
+                    let mask = masks::build_mask_with(layer, cx.canvas, Some(&cx.ctl)).ok()?;
+                    prepared.insert(key, mask.clone());
+                    Some(mask)
+                }
+            }
+            None => masks::combined_mask(layer, cx.canvas),
+        }
     {
         let mut v = Vec::new();
         s.read_region_into(rect, &mut v);

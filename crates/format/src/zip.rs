@@ -38,12 +38,21 @@ impl ZipWriter {
     }
 
     /// Reserves the complete archive from its entry names and payload sizes.
-    pub(crate) fn with_entries<'a>(entries: impl IntoIterator<Item = (&'a str, usize)>) -> Result<Self, FormatError> {
+    pub(crate) fn with_entries<'a>(
+        entries: impl IntoIterator<Item = (&'a str, usize)>,
+        max: usize,
+        ctl: &photocraft_raster::Interrupt,
+    ) -> Result<Self, FormatError> {
         let (size, directory) = entries.into_iter().try_fold((22usize, 0usize), |(size, directory), (name, bytes)| {
+            ctl.check()?;
             let directory = directory.checked_add(46 + name.len());
             let size = size.checked_add(76).and_then(|n| n.checked_add(name.len())).and_then(|n| n.checked_add(name.len())).and_then(|n| n.checked_add(bytes));
             size.zip(directory).ok_or_else(|| FormatError::Unsupported("zip size overflow".into()))
         })?;
+        if size > max {
+            return Err(FormatError::LimitExceeded("save ZIP bytes".into()));
+        }
+        ctl.check()?;
         let mut writer = Self::new();
         writer.out.try_reserve_exact(size).map_err(|_| FormatError::LimitExceeded("not enough memory for zip".into()))?;
         writer.central.try_reserve_exact(directory).map_err(|_| FormatError::LimitExceeded("not enough memory for zip directory".into()))?;
@@ -53,6 +62,12 @@ impl ZipWriter {
     /// Adds a STORE entry, rejecting names or data that exceed ZIP field limits.
     /// The entry path has a 16-bit byte length, independent of filesystem limits.
     pub fn add(&mut self, name: &str, data: &[u8]) -> Result<(), FormatError> {
+        self.add_interruptible(name, data, &photocraft_raster::Interrupt::NONE)
+    }
+
+    /// Append one entry cooperatively, discarding the writer if cancellation returns an error.
+    pub fn add_interruptible(&mut self, name: &str, data: &[u8], ctl: &photocraft_raster::Interrupt) -> Result<(), FormatError> {
+        ctl.check()?;
         if self.count == u16::MAX {
             return Err(FormatError::Unsupported("more than 65535 zip entries (ZIP64 not supported)".into()));
         }
@@ -66,7 +81,12 @@ impl ZipWriter {
             .ok_or_else(|| FormatError::Unsupported("zip entry size overflow".into()))?;
         self.out.try_reserve(local_len).map_err(|_| FormatError::LimitExceeded("not enough memory for zip entry".into()))?;
         self.central.try_reserve(46 + name_b.len()).map_err(|_| FormatError::LimitExceeded("not enough memory for zip directory".into()))?;
-        let crc = crc32(data);
+        let mut hasher = crc32fast::Hasher::new();
+        for chunk in data.chunks(64 << 10) {
+            ctl.check()?;
+            hasher.update(chunk);
+        }
+        let crc = hasher.finalize();
         // Local file header.
         let o = &mut self.out;
         o.extend_from_slice(&LOCAL_SIG.to_le_bytes());
@@ -81,7 +101,10 @@ impl ZipWriter {
         o.extend_from_slice(&name_len.to_le_bytes());
         o.extend_from_slice(&0u16.to_le_bytes());
         o.extend_from_slice(name_b);
-        o.extend_from_slice(data);
+        for chunk in data.chunks(64 << 10) {
+            ctl.check()?;
+            o.extend_from_slice(chunk);
+        }
         // Central directory entry.
         let c = &mut self.central;
         c.extend_from_slice(&CENTRAL_SIG.to_le_bytes());
@@ -104,11 +127,20 @@ impl ZipWriter {
     }
 
     /// Appends the central directory and returns the complete archive.
-    pub fn finish(mut self) -> Result<Vec<u8>, FormatError> {
+    pub fn finish(self) -> Result<Vec<u8>, FormatError> {
+        self.finish_interruptible(&photocraft_raster::Interrupt::NONE)
+    }
+
+    /// Finish the archive cooperatively; no partial archive is returned.
+    pub fn finish_interruptible(mut self, ctl: &photocraft_raster::Interrupt) -> Result<Vec<u8>, FormatError> {
+        ctl.check()?;
         let cd_offset = u32::try_from(self.out.len()).map_err(|_| FormatError::Unsupported("zip over 4 GiB".into()))?;
         let cd_size = u32::try_from(self.central.len()).map_err(|_| FormatError::Unsupported("zip directory over 4 GiB".into()))?;
         self.out.try_reserve(self.central.len().saturating_add(22)).map_err(|_| FormatError::LimitExceeded("not enough memory to finish zip".into()))?;
-        self.out.extend_from_slice(&self.central);
+        for chunk in self.central.chunks(64 << 10) {
+            ctl.check()?;
+            self.out.extend_from_slice(chunk);
+        }
         self.out.extend_from_slice(&EOCD_SIG.to_le_bytes());
         self.out.extend_from_slice(&[0; 4]); // disk numbers
         self.out.extend_from_slice(&self.count.to_le_bytes());
@@ -151,6 +183,12 @@ fn u32_at(b: &[u8], o: usize) -> Result<u32, FormatError> {
 impl<'a> ZipReader<'a> {
     /// Checks ZIP record bounds and indexes the first entry for each name.
     pub fn new(bytes: &'a [u8]) -> Result<Self, FormatError> {
+        Self::new_interruptible(bytes, &photocraft_raster::Interrupt::NONE)
+    }
+
+    /// Index ZIP entries, returning `Cancelled` when the interrupt is set.
+    pub fn new_interruptible(bytes: &'a [u8], ctl: &photocraft_raster::Interrupt) -> Result<Self, FormatError> {
+        ctl.check()?;
         if bytes.len() < 22 {
             return Err(FormatError::corrupt("not a zip archive (too short)"));
         }
@@ -181,6 +219,7 @@ impl<'a> ZipReader<'a> {
         let mut by_name = HashMap::with_capacity(entries.capacity());
         let mut p = cd_off;
         for _ in 0..count {
+            ctl.check()?;
             let header_end = p.checked_add(46).filter(|end| *end <= cd_end).ok_or_else(|| FormatError::corrupt("truncated zip central directory entry"))?;
             if u32_at(bytes, p)? != CENTRAL_SIG {
                 return Err(FormatError::corrupt("bad zip central directory entry"));
@@ -236,6 +275,13 @@ impl<'a> ZipReader<'a> {
 
     /// Entry payload (decompressed), at most `max` bytes, CRC-checked.
     pub fn read(&self, e: &Entry, max: usize) -> Result<Vec<u8>, FormatError> {
+        self.read_interruptible(e, max, &photocraft_raster::Interrupt::NONE)
+    }
+
+    /// Read and verify one entry under a decoded byte limit and cooperative cancellation.
+    /// Checks compressed input as well as output, including streams of empty blocks.
+    pub fn read_interruptible(&self, e: &Entry, max: usize, ctl: &photocraft_raster::Interrupt) -> Result<Vec<u8>, FormatError> {
+        ctl.check()?;
         if e.uncompressed > max {
             return Err(FormatError::LimitExceeded(format!("zip entry `{}` is {} bytes (max {max})", e.name, e.uncompressed)));
         }
@@ -246,27 +292,51 @@ impl<'a> ZipReader<'a> {
             .and_then(|end| self.bytes.get(e.data_offset..end))
             .ok_or_else(|| FormatError::corrupt(format!("zip entry `{}` out of range", e.name)))?;
         let data = match e.method {
-            0 => raw.to_vec(),
+            0 => {
+                if raw.len() != e.uncompressed {
+                    return Err(FormatError::corrupt(format!("zip entry `{}` has wrong size", e.name)));
+                }
+                let mut out = Vec::new();
+                for chunk in raw.chunks(64 << 10) {
+                    ctl.check()?;
+                    out.extend_from_slice(chunk);
+                }
+                out
+            }
             8 => {
                 // The uncompressed length comes from an untrusted ZIP header: a
                 // small forged archive must not reserve gigabytes up front, so the
                 // preallocation is capped (DEFLATE expands at most ~1032x).
                 let mut out = Vec::with_capacity(e.uncompressed.min(raw.len().saturating_mul(1032)).min(64 << 20));
                 // One surplus byte proves a false size without expanding to the caller's larger budget.
-                flate2::bufread::DeflateDecoder::new(raw)
-                    .take((e.uncompressed as u64).saturating_add(1))
-                    .read_to_end(&mut out)
-                    .map_err(|err| FormatError::corrupt(format!("zip entry `{}`: {err}", e.name)))?;
+                let input = crate::InterruptReader { bytes: raw, offset: 0, ctl: *ctl, cancelled: false };
+                let mut decoder = flate2::bufread::DeflateDecoder::new(input).take((e.uncompressed as u64).saturating_add(1));
+                while decoder.by_ref().take(64 << 10).read_to_end(&mut out).map_err(|err| {
+                    if ctl.cancelled() {
+                        FormatError::Cancelled(photocraft_raster::Cancelled)
+                    } else {
+                        FormatError::corrupt(format!("zip entry `{}`: {err}", e.name))
+                    }
+                })? > 0
+                {
+                    ctl.check()?;
+                }
                 out
             }
             m => {
                 return Err(FormatError::Unsupported(format!("zip compression method {m} for `{}`", e.name)));
             }
         };
+        ctl.check()?;
         if data.len() != e.uncompressed || data.len() > max {
             return Err(FormatError::corrupt(format!("zip entry `{}` has wrong size", e.name)));
         }
-        if crc32(&data) != e.crc {
+        let mut crc = crc32fast::Hasher::new();
+        for chunk in data.chunks(64 << 10) {
+            ctl.check()?;
+            crc.update(chunk);
+        }
+        if crc.finalize() != e.crc {
             return Err(FormatError::corrupt(format!("zip entry `{}` failed its CRC check", e.name)));
         }
         Ok(data)
@@ -426,7 +496,8 @@ mod tests {
         let entries = [("层/é.png", &b"image"[..]), ("empty", &b""[..]), ("empty", &b"duplicate"[..])];
         for entries in [&entries[..0], &entries[..]] {
             let mut previous = ZipWriter::new();
-            let mut reserved = ZipWriter::with_entries(entries.iter().map(|(name, data)| (*name, data.len()))).unwrap();
+            let mut reserved =
+                ZipWriter::with_entries(entries.iter().map(|(name, data)| (*name, data.len())), usize::MAX, &photocraft_raster::Interrupt::NONE).unwrap();
             let (capacity, directory) = (reserved.out.capacity(), reserved.central.capacity());
             for (name, data) in entries {
                 previous.add(name, data).unwrap();
@@ -437,8 +508,11 @@ mod tests {
             assert_eq!(bytes.capacity(), capacity);
             assert_eq!(bytes, previous.finish().unwrap());
         }
-        assert!(matches!(ZipWriter::with_entries([("x", usize::MAX)]), Err(FormatError::Unsupported(_))));
-        assert!(matches!(ZipWriter::with_entries([("x", isize::MAX as usize)]), Err(FormatError::LimitExceeded(_))));
+        assert!(matches!(ZipWriter::with_entries([("x", usize::MAX)], usize::MAX, &photocraft_raster::Interrupt::NONE), Err(FormatError::Unsupported(_))));
+        assert!(matches!(
+            ZipWriter::with_entries([("x", isize::MAX as usize)], usize::MAX, &photocraft_raster::Interrupt::NONE),
+            Err(FormatError::LimitExceeded(_))
+        ));
     }
 
     /// Invalid UTF-8 names retain their lossy spelling and first-entry lookup.
@@ -587,4 +661,27 @@ mod tests {
         assert!(u16_at(&[], usize::MAX).is_err());
         assert!(u32_at(&[], usize::MAX - 3).is_err());
     }
+}
+
+#[cfg(test)]
+#[test]
+fn stored_entry_checks_actual_size_before_copying() {
+    let bytes = vec![0; 1 << 20];
+    let reader = ZipReader { bytes: &bytes, entries: Vec::new(), by_name: HashMap::new() };
+    let entry = Entry { name: "forged".into(), method: 0, crc: 0, compressed: bytes.len(), uncompressed: 0, data_offset: 0 };
+    assert!(matches!(reader.read(&entry, 0), Err(FormatError::Corrupt(_))));
+}
+
+#[cfg(test)]
+#[test]
+fn empty_deflate_blocks_still_check_cancellation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut raw = [0, 0, 0, 0xff, 0xff].repeat(100_000);
+    raw.extend([1, 0, 0, 0xff, 0xff]);
+    let reader = ZipReader { bytes: &raw, entries: Vec::new(), by_name: HashMap::new() };
+    let entry = Entry { name: "empty".into(), method: 8, crc: crc32(&[]), compressed: raw.len(), uncompressed: 0, data_offset: 0 };
+    assert!(reader.read(&entry, 0).unwrap().is_empty());
+    let checks = AtomicUsize::new(0);
+    let cancel = || checks.fetch_add(1, Ordering::Relaxed) >= 3;
+    assert!(matches!(reader.read_interruptible(&entry, 0, &photocraft_raster::Interrupt::cancel_only(&cancel)), Err(FormatError::Cancelled(_))));
 }

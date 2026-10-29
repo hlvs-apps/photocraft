@@ -114,6 +114,10 @@ impl<'a> LabStack<'a> {
 
     /// Straight L, a, b and alpha over `rect`, row-major, into `acc` (`src` and `mv` are scratch).
     fn composite(&self, rect: Rect, acc: &mut Vec<[f32; LAB + 1]>, src: &mut Vec<f32>, mv: &mut Vec<f32>) {
+        self.composite_with(rect, acc, src, mv, &photocraft_raster::Interrupt::NONE)
+    }
+
+    fn composite_with(&self, rect: Rect, acc: &mut Vec<[f32; LAB + 1]>, src: &mut Vec<f32>, mv: &mut Vec<f32>, ctl: &photocraft_raster::Interrupt) {
         let n = rect.width() as usize * rect.height() as usize;
         acc.clear();
         acc.resize(n, [0.0, adjust::LAB_NEUTRAL, adjust::LAB_NEUTRAL, 0.0]);
@@ -126,6 +130,9 @@ impl<'a> LabStack<'a> {
             }
         };
         for item in &self.items {
+            if ctl.cancelled() {
+                return;
+            }
             match item {
                 Item::Layer(surf, opacity, mask) => {
                     let opacity = *opacity;
@@ -227,19 +234,32 @@ pub fn flatten_lab(doc: &Document, rect: Rect, fmt: PixelFormat, white: bool) ->
 /// work on L, a and b, worked out on the stored values; `None` for any other document, which the
 /// RGB compositor renders. Rows of `tile` render in parallel.
 pub fn render_lab(doc: &Document, rect: Rect, tile: i32) -> Option<Buffer> {
+    render_lab_with(doc, rect, tile, &photocraft_raster::Interrupt::NONE)
+}
+
+pub(crate) fn render_lab_with(doc: &Document, rect: Rect, tile: i32, ctl: &photocraft_raster::Interrupt) -> Option<Buffer> {
     let stack = LabStack::new(doc).filter(LabStack::adjusts)?;
     let w = rect.width() as usize;
     let mut out = Buffer::transparent(rect);
     if w == 0 || rect.is_empty() {
         return Some(out);
     }
-    let rows = tile.max(1) as usize;
+    let rows = (tile.max(1) as usize).min((65_536 / w).max(1));
     let band = |i: usize, px: &mut [[f32; 4]]| {
+        if ctl.cancelled() {
+            return;
+        }
         let y0 = rect.y0.saturating_add((i * rows) as i32);
         let r = Rect::new(rect.x0, y0, rect.x1, y0.saturating_add((px.len() / w) as i32));
         let (mut acc, mut src, mut mv) = (Vec::new(), Vec::new(), Vec::new());
-        stack.composite(r, &mut acc, &mut src, &mut mv);
-        for (o, p) in px.iter_mut().zip(&acc) {
+        stack.composite_with(r, &mut acc, &mut src, &mut mv, ctl);
+        if ctl.cancelled() {
+            return;
+        }
+        for (index, (o, p)) in px.iter_mut().zip(&acc).enumerate() {
+            if index % 1024 == 0 && ctl.cancelled() {
+                return;
+            }
             if p[LAB] > 0.0 {
                 let [r, g, b] = photocraft_color::convert::lab_to_srgb([p[0] * 100.0, p[1] * 255.0 - 128.0, p[2] * 255.0 - 128.0]);
                 *o = [r, g, b, p[LAB]];

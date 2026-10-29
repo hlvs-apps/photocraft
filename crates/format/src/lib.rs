@@ -22,6 +22,17 @@
 //!
 //! This crate sits at L3 next to the compositor, so it does not render.
 //! Callers pass previews in [`SaveOptions`]; `photocraft-io` does that.
+//!
+//! Server callers can use [`save_to_bytes_interruptible`] or
+//! [`PcraftWriter::save_zip_interruptible`] with [`SaveLimits`] and the raster crate's
+//! `Interrupt`. Limits cover distinct payload bytes, serialized manifest bytes, archive
+//! bytes, preview pixels and compression workers. Cancellation returns an error and discards
+//! the archive; a writer remains reusable after failure. Previews encode sequentially, with
+//! checks between them. Their codec call, owned metadata clones and allocation/destruction
+//! are work units, so callers must also bound their source document. These are cooperative
+//! checks, not a deadline or total-process-memory guarantee. Native server saves need no
+//! previews: pass [`SaveOptions::default`]. The generic I/O export path also renders previews
+//! and is not a substitute for this explicitly bounded API.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -54,6 +65,8 @@ pub const EXTENSION: &str = "pcraft";
 
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {
+    #[error("cancelled")]
+    Cancelled(#[from] photocraft_raster::Cancelled),
     #[error("corrupt .pcraft bundle: {0}")]
     Corrupt(String),
     #[error("unsupported .pcraft feature: {0}")]
@@ -158,8 +171,22 @@ pub fn load_from_bytes(bytes: &[u8]) -> Result<Document> {
 }
 
 pub fn load_from_bytes_with(bytes: &[u8], opts: &LoadOptions) -> Result<Document> {
-    let src = store::ZipSource::new(bytes)?;
-    store::load(&src, opts)
+    load_from_bytes_interruptible(bytes, opts, &photocraft_raster::Interrupt::NONE)
+}
+
+/// Load with explicit budgets and cooperative cancellation.
+///
+/// Checks the interrupt before starting, at each ZIP entry, layer and tile, and
+/// every 64 KiB while copying, inflating, hashing or parsing manifest bytes.
+/// Cancellation returns [`FormatError::Cancelled`], never a partial document.
+/// Owned manifest conversion, validation and cleanup run between checks; their
+/// work is bounded by `max_manifest_bytes`, not a wall-clock deadline. Budgets
+/// limit decoded payloads, not total process memory. Callers handling untrusted
+/// input should cap the input size and supply their own [`LoadOptions`].
+pub fn load_from_bytes_interruptible(bytes: &[u8], opts: &LoadOptions, ctl: &photocraft_raster::Interrupt) -> Result<Document> {
+    ctl.check()?;
+    let src = store::ZipSource::new_interruptible(bytes, *ctl)?;
+    store::load_interruptible(&src, opts, ctl)
 }
 
 /// Load a bundle from a path: a directory bundle or a ZIP file.
@@ -196,4 +223,69 @@ pub fn read_thumbnail(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
         Some(p) => Ok(Some(src.get(&p, 64 << 20)?)),
         None => Ok(None),
     }
+}
+
+pub(crate) struct InterruptReader<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) offset: usize,
+    pub(crate) ctl: photocraft_raster::Interrupt<'a>,
+    pub(crate) cancelled: bool,
+}
+
+impl std::io::Read for InterruptReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.offset.is_multiple_of(64 << 10) && self.ctl.cancelled() {
+            self.cancelled = true;
+            return Err(std::io::Error::other("cancelled"));
+        }
+        let len = out.len().min(self.bytes.len()).min((64 << 10) - self.offset % (64 << 10));
+        let (chunk, rest) = self.bytes.split_at(len);
+        out.get_mut(..len).ok_or_else(|| std::io::Error::other("invalid read buffer"))?.copy_from_slice(chunk);
+        self.bytes = rest;
+        self.offset += len;
+        Ok(len)
+    }
+}
+
+impl std::io::BufRead for InterruptReader<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.ctl.cancelled() {
+            self.cancelled = true;
+            return Err(std::io::Error::other("cancelled"));
+        }
+        Ok(self.bytes.get(..self.bytes.len().min(64 << 10)).unwrap_or_default())
+    }
+
+    fn consume(&mut self, amount: usize) {
+        let amount = amount.min(self.bytes.len());
+        self.bytes = self.bytes.get(amount..).unwrap_or_default();
+        self.offset += amount;
+    }
+}
+
+/// Explicit budgets for an in-memory native save. Preview encoding and manifest memory are
+/// additional to the distinct tile/blob payload budget.
+#[derive(Clone, Copy, Debug)]
+pub struct SaveLimits {
+    /// Maximum distinct uncompressed tile/blob bytes.
+    pub max_total_bytes: u64,
+    /// Maximum serialized manifest bytes.
+    pub max_manifest_bytes: usize,
+    /// Maximum complete ZIP bytes.
+    pub max_output_bytes: usize,
+    /// Maximum pixels per optional preview.
+    pub max_preview_pixels: u64,
+    /// Maximum simultaneous compression workers; zero is invalid.
+    pub max_workers: usize,
+}
+
+impl Default for SaveLimits {
+    fn default() -> Self {
+        Self { max_total_bytes: u64::MAX, max_manifest_bytes: usize::MAX, max_output_bytes: usize::MAX, max_preview_pixels: u64::MAX, max_workers: 32 }
+    }
+}
+
+/// Save with explicit budgets and cancellation; no partial archive is returned.
+pub fn save_to_bytes_interruptible(doc: &Document, opts: &SaveOptions, limits: &SaveLimits, ctl: &photocraft_raster::Interrupt) -> Result<Vec<u8>> {
+    PcraftWriter::new().save_zip_interruptible(doc, opts, limits, ctl).map(|(b, _)| b)
 }

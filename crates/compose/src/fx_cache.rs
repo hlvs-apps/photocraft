@@ -166,13 +166,7 @@ pub(crate) fn fx_region_bytes(layers: &[Layer], canvas: Rect) -> u64 {
     fn bytes(layers: &[Layer], canvas: Rect, depth: u32) -> u64 {
         let mut total = 0u64;
         for l in layers.iter().filter(|l| l.visible) {
-            if effects::has_effects(l) {
-                let m = effects::margin(l);
-                let region = effect_source_bounds(l, canvas).inflate(m).intersect(&canvas.inflate(m));
-                let maps = effects::map_count(l) as u64;
-                let px = u64::from(region.width()) * u64::from(region.height());
-                total = total.saturating_add(maps.saturating_mul(px).saturating_mul(4));
-            }
+            total = total.saturating_add(fx_layer_region_bytes(l, canvas));
             if let LayerContent::Group(g) = &l.content
                 && depth < PREPARE_DEPTH
             {
@@ -182,6 +176,17 @@ pub(crate) fn fx_region_bytes(layers: &[Layer], canvas: Rect) -> u64 {
         total
     }
     bytes(layers, canvas, 0)
+}
+
+/// Estimated maps for this layer only; callers account for group children separately.
+pub(crate) fn fx_layer_region_bytes(layer: &Layer, canvas: Rect) -> u64 {
+    if !layer.visible || !effects::has_effects(layer) {
+        return 0;
+    }
+    let margin = effects::margin(layer);
+    let region = effect_source_bounds(layer, canvas).inflate(margin).intersect(&canvas.inflate(margin));
+    let pixels = u64::from(region.width()) * u64::from(region.height());
+    (effects::map_count(layer) as u64).saturating_mul(pixels).saturating_mul(4)
 }
 
 /// Most bytes one layer's effect maps and source may take to build, whatever the cache budget.
@@ -225,7 +230,7 @@ fn build_fx_slot_maps(layer: &Layer, region: Rect, key: u64, cx: &Ctx, slot: &Fx
     // The maps, plus what each reserved tile address keeps allocated.
     let bytes = maps.bytes().saturating_add(pin.len().saturating_mul(std::mem::size_of::<photocraft_raster::Tile>() + 2 * std::mem::size_of::<usize>()));
     let maps = std::sync::Arc::new(maps);
-    if slot.set(FxEntry { maps: maps.clone(), _pin: pin, bytes }).is_ok() {
+    if !cx.ctl.cancelled() && slot.set(FxEntry { maps: maps.clone(), _pin: pin, bytes }).is_ok() {
         // Counted exactly once, by the build that filled the slot, and only while the
         // slot is still cached (eviction may have dropped it meanwhile).
         let mut c = fx_cache().lock().unwrap_or_else(|e| e.into_inner());
@@ -275,6 +280,13 @@ fn cached_effect_maps(layer: &Layer, region: Rect, key: u64, cx: &Ctx) -> std::s
         Some(e) => e.maps.clone(),
         None => build_fx_slot_maps(layer, region, key, cx, &slot),
     };
+    if cx.ctl.cancelled() && slot.get().is_none() {
+        let mut c = fx_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if slot.get().is_none() && c.map.get(&key).is_some_and(|active| std::sync::Arc::ptr_eq(active, &slot)) {
+            c.map.remove(&key);
+            c.order.retain(|queued| *queued != key);
+        }
+    }
     // Evict the oldest entries over budget (never the one just used).
     evict_fx_cache_over_budget(key);
     maps
