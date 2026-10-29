@@ -17,11 +17,15 @@ fn err(e: impl std::fmt::Display) -> CodecError {
     CodecError::malformed(F, e)
 }
 
-type Decoder<'a> = image_webp::WebPDecoder<Cursor<&'a [u8]>>;
+type Decoder<'a> = image_webp::WebPDecoder<std::io::BufReader<crate::probe::ProbeReader<'a>>>;
 
 /// The decoder with its chunks read, the stored size and the output layout, the size checked.
 fn open<'a>(bytes: &'a [u8], limits: &Limits) -> Result<(Decoder<'a>, u32, u32, ChannelLayout), CodecError> {
-    let mut dec = image_webp::WebPDecoder::new(Cursor::new(bytes)).map_err(err)?;
+    open_with(bytes, limits, crate::ProbeControl::default())
+}
+
+fn open_with<'a>(bytes: &'a [u8], limits: &Limits, ctl: crate::ProbeControl<'a>) -> Result<(Decoder<'a>, u32, u32, ChannelLayout), CodecError> {
+    let mut dec = image_webp::WebPDecoder::new(std::io::BufReader::new(crate::probe::ProbeReader::new(bytes, ctl))).map_err(err)?;
     dec.set_memory_limit(limits.alloc_usize());
     let (w, h) = dec.dimensions();
     let layout = if dec.has_alpha() { ChannelLayout::Rgba } else { ChannelLayout::Rgb };
@@ -51,8 +55,8 @@ pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError>
 
 /// The stored size and EXIF block [`decode`] would find, from the container's chunks alone: the
 /// same header reads and size checks, without decoding the bitstream.
-pub(crate) fn probe(bytes: &[u8], limits: &Limits) -> Result<(u32, u32, Option<Vec<u8>>), CodecError> {
-    let (mut dec, w, h, _) = open(bytes, limits)?;
+pub(crate) fn probe_with(bytes: &[u8], ctl: &crate::ProbeControl) -> Result<(u32, u32, Option<Vec<u8>>), CodecError> {
+    let (mut dec, w, h, _) = open_with(bytes, &ctl.limits, *ctl)?;
     Ok((w, h, dec.exif_metadata().ok().flatten()))
 }
 

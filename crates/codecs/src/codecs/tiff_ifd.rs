@@ -170,6 +170,11 @@ impl<'a> File<'a> {
     /// The directory at `at`: its whole table, up to and including the next-IFD pointer, must
     /// be inside the file and after the header.
     pub fn ifd(&self, at: u64) -> Option<Ifd> {
+        self.ifd_with(at, &crate::ProbeControl::default())
+    }
+
+    fn ifd_with(&self, at: u64, ctl: &crate::ProbeControl) -> Option<Ifd> {
+        ctl.check().ok()?;
         if at < self.header_len() {
             return None;
         }
@@ -182,6 +187,7 @@ impl<'a> File<'a> {
         let next = if self.big { self.u64_at(next_at)? } else { u64::from(self.u32_at(next_at)?) };
         let mut entries = Vec::with_capacity(usize::try_from(n).ok()?);
         for i in 0..n {
+            ctl.check().ok()?;
             let e = first.checked_add(i.checked_mul(entry)?)?;
             let tag = self.u16_at(e)?;
             let ty = self.u16_at(e.checked_add(2)?)?;
@@ -374,6 +380,7 @@ fn describe(f: &File<'_>, ifd: &Ifd, parent: Option<usize>) -> TiffPage {
 
 struct Walk<'a, 'f> {
     f: &'f File<'a>,
+    ctl: crate::ProbeControl<'f>,
     seen: HashSet<u64>,
     pages: Vec<TiffPage>,
     complete: bool,
@@ -388,6 +395,10 @@ impl Walk<'_, '_> {
     /// its SubIFDs.
     fn chain(&mut self, mut at: u64, parent: Option<usize>, depth: usize) {
         while at != 0 {
+            if self.ctl.check().is_err() {
+                self.complete = false;
+                return;
+            }
             if self.pages.len() >= MAX_IFDS || !self.seen.insert(at) {
                 self.complete = false;
                 return;
@@ -401,7 +412,7 @@ impl Walk<'_, '_> {
                 return;
             }
             self.entry_budget -= n;
-            let Some(ifd) = self.f.ifd(at) else {
+            let Some(ifd) = self.f.ifd_with(at, &self.ctl) else {
                 self.complete = false;
                 return;
             };
@@ -425,9 +436,19 @@ pub fn tiff_info(bytes: &[u8]) -> Result<TiffInfo, CodecError> {
     info_of(&f)
 }
 
+pub fn tiff_info_with(bytes: &[u8], ctl: &crate::ProbeControl) -> Result<TiffInfo, CodecError> {
+    let f = File::parse(bytes).ok_or_else(|| CodecError::malformed(Format::Tiff, "not a TIFF or BigTIFF header"))?;
+    info_of_with(&f, ctl)
+}
+
 pub(crate) fn info_of(f: &File<'_>) -> Result<TiffInfo, CodecError> {
-    let mut w = Walk { f, seen: HashSet::new(), pages: Vec::new(), complete: true, entry_budget: (f.b.len() as u64) / 12 + 64 };
+    info_of_with(f, &crate::ProbeControl::default())
+}
+
+fn info_of_with(f: &File<'_>, ctl: &crate::ProbeControl) -> Result<TiffInfo, CodecError> {
+    let mut w = Walk { f, ctl: *ctl, seen: HashSet::new(), pages: Vec::new(), complete: true, entry_budget: (f.b.len() as u64) / 12 + 64 };
     w.chain(f.first_ifd, None, 0);
+    ctl.check()?;
     if w.pages.is_empty() {
         return Err(CodecError::malformed(Format::Tiff, "the first image directory is missing or cut off"));
     }
@@ -458,5 +479,8 @@ mod tests {
         let info = tiff_info(&b).expect("the first directory is readable");
         assert!(!info.complete);
         assert!(info.pages.len() < 200, "{} directories parsed", info.pages.len());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let cancel = || calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 5;
+        assert!(matches!(tiff_info_with(&b, &crate::ProbeControl { cancelled: &cancel, ..Default::default() }), Err(CodecError::Cancelled)));
     }
 }

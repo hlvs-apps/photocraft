@@ -23,20 +23,38 @@ fn bad(msg: impl std::fmt::Display) -> CodecError {
 /// Extract C string literals without treating quoted text or // in a string as a comment.
 /// XPM uses one literal for the header, each palette entry and each row.
 fn c_strings(bytes: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
+    c_strings_with(bytes, usize::MAX, &crate::ProbeControl::default())
+}
+
+fn c_strings_with(bytes: &[u8], max_lines: usize, ctl: &crate::ProbeControl) -> Result<Vec<Vec<u8>>, CodecError> {
     let mut lines = Vec::new();
     let mut i = 0usize;
+    let mut next_check = 0usize;
     while i < bytes.len() {
+        if i >= next_check {
+            ctl.check()?;
+            next_check = i.saturating_add(64 << 10);
+        }
         if bytes[i..].starts_with(b"/*") {
             let tail = &bytes[i + 2..];
-            let Some(end) = tail.windows(2).position(|p| p == b"*/") else { return Err(bad("unterminated C comment")) };
+            let Some(end) = tail.windows(2).enumerate().position(|(n, p)| p == b"*/" || (n.is_multiple_of(64 << 10) && ctl.check().is_err())) else {
+                return Err(bad("unterminated C comment"));
+            };
+            ctl.check()?;
             i += end + 4;
         } else if bytes[i..].starts_with(b"//") {
-            i += bytes[i..].iter().position(|&c| c == b'\n').unwrap_or(bytes.len() - i);
+            i +=
+                bytes[i..].iter().enumerate().position(|(n, &c)| c == b'\n' || (n.is_multiple_of(64 << 10) && ctl.check().is_err())).unwrap_or(bytes.len() - i);
+            ctl.check()?;
         } else if bytes[i] == b'"' {
             i += 1;
             let mut s = Vec::new();
             let mut closed = false;
             while i < bytes.len() {
+                if i >= next_check {
+                    ctl.check()?;
+                    next_check = i.saturating_add(64 << 10);
+                }
                 let c = bytes[i];
                 i += 1;
                 match c {
@@ -62,6 +80,9 @@ fn c_strings(bytes: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
                 return Err(bad("unterminated XPM string"));
             }
             lines.push(s);
+            if lines.len() >= max_lines {
+                break;
+            }
         } else {
             i += 1;
         }
@@ -72,13 +93,22 @@ fn c_strings(bytes: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
 /// Extract XPM2's plain-text lines without trimming pixel rows: leading and
 /// trailing spaces can be palette keys, and physical CRLF is not image data.
 fn xpm2_lines(bytes: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
-    let mut input = bytes.split(|&b| b == b'\n');
+    xpm2_lines_with(bytes, usize::MAX, &crate::ProbeControl::default())
+}
+
+fn xpm2_lines_with(bytes: &[u8], max_lines: usize, ctl: &crate::ProbeControl) -> Result<Vec<Vec<u8>>, CodecError> {
+    let mut scanned = 0usize;
+    let mut input = bytes.split(|&b| {
+        scanned += 1;
+        b == b'\n' || (scanned.is_multiple_of(64 << 10) && ctl.check().is_err())
+    });
     let header = input.next().ok_or_else(|| bad("missing XPM2 marker"))?;
     if header.strip_suffix(b"\r").unwrap_or(header) != b"! XPM2" {
         return Err(bad("not an XPM2 image"));
     }
     let mut lines = Vec::new();
     for raw in input {
+        ctl.check()?;
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
         // The header may be preceded by comments and blank lines. After the
         // header, a leading '!' is allowed as a palette key or pixel value.
@@ -86,6 +116,9 @@ fn xpm2_lines(bytes: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
             continue;
         }
         lines.push(line.to_vec());
+        if lines.len() >= max_lines {
+            break;
+        }
     }
     Ok(lines)
 }
@@ -138,6 +171,21 @@ fn color(name: &str) -> Option<[u8; 4]> {
     Some([rgb[0], rgb[1], rgb[2], 255])
 }
 
+pub(crate) fn probe(bytes: &[u8], ctl: &crate::ProbeControl) -> Result<(u32, u32), CodecError> {
+    if bytes.len() > MAX_SOURCE {
+        return Err(CodecError::LimitExceeded("XPM source exceeds 256 MiB".into()));
+    }
+    let lines = if bytes.starts_with(b"/* XPM */") {
+        c_strings_with(bytes, 1, ctl)?
+    } else if bytes.starts_with(b"! XPM2\n") || bytes.starts_with(b"! XPM2\r\n") {
+        xpm2_lines_with(bytes, 1, ctl)?
+    } else {
+        return Err(bad("not an XPM2/XPM3 image"));
+    };
+    let h = read_header(&lines, &ctl.limits)?;
+    Ok((h.w, h.h))
+}
+
 pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError> {
     if bytes.len() > MAX_SOURCE {
         return Err(CodecError::LimitExceeded("XPM source exceeds 256 MiB".into()));
@@ -152,7 +200,14 @@ pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError>
     decode_lines(&lines, limits)
 }
 
-fn decode_lines(lines: &[Vec<u8>], limits: &Limits) -> Result<Image, CodecError> {
+struct XpmHeader {
+    w: u32,
+    h: u32,
+    colours: usize,
+    cpp: usize,
+}
+
+fn read_header(lines: &[Vec<u8>], limits: &Limits) -> Result<XpmHeader, CodecError> {
     let header = lines.first().ok_or_else(|| bad("missing image header"))?;
     let parts = std::str::from_utf8(header).map_err(|_| bad("non-UTF-8 XPM header"))?;
     let mut parts = parts.split_ascii_whitespace();
@@ -168,6 +223,12 @@ fn decode_lines(lines: &[Vec<u8>], limits: &Limits) -> Result<Image, CodecError>
     }
     let (w, h) = (u32::try_from(width).map_err(|_| bad("width overflow"))?, u32::try_from(height).map_err(|_| bad("height overflow"))?);
     limits.check(w, h, ChannelLayout::Rgba, SampleType::U8)?;
+    Ok(XpmHeader { w, h, colours, cpp })
+}
+
+fn decode_lines(lines: &[Vec<u8>], limits: &Limits) -> Result<Image, CodecError> {
+    let XpmHeader { w, h, colours, cpp } = read_header(lines, limits)?;
+    let (width, height) = (w as usize, h as usize);
     let required = 1usize.checked_add(colours).and_then(|n| n.checked_add(height)).ok_or_else(|| bad("row count overflow"))?;
     if lines.len() < required {
         return Err(bad("truncated palette or image rows"));

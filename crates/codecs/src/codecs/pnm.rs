@@ -20,14 +20,21 @@ fn err(msg: impl std::fmt::Display) -> CodecError {
 struct Reader<'a> {
     b: &'a [u8],
     pos: usize,
+    ctl: crate::ProbeControl<'a>,
 }
 
 impl<'a> Reader<'a> {
-    fn skip_ws_and_comments(&mut self) {
+    fn skip_ws_and_comments(&mut self) -> Result<(), CodecError> {
         while self.pos < self.b.len() {
+            if self.pos.is_multiple_of(64 << 10) {
+                self.ctl.check()?;
+            }
             let c = self.b[self.pos];
             if c == b'#' {
                 while self.pos < self.b.len() && self.b[self.pos] != b'\n' && self.b[self.pos] != b'\r' {
+                    if self.pos.is_multiple_of(64 << 10) {
+                        self.ctl.check()?;
+                    }
                     self.pos += 1;
                 }
             } else if c.is_ascii_whitespace() {
@@ -36,18 +43,34 @@ impl<'a> Reader<'a> {
                 break;
             }
         }
+        Ok(())
     }
 
     fn token(&mut self) -> Result<&'a [u8], CodecError> {
-        self.skip_ws_and_comments();
+        self.skip_ws_and_comments()?;
         let start = self.pos;
         while self.pos < self.b.len() && !self.b[self.pos].is_ascii_whitespace() && self.b[self.pos] != b'#' {
+            if self.pos.is_multiple_of(64 << 10) {
+                self.ctl.check()?;
+            }
             self.pos += 1;
         }
         if start == self.pos {
             return Err(err("unexpected end of header"));
         }
         Ok(&self.b[start..self.pos])
+    }
+
+    fn scale(&mut self) -> Result<f32, CodecError> {
+        std::str::from_utf8(self.token()?)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|s: &f32| s.is_finite() && *s != 0.0)
+            .ok_or_else(|| err("invalid PFM scale"))
+    }
+
+    fn dimensions(&mut self) -> Result<(u32, u32), CodecError> {
+        Ok((self.uint()?, self.uint()?))
     }
 
     fn uint(&mut self) -> Result<u32, CodecError> {
@@ -163,15 +186,45 @@ fn read_binary(data: &[u8], n: usize, maxval: u32) -> Result<Samples, CodecError
     Ok(out)
 }
 
+pub(crate) fn probe(bytes: &[u8], ctl: &crate::ProbeControl) -> Result<(u32, u32), CodecError> {
+    if bytes.len() < 2 || bytes[0] != b'P' {
+        return Err(err("not a Netpbm file"));
+    }
+    let mut r = Reader { b: bytes, pos: 2, ctl: *ctl };
+    match bytes[1] {
+        b'7' => {
+            let header = pam_header(&mut r, &ctl.limits)?;
+            Ok((header.w, header.h))
+        }
+        b'1'..=b'6' => {
+            let size = r.dimensions()?;
+            if matches!(bytes[1], b'2' | b'3' | b'5' | b'6') {
+                sample_for_maxval(r.uint()?)?;
+            }
+            if matches!(bytes[1], b'4' | b'5' | b'6') {
+                r.single_ws()?;
+            }
+            Ok(size)
+        }
+        b'F' | b'f' => {
+            let size = r.dimensions()?;
+            r.scale()?;
+            r.single_ws()?;
+            Ok(size)
+        }
+        _ => Err(err("unknown Netpbm subtype")),
+    }
+}
+
 pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError> {
     if bytes.len() < 2 || bytes[0] != b'P' {
         return Err(err("not a Netpbm file"));
     }
     let kind = bytes[1];
-    let mut r = Reader { b: bytes, pos: 2 };
+    let mut r = Reader { b: bytes, pos: 2, ctl: crate::ProbeControl::default() };
     match kind {
         b'1' | b'4' => {
-            let (w, h) = (r.uint()?, r.uint()?);
+            let (w, h) = r.dimensions()?;
             limits.check(w, h, ChannelLayout::Gray, SampleType::U8)?;
             let n = sample_count(w, h, 1)?;
             let mut px;
@@ -193,7 +246,7 @@ pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError>
                 // Each ASCII pixel takes at least a byte, so the file bounds the reservation (#1110).
                 px = Vec::with_capacity(n.min(r.rest().len()));
                 while px.len() < n {
-                    r.skip_ws_and_comments();
+                    r.skip_ws_and_comments()?;
                     match r.b.get(r.pos) {
                         Some(b'0') => px.push(255),
                         Some(b'1') => px.push(0),
@@ -206,7 +259,8 @@ pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError>
             Image::from_u8(w, h, ChannelLayout::Gray, px)
         }
         b'2' | b'3' | b'5' | b'6' => {
-            let (w, h, maxval) = (r.uint()?, r.uint()?, r.uint()?);
+            let (w, h) = r.dimensions()?;
+            let maxval = r.uint()?;
             let layout = if matches!(kind, b'2' | b'5') { ChannelLayout::Gray } else { ChannelLayout::Rgb };
             limits.check(w, h, layout, sample_for_maxval(maxval)?)?;
             let n = sample_count(w, h, layout.channels())?;
@@ -227,12 +281,8 @@ pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError>
         b'7' => decode_pam(&mut r, limits),
         b'F' | b'f' => {
             let layout = if kind == b'F' { ChannelLayout::Rgb } else { ChannelLayout::Gray };
-            let (w, h) = (r.uint()?, r.uint()?);
-            let scale: f32 = std::str::from_utf8(r.token()?)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .filter(|s: &f32| s.is_finite() && *s != 0.0)
-                .ok_or_else(|| err("invalid PFM scale"))?;
+            let (w, h) = r.dimensions()?;
+            let scale = r.scale()?;
             r.single_ws()?;
             limits.check(w, h, layout, SampleType::F32)?;
             let nc = layout.channels();
@@ -263,7 +313,14 @@ pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError>
     }
 }
 
-fn decode_pam(r: &mut Reader<'_>, limits: &Limits) -> Result<Image, CodecError> {
+struct PamHeader {
+    w: u32,
+    h: u32,
+    layout: ChannelLayout,
+    maxval: u32,
+}
+
+fn pam_header(r: &mut Reader<'_>, limits: &Limits) -> Result<PamHeader, CodecError> {
     let (mut w, mut h, mut depth, mut maxval) = (None, None, None, None);
     let mut tupltype = String::new();
     loop {
@@ -301,6 +358,11 @@ fn decode_pam(r: &mut Reader<'_>, limits: &Limits) -> Result<Image, CodecError> 
         }
     };
     limits.check(w, h, layout, sample_for_maxval(maxval)?)?;
+    Ok(PamHeader { w, h, layout, maxval })
+}
+
+fn decode_pam(r: &mut Reader<'_>, limits: &Limits) -> Result<Image, CodecError> {
+    let PamHeader { w, h, layout, maxval } = pam_header(r, limits)?;
     let n = sample_count(w, h, layout.channels())?;
     read_binary(r.rest(), n, maxval)?.into_image(w, h, layout)
 }

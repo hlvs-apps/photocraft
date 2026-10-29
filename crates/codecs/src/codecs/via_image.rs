@@ -84,8 +84,12 @@ pub(crate) fn encode_bmp_indexed(width: u32, height: u32, indices: &[u8], palett
 
 /// The `image` decoder for `f` with our limits, its header read and its size checked.
 fn open<'a>(f: Format, bytes: &'a [u8], limits: &Limits) -> Result<impl ImageDecoder + 'a, CodecError> {
+    open_with(f, bytes, limits, crate::ProbeControl::default())
+}
+
+fn open_with<'a>(f: Format, bytes: &'a [u8], limits: &Limits, ctl: crate::ProbeControl<'a>) -> Result<impl ImageDecoder + 'a, CodecError> {
     let fmt = image_format(f).ok_or_else(|| CodecError::unsupported(f, "not handled by image backend"))?;
-    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), fmt);
+    let mut reader = image::ImageReader::with_format(std::io::BufReader::new(crate::probe::ProbeReader::new(bytes, ctl)), fmt);
     let mut il = image::Limits::default();
     il.max_image_width = Some(limits.max_width);
     il.max_image_height = Some(limits.max_height);
@@ -104,7 +108,8 @@ fn open<'a>(f: Format, bytes: &'a [u8], limits: &Limits) -> Result<impl ImageDec
     let declared = u64::from(w).saturating_mul(u64::from(h)).saturating_mul(bpp);
     // A GIF's first frame is what the file must hold: the logical screen around it needs no
     // data, so up to 256 MiB of screen (8192x8192) is free and only the rest must be backed.
-    let frame = if f == Format::Gif { gif_first_frame(bytes) } else { None };
+    let frame = if f == Format::Gif { gif_first_frame_with(bytes, &ctl) } else { None };
+    ctl.check()?;
     let declared = match frame {
         Some((fw, fh)) => u64::from(fw).saturating_mul(u64::from(fh)).saturating_mul(bpp).max(declared.saturating_sub(1 << 28)),
         _ => declared,
@@ -132,11 +137,11 @@ pub(crate) fn decode(f: Format, bytes: &[u8], limits: &Limits) -> Result<Image, 
 /// The stored size and EXIF block [`decode`] would find, from the decoder's header alone: the
 /// same reader, limits and size check, without decoding pixels. AVIF is refused: its decoder
 /// decodes the image as it opens.
-pub(crate) fn probe(f: Format, bytes: &[u8], limits: &Limits) -> Result<(u32, u32, Option<Vec<u8>>), CodecError> {
+pub(crate) fn probe_with(f: Format, bytes: &[u8], ctl: &crate::ProbeControl) -> Result<(u32, u32, Option<Vec<u8>>), CodecError> {
     if f == Format::Avif {
         return Err(CodecError::unsupported(f, "no header-only size probe"));
     }
-    let mut dec = open(f, bytes, limits)?;
+    let mut dec = open_with(f, bytes, &ctl.limits, *ctl)?;
     let (w, h) = dec.dimensions();
     Ok((w, h, dec.exif_metadata().ok().flatten()))
 }
@@ -148,12 +153,16 @@ fn bmp_is_rle(b: &[u8]) -> bool {
 }
 
 /// The width and height of a GIF's first image descriptor, if the blocks reach one.
-fn gif_first_frame(b: &[u8]) -> Option<(u32, u32)> {
+fn gif_first_frame_with(b: &[u8], ctl: &crate::ProbeControl) -> Option<(u32, u32)> {
     let mut at = None;
-    gif_walk(b, |i| {
-        at = Some(i);
-        false
-    });
+    gif_walk_with(
+        b,
+        |i| {
+            at = Some(i);
+            false
+        },
+        ctl,
+    );
     let u16_at = |at: usize| b.get(at..at + 2).and_then(|b| b.try_into().ok()).map(u16::from_le_bytes);
     // Descriptor: separator, left, top, width, height (little-endian u16s), packed fields.
     let i = at?;
@@ -170,12 +179,17 @@ fn gif_more_frames(b: &[u8]) -> Option<DecodeWarning> {
 /// Walks a GIF's blocks without decompressing any, handing `frame` the offset of each image
 /// descriptor until it returns false. Gives the descriptors seen, and the frame count if the
 /// blocks reached the trailer.
-fn gif_walk(b: &[u8], mut frame: impl FnMut(usize) -> bool) -> (u32, Option<u32>) {
+fn gif_walk(b: &[u8], frame: impl FnMut(usize) -> bool) -> (u32, Option<u32>) {
+    gif_walk_with(b, frame, &crate::ProbeControl::default())
+}
+
+fn gif_walk_with(b: &[u8], mut frame: impl FnMut(usize) -> bool, ctl: &crate::ProbeControl) -> (u32, Option<u32>) {
     // Size of the colour table a packed-fields byte announces.
     let table = |flags: u8| if flags & 0x80 != 0 { 3usize << ((flags & 7) + 1) } else { 0 };
     // Skips the data sub-blocks starting at `i` (each length-prefixed, ended by a zero length).
     let skip = |mut i: usize| -> Option<usize> {
         loop {
+            ctl.check().ok()?;
             let n = usize::from(*b.get(i)?);
             i = i.checked_add(1 + n)?;
             if n == 0 {
@@ -190,6 +204,9 @@ fn gif_walk(b: &[u8], mut frame: impl FnMut(usize) -> bool) -> (u32, Option<u32>
     let mut i = 13 + table(flags);
     let mut frames = 0u32;
     let total = loop {
+        if ctl.check().is_err() {
+            break None;
+        }
         let next = match b.get(i) {
             Some(0x3B) => break Some(frames),
             Some(0x21) => skip(i + 2),
@@ -319,4 +336,18 @@ mod indexed_tests {
         assert!(encode_bmp_indexed(1, 1, &[0], &[]).is_err(), "no colours");
         assert!(encode_bmp_indexed(1, 1, &[0], &[[0; 3]; 257]).is_err(), "more than 256 colours");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn gif_auxiliary_walk_can_cancel_between_subblocks() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut bytes = b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x21\xfe".to_vec();
+    bytes.extend([1, b'x'].repeat(100_000));
+    bytes.extend([0, 0x3b]);
+    assert_eq!(gif_walk(&bytes, |_| true), (0, Some(0)));
+    let calls = AtomicUsize::new(0);
+    let cancel = || calls.fetch_add(1, Ordering::Relaxed) > 5;
+    assert_eq!(gif_walk_with(&bytes, |_| true, &crate::ProbeControl { cancelled: &cancel, ..Default::default() }), (0, None));
+    assert!(calls.load(Ordering::Relaxed) <= 8);
 }

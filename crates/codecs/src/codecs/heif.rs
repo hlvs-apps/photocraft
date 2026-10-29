@@ -76,6 +76,18 @@ pub(crate) fn decode(bytes: &[u8], limits: &Limits, keep_orientation: bool) -> R
     }
 }
 
+#[cfg(not(feature = "heif"))]
+pub(crate) fn probe(_bytes: &[u8], _limits: &Limits) -> Result<(u32, u32), CodecError> {
+    Err(CodecError::unsupported(F, NOT_IN_BUILD))
+}
+
+#[cfg(feature = "heif")]
+pub(crate) fn probe(bytes: &[u8], limits: &Limits) -> Result<(u32, u32), CodecError> {
+    let info = photocraft_heif::probe(bytes).map_err(err)?;
+    limits.check_bytes(info.width, info.height, 1)?;
+    Ok((info.width, info.height))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

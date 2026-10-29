@@ -48,6 +48,7 @@ struct Cur<'a> {
     b: &'a [u8],
     pos: usize,
     big: bool,
+    ctl: crate::ProbeControl<'a>,
 }
 
 impl<'a> Cur<'a> {
@@ -74,6 +75,7 @@ impl<'a> Cur<'a> {
 /// Read one element's tag and value length, leaving the cursor at the value. Item and delimiter
 /// tags (group `FFFE`) carry a `u32` length with no VR even under explicit VR.
 fn read_header(c: &mut Cur, syn: &Syntax) -> Result<(u16, u16, [u8; 2], u32), CodecError> {
+    c.ctl.check()?;
     let group = c.u16().ok_or_else(|| bad("truncated element tag"))?;
     let elem = c.u16().ok_or_else(|| bad("truncated element tag"))?;
     let (vr, len) = if group == 0xFFFE {
@@ -119,8 +121,14 @@ fn skip_undefined(c: &mut Cur, syn: &Syntax) -> Result<(), CodecError> {
 /// Walk the elements from `start`, calling `f` with each `(group, element, value)`. An
 /// undefined-length sequence outside the pixel data is skipped; encapsulated (undefined-length)
 /// pixel data is refused. Returns the number of bytes walked.
-fn elements(b: &[u8], start: usize, syn: &Syntax, mut f: impl FnMut(u16, u16, &Elem) -> Result<(), CodecError>) -> Result<usize, CodecError> {
-    let mut c = Cur { b, pos: start, big: syn.endian.big };
+fn elements(
+    b: &[u8],
+    start: usize,
+    syn: &Syntax,
+    ctl: &crate::ProbeControl,
+    mut f: impl FnMut(u16, u16, &Elem) -> Result<(), CodecError>,
+) -> Result<usize, CodecError> {
+    let mut c = Cur { b, pos: start, big: syn.endian.big, ctl: *ctl };
     loop {
         if c.pos >= b.len() {
             return Ok(c.pos - start);
@@ -158,11 +166,11 @@ fn u16_val(b: &[u8], e: &Elem, big: bool) -> Option<u16> {
 /// The transfer syntax (byte order and explicit/implicit VR) and the data-set start. The file
 /// meta group is always explicit VR little-endian; the data set follows its `(0002,0010)`
 /// TransferSyntaxUID.
-fn transfer_syntax(b: &[u8]) -> Result<(Syntax, usize), CodecError> {
+fn transfer_syntax(b: &[u8], ctl: &crate::ProbeControl) -> Result<(Syntax, usize), CodecError> {
     let meta = Syntax { endian: Endian { big: false }, explicit: true };
     let mut ts: Option<String> = None;
     let mut data_start = b.len();
-    let mut c = Cur { b, pos: PREAMBLE, big: false };
+    let mut c = Cur { b, pos: PREAMBLE, big: false, ctl: *ctl };
     while c.pos + 8 <= b.len() {
         let save = c.pos;
         let (group, elem, _, len) = read_header(&mut c, &meta)?;
@@ -194,21 +202,40 @@ fn transfer_syntax(b: &[u8]) -> Result<(Syntax, usize), CodecError> {
     Ok((syn, data_start))
 }
 
-pub(crate) fn decode(b: &[u8], limits: &Limits) -> Result<Image, CodecError> {
+struct Dataset {
+    syn: Syntax,
+    tags: HashMap<(u16, u16), Elem>,
+}
+
+fn dataset(b: &[u8], ctl: &crate::ProbeControl) -> Result<Dataset, CodecError> {
     if !is_dicom(b) {
         return Err(bad("not a DICOM file (no DICM magic)"));
     }
-    let (syn, start) = transfer_syntax(b)?;
+    let (syn, start) = transfer_syntax(b, ctl)?;
     let mut tags: HashMap<(u16, u16), Elem> = HashMap::new();
-    elements(b, start, &syn, |g, e, el| {
+    elements(b, start, &syn, ctl, |g, e, el| {
         // Later duplicates must not silently override the first (DICOM forbids duplicates).
         tags.entry((g, e)).or_insert_with(|| Elem { vr: el.vr, start: el.start, len: el.len });
         Ok(())
     })?;
+    Ok(Dataset { syn, tags })
+}
+
+fn dimensions(b: &[u8], d: &Dataset) -> Result<(u32, u32), CodecError> {
+    let read = |tag| d.tags.get(&tag).and_then(|e| u16_val(b, e, d.syn.endian.big)).map(u32::from);
+    Ok((read((0x0028, 0x0011)).ok_or_else(|| bad("missing Columns (0028,0011)"))?, read((0x0028, 0x0010)).ok_or_else(|| bad("missing Rows (0028,0010)"))?))
+}
+
+pub(crate) fn probe(b: &[u8], ctl: &crate::ProbeControl) -> Result<(u32, u32), CodecError> {
+    dimensions(b, &dataset(b, ctl)?)
+}
+
+pub(crate) fn decode(b: &[u8], limits: &Limits) -> Result<Image, CodecError> {
+    let d = dataset(b, &crate::ProbeControl::default())?;
+    let (cols, rows) = dimensions(b, &d)?;
+    let Dataset { syn, tags } = d;
     let big = syn.endian.big;
     let get_u16 = |tag: (u16, u16)| tags.get(&tag).and_then(|e| u16_val(b, e, big));
-    let rows = u32::from(get_u16((0x0028, 0x0010)).ok_or_else(|| bad("missing Rows (0028,0010)"))?);
-    let cols = u32::from(get_u16((0x0028, 0x0011)).ok_or_else(|| bad("missing Columns (0028,0011)"))?);
     let samples = u32::from(get_u16((0x0028, 0x0002)).unwrap_or(1));
     let bits = get_u16((0x0028, 0x0100)).ok_or_else(|| bad("missing BitsAllocated (0028,0100)"))?;
     let bits_stored = get_u16((0x0028, 0x0101)).unwrap_or(bits);
@@ -513,5 +540,17 @@ mod tests {
         let at = b.windows(uncompressed.len()).position(|w| w == uncompressed).expect("transfer syntax in the fixture");
         b[at..at + compressed.len()].copy_from_slice(compressed);
         assert!(matches!(decode(&b, &Limits::default()), Err(CodecError::Unsupported { .. })));
+    }
+    #[test]
+    fn header_probe_does_not_need_pixel_data_and_checks_records() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let bytes = synth("1.2.840.10008.1.2.1", true, false, 0, 2, 3, 1, 8, "MONOCHROME2", &[42; 6]);
+        assert_eq!(crate::probe_size(&bytes).unwrap(), crate::decode(&bytes).unwrap().dimensions());
+        let start = bytes.windows(4).position(|b| b == [0xe0, 0x7f, 0x10, 0]).unwrap();
+        assert_eq!(crate::probe_size(&bytes[..start]).unwrap(), (3, 2));
+        assert!(crate::decode(&bytes[..start]).is_err());
+        let calls = AtomicUsize::new(0);
+        let cancel = || calls.fetch_add(1, Ordering::Relaxed) >= 5;
+        assert!(matches!(crate::probe_size_with(&bytes, &crate::ProbeControl { cancelled: &cancel, ..Default::default() }), Err(CodecError::Cancelled)));
     }
 }

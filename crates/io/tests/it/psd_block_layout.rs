@@ -155,3 +155,47 @@ fn psb_long_length_keys_are_read_and_written_with_eight_bytes() {
     assert_eq!(back.global_block(b"cinf").unwrap().data, cinf.data);
     assert_eq!(back.to_bytes().unwrap(), bytes);
 }
+
+#[test]
+fn placed_source_budget_is_fatal_instead_of_approximating_its_transform() {
+    let uuid = "bounded-source";
+    let mut file = testgen::small(Version::Psd, Compression::Raw);
+    let mut placed = plld(uuid);
+    placed.truncate(4 + 4 + 1 + uuid.len() + 16 + 64); // record ending at its corners has no warp
+    file.layers_mut()[0].blocks.push(TaggedBlock::new(*b"PlLd", placed));
+    let linked = linked::LinkedFile { uuid: uuid.into(), file_name: "header.ppm".into(), bytes: b"P6\n700 500\n255\n".to_vec() };
+    file.global_blocks.push(TaggedBlock::new(*b"lnk2", linked::encode_linked_file(&linked)));
+    let bytes = file.to_bytes().unwrap();
+    assert!(import_psd_with_limits("source.psd", &bytes, Default::default(), &photocraft_raster::Interrupt::NONE).is_ok());
+    let limits = photocraft_psd::LoadOptions { max_pixels: 100, ..Default::default() };
+    assert!(matches!(
+        import_psd_with_limits("source.psd", &bytes, limits, &photocraft_raster::Interrupt::NONE),
+        Err(IoError::Psd(photocraft_psd::PsdError::LimitExceeded("embedded source input/dimension budget")))
+    ));
+}
+
+#[cfg(all(feature = "corpus", not(feature = "heif")))]
+#[test]
+fn disabled_heif_keeps_photoshops_stored_layer_pixels_and_embedded_source() {
+    use photocraft_doc::LayerContent;
+    assert!(!photocraft_codecs::caps(photocraft_codecs::Format::Heif).read);
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/heif/heic-rs/checker-64.heic");
+    let source = std::fs::read(path).expect("fetch the pinned HEIF corpus");
+    assert_eq!(photocraft_codecs::detect(&source), Some(photocraft_codecs::Format::Heif));
+    let uuid = "stored-heif-source";
+    let mut file = testgen::small(Version::Psd, Compression::Raw);
+    let name = file.layers()[0].name();
+    let baseline = import("plain.psd", &file.to_bytes().unwrap()).unwrap().document;
+    let LayerContent::Raster(expected) = &baseline.layers.iter().find(|l| l.name == name).unwrap().content else { panic!("raster fixture") };
+    let mut placed = plld(uuid);
+    placed.truncate(4 + 4 + 1 + uuid.len() + 16 + 64);
+    file.layers_mut()[0].blocks.push(TaggedBlock::new(*b"PlLd", placed));
+    let linked = linked::LinkedFile { uuid: uuid.into(), file_name: "source.heic".into(), bytes: source.clone() };
+    file.global_blocks.push(TaggedBlock::new(*b"lnk2", linked::encode_linked_file(&linked)));
+    let bytes = file.to_bytes().unwrap();
+    let imported = import_psd_with_limits("embedded.psd", &bytes, Default::default(), &photocraft_raster::Interrupt::NONE).unwrap().document;
+    let LayerContent::Smart(smart) = &imported.layers.iter().find(|l| l.name == name).unwrap().content else { panic!("smart object retained") };
+    assert_eq!(smart.cache.as_ref().unwrap(), expected);
+    assert!(!smart.cache.as_ref().unwrap().content_bounds().is_empty());
+    assert_eq!(linked::find_linked_file(&imported.metadata, uuid).unwrap().bytes, source);
+}

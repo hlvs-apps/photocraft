@@ -191,7 +191,16 @@ fn dx10_encoding(b: &[u8]) -> Result<Encoding, CodecError> {
     }
 }
 
-pub(crate) fn decode(b: &[u8], limits: &Limits) -> Result<Image, CodecError> {
+struct ReadHeader {
+    width: u32,
+    height: u32,
+    flags: u32,
+    encoding: Encoding,
+    start: usize,
+    layout: ChannelLayout,
+}
+
+fn read_header(b: &[u8], limits: &Limits) -> Result<ReadHeader, CodecError> {
     if !b.starts_with(b"DDS ") {
         return Err(bad("missing the `DDS ` signature"));
     }
@@ -209,6 +218,16 @@ pub(crate) fn decode(b: &[u8], limits: &Limits) -> Result<Image, CodecError> {
     let (encoding, start) = if dx10 { (dx10_encoding(b)?, HEADER + DX10_HEADER) } else { (legacy_encoding(b)?, HEADER) };
     let layout = encoding.layout();
     limits.check(width, height, layout, SampleType::U8)?;
+    Ok(ReadHeader { width, height, flags, encoding, start, layout })
+}
+
+pub(crate) fn probe(b: &[u8], limits: &Limits) -> Result<(u32, u32), CodecError> {
+    let h = read_header(b, limits)?;
+    Ok((h.width, h.height))
+}
+
+pub(crate) fn decode(b: &[u8], limits: &Limits) -> Result<Image, CodecError> {
+    let ReadHeader { width, height, flags, encoding, start, layout } = read_header(b, limits)?;
     // The same header field is a total level size for BC, but a row stride when DDSD_PITCH is set.
     let pitch = if flags & DDSD_PITCH != 0 { Some(le32(b, 20)?) } else { None };
     let (row_pitch, size) = encoding.level_layout(width, height, pitch)?;

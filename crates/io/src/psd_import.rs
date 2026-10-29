@@ -94,6 +94,7 @@ pub(crate) struct Ctx<'a> {
     pub damaged: bool,
     /// Failure to read source channel data, which must fail the open.
     pub read_error: Option<String>,
+    pub probe_error: Option<photocraft_psd::PsdError>,
     /// Document resolution (type sizes are converted to points with it).
     pub dpi: f32,
     /// The parsed `Txt2` block (type settings EngineData lacks, e.g. optical kerning).
@@ -267,11 +268,20 @@ impl Ctx<'_> {
                 return Placement::default();
             }
         };
-        let (global, ctl) = (&self.global, self.ctl);
-        let size = *self
-            .plld_sizes
-            .entry(id.clone())
-            .or_insert_with(|| crate::linked::source_size_in_blocks(global.iter().map(|(_, k, d)| (k, d.as_slice())), &id, &ctl));
+        let (global, ctl, limits, error) = (&self.global, self.ctl, self.read_limits, &mut self.probe_error);
+        let size = *self.plld_sizes.entry(id.clone()).or_insert_with(|| {
+            match crate::linked::source_size_in_blocks_with(global.iter().map(|(_, k, d)| (k, d.as_slice())), &id, limits, &ctl) {
+                Ok(size) => size,
+                Err(e) => {
+                    *error = Some(match e {
+                        photocraft_codecs::CodecError::Cancelled => photocraft_psd::PsdError::Cancelled,
+                        photocraft_codecs::CodecError::LimitExceeded(_) => photocraft_psd::PsdError::LimitExceeded("embedded source input/dimension budget"),
+                        e => photocraft_psd::PsdError::Invalid(e.to_string()),
+                    });
+                    None
+                }
+            }
+        });
         // Without the source (missing or unreadable), it is taken as placed at 100 %.
         let (transform, perspective) = blocks::plld_transform(&p, size, warp.as_ref());
         Placement { id, transform, perspective, warp }
@@ -280,7 +290,7 @@ impl Ctx<'_> {
     /// Decodes a PSD layer channel, marking the document damaged if its data is unreadable.
     fn channel_plane(&mut self, rec: &LayerRecord, id: i16, name: &str) -> Option<Vec<u8>> {
         rec.channel(id)?;
-        if self.read_error.is_some() {
+        if self.read_error.is_some() || self.probe_error.is_some() {
             return None;
         }
         let channel = rec.channel(id)?;
@@ -308,7 +318,7 @@ impl Ctx<'_> {
     fn record_surface(&mut self, rec: &LayerRecord, name: &str) -> Surface {
         let r = rec.rect;
         // Once the file couldn't be read the open fails: nothing more is decoded.
-        if r.is_empty() || r.size().is_err() || self.read_error.is_some() {
+        if r.is_empty() || r.size().is_err() || (self.read_error.is_some() || self.probe_error.is_some()) {
             return Surface::new(self.fmt);
         }
         let (w, h) = r.size().unwrap_or((0, 0));
@@ -749,40 +759,45 @@ impl Ctx<'_> {
         nodes
             .iter()
             // A cancelled open stops decoding; the caller discards the partial document.
-            .take_while(|_| !ctl.cancelled())
-            .map(|n| match n {
-                LayerNode::Layer { index } => {
-                    let l = self.layer_from_record(&layers[*index]);
-                    self.done += 1;
-                    // Layers are 10–95 % of an open (the merged image and channels the rest).
-                    self.ctl.progress(0.1 + 0.85 * self.done as f32 / self.total.max(1) as f32);
-                    l
+            .map_while(|n| {
+                if ctl.cancelled() || self.probe_error.is_some() {
+                    return None;
                 }
-                LayerNode::Group { index, children, .. } => {
-                    let rec = &layers[*index];
-                    // The recursion here (and in every later consumer of the tree) is bounded by
-                    // the document model's nesting cap; a deeper subtree is not imported.
-                    let children = if depth >= photocraft_doc::MAX_GROUP_DEPTH {
-                        self.warn(format!(
-                            "group `{}` nests deeper than {} groups; its contents were not imported",
-                            rec.name(),
-                            photocraft_doc::MAX_GROUP_DEPTH
-                        ));
-                        Vec::new()
-                    } else {
-                        self.build(children, depth + 1)
-                    };
-                    let sd = rec.section_divider();
-                    let expanded = sd.is_none_or(|s| s.kind != photocraft_psd::SectionType::ClosedFolder);
-                    let artboard = crate::comps_map::ARTBOARD_KEYS.iter().find_map(|k| rec.block(k)).and_then(|b| crate::comps_map::parse_artboard(&b.data));
-                    // A Photoshop Frame's stroke: `vstk` on the frame group, in a shape's layout.
-                    let frame_stroke = rec.block(b"vstk").and_then(|b| crate::vector_map::parse_vstk(&b.data, self.dpi)).and_then(|v| v.stroke);
-                    let mut l = Layer::new(rec.name(), LayerContent::Group(Group { children, expanded, artboard, frame_stroke }));
-                    l.psd_blocks = preserved_blocks(rec);
-                    self.apply_common(&mut l, rec, sd.and_then(|s| s.blend_mode));
-                    self.apply_vector_mask(&mut l, rec);
-                    l
-                }
+                Some(match n {
+                    LayerNode::Layer { index } => {
+                        let l = self.layer_from_record(&layers[*index]);
+                        self.done += 1;
+                        // Layers are 10–95 % of an open (the merged image and channels the rest).
+                        self.ctl.progress(0.1 + 0.85 * self.done as f32 / self.total.max(1) as f32);
+                        l
+                    }
+                    LayerNode::Group { index, children, .. } => {
+                        let rec = &layers[*index];
+                        // The recursion here (and in every later consumer of the tree) is bounded by
+                        // the document model's nesting cap; a deeper subtree is not imported.
+                        let children = if depth >= photocraft_doc::MAX_GROUP_DEPTH {
+                            self.warn(format!(
+                                "group `{}` nests deeper than {} groups; its contents were not imported",
+                                rec.name(),
+                                photocraft_doc::MAX_GROUP_DEPTH
+                            ));
+                            Vec::new()
+                        } else {
+                            self.build(children, depth + 1)
+                        };
+                        let sd = rec.section_divider();
+                        let expanded = sd.is_none_or(|s| s.kind != photocraft_psd::SectionType::ClosedFolder);
+                        let artboard =
+                            crate::comps_map::ARTBOARD_KEYS.iter().find_map(|k| rec.block(k)).and_then(|b| crate::comps_map::parse_artboard(&b.data));
+                        // A Photoshop Frame's stroke: `vstk` on the frame group, in a shape's layout.
+                        let frame_stroke = rec.block(b"vstk").and_then(|b| crate::vector_map::parse_vstk(&b.data, self.dpi)).and_then(|v| v.stroke);
+                        let mut l = Layer::new(rec.name(), LayerContent::Group(Group { children, expanded, artboard, frame_stroke }));
+                        l.psd_blocks = preserved_blocks(rec);
+                        self.apply_common(&mut l, rec, sd.and_then(|s| s.blend_mode));
+                        self.apply_vector_mask(&mut l, rec);
+                        l
+                    }
+                })
             })
             .collect()
     }
@@ -1278,6 +1293,7 @@ fn psd_to_document_global(
         warnings,
         damaged,
         read_error: None,
+        probe_error: None,
         dpi: doc.resolution_dpi,
         txt2: global.iter().find(|(_, k, _)| k == b"Txt2").and_then(|(_, _, d)| photocraft_text::psd::parse_txt2(d)),
         filter_effects: Vec::new(),
@@ -1321,6 +1337,9 @@ fn psd_to_document_global(
     let canvas = Rect::new(0, 0, h.width as i32, h.height as i32);
     let Some(merged) = decode_merged(file, decoded, ctl, &mut cx) else { return Ok(None) };
     import_decoded_content(DecodedImport { file, merged: &merged, sizes, canvas, layered, multichannel, depth, fmt }, &mut doc, &mut cx);
+    if let Some(error) = cx.probe_error.take() {
+        return Err(error);
+    }
     Ok(finish_import(doc, cx, ctl))
 }
 
@@ -1418,7 +1437,9 @@ fn import_decoded_content(import: DecodedImport<'_>, doc: &mut Document, cx: &mu
     } else {
         import_flattened(import.file, import.merged, import.sizes, import.canvas, import.fmt, doc, cx);
     }
-    import_extra_channels(import, doc, cx);
+    if cx.probe_error.is_none() {
+        import_extra_channels(import, doc, cx);
+    }
 }
 
 fn import_multichannel(file: &PsdFile, merged: &Option<photocraft_psd::Result<Vec<u8>>>, doc: &mut Document, cx: &mut Ctx<'_>) {

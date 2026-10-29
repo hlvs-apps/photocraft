@@ -20,13 +20,15 @@ pub struct LinkedFile {
     pub bytes: Vec<u8>,
 }
 
-struct Rd<'a> {
+struct Rd<'a, 'c> {
     d: &'a [u8],
     p: usize,
+    ctl: photocraft_codecs::ProbeControl<'c>,
 }
 
-impl<'a> Rd<'a> {
+impl<'a> Rd<'a, '_> {
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        self.ctl.check().ok()?;
         let s = self.d.get(self.p..self.p.checked_add(n)?)?;
         self.p += n;
         Some(s)
@@ -43,8 +45,15 @@ impl<'a> Rd<'a> {
     fn unicode(&mut self) -> Option<String> {
         let n = self.u32()? as usize;
         let raw = self.take(n.checked_mul(2)?)?;
-        let units: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
-        Some(String::from_utf16_lossy(&units).trim_end_matches('\0').to_string())
+        let units = raw.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes(*c));
+        let mut out = String::new();
+        for (i, c) in char::decode_utf16(units).enumerate() {
+            if i.is_multiple_of(16384) {
+                self.ctl.check().ok()?;
+            }
+            out.push(c.unwrap_or(char::REPLACEMENT_CHARACTER));
+        }
+        Some(out.trim_end_matches('\0').to_string())
     }
 }
 
@@ -58,7 +67,11 @@ fn parse_item(item: &[u8]) -> Option<LinkedFile> {
 /// The uuid and file name of an embedded (`liFD`) item, and where its file bytes start and how
 /// many there are; `None` for malformed data or other items.
 fn item_header(item: &[u8]) -> Option<(String, String, usize, usize)> {
-    let mut r = Rd { d: item, p: 0 };
+    item_header_with(item, &photocraft_codecs::ProbeControl::default())
+}
+
+fn item_header_with(item: &[u8], ctl: &photocraft_codecs::ProbeControl) -> Option<(String, String, usize, usize)> {
+    let mut r = Rd { d: item, p: 0, ctl: *ctl };
     let kind = r.take(4)?;
     let _version = r.u32()?;
     let n = r.u8()? as usize;
@@ -67,7 +80,8 @@ fn item_header(item: &[u8]) -> Option<(String, String, usize, usize)> {
     r.take(8)?; // file type + creator
     let len = usize::try_from(r.u64()?).ok()?;
     if r.u8()? != 0 {
-        let (_, used) = VersionedDescriptor::parse_prefix(item.get(r.p..)?).ok()?;
+        let (_, used) =
+            VersionedDescriptor::parse_prefix_with(item.get(r.p..)?, &photocraft_psd::ReadControl { cancelled: ctl.cancelled, ..Default::default() }).ok()?;
         r.p += used;
     }
     if kind != b"liFD" {
@@ -83,7 +97,7 @@ pub fn embedded_file_name(meta: &Metadata, uuid: &str) -> Option<String> {
         return None;
     }
     meta.psd_global_blocks.iter().filter(|(_, k, _)| matches!(k, b"lnk2" | b"lnk3" | b"lnkD")).find_map(|(_, _, d)| {
-        let mut r = Rd { d, p: 0 };
+        let mut r = Rd { d, p: 0, ctl: photocraft_codecs::ProbeControl::default() };
         while let Some(len) = r.u64() {
             let item = r.take(usize::try_from(len).ok()?)?;
             if let Some((_, name, ..)) = item_header(item).filter(|h| h.0 == uuid) {
@@ -98,7 +112,7 @@ pub fn embedded_file_name(meta: &Metadata, uuid: &str) -> Option<String> {
 /// Every embedded (`liFD`) file in one linked-layer block's data.
 pub fn parse_linked_files(data: &[u8]) -> Vec<LinkedFile> {
     let mut out = Vec::new();
-    let mut r = Rd { d: data, p: 0 };
+    let mut r = Rd { d: data, p: 0, ctl: photocraft_codecs::ProbeControl::default() };
     while let Some(len) = r.u64() {
         let Ok(len) = usize::try_from(len) else { break };
         let Some(item) = r.take(len) else { break };
@@ -125,23 +139,41 @@ pub fn find_in_blocks<'a>(blocks: impl IntoIterator<Item = (&'a [u8; 4], &'a [u8
 /// [`find_in_blocks`] without copying: the uuid, file name and bytes of the embedded file, as a
 /// slice of the block. Only the matching item's header is parsed beyond the uuid, and no other
 /// embedded file is copied (a `lnk2` block can hold gigabytes of them).
-fn find_slice_in_blocks<'a>(blocks: impl IntoIterator<Item = (&'a [u8; 4], &'a [u8])>, uuid: &str) -> Option<(String, String, &'a [u8])> {
+type LinkedSlice<'a> = (String, String, &'a [u8]);
+
+fn find_slice_in_blocks<'a>(blocks: impl IntoIterator<Item = (&'a [u8; 4], &'a [u8])>, uuid: &str) -> Option<LinkedSlice<'a>> {
+    find_slice_in_blocks_with(blocks, uuid, &photocraft_codecs::ProbeControl::default()).ok().flatten()
+}
+
+fn find_slice_in_blocks_with<'a>(
+    blocks: impl IntoIterator<Item = (&'a [u8; 4], &'a [u8])>,
+    uuid: &str,
+    ctl: &photocraft_codecs::ProbeControl,
+) -> Result<Option<LinkedSlice<'a>>, photocraft_codecs::CodecError> {
     if uuid.is_empty() {
-        return None;
+        return Ok(None);
     }
-    blocks.into_iter().filter(|(k, _)| matches!(*k, b"lnk2" | b"lnk3" | b"lnkD")).find_map(|(_, d)| {
-        let mut r = Rd { d, p: 0 };
+    for (_, d) in blocks.into_iter().filter(|(k, _)| matches!(*k, b"lnk2" | b"lnk3" | b"lnkD")) {
+        ctl.check()?;
+        if d.len() > ctl.max_input_bytes {
+            return Err(photocraft_codecs::CodecError::LimitExceeded("linked block input byte budget".into()));
+        }
+        let mut r = Rd { d, p: 0, ctl: *ctl };
         while let Some(len) = r.u64() {
-            let Ok(len) = usize::try_from(len) else { return None };
-            let item = r.take(len)?;
-            let found = item_header(item).filter(|h| h.0 == uuid).and_then(|(id, name, start, n)| Some((id, name, item.get(start..start.checked_add(n)?)?)));
+            ctl.check()?;
+            let Ok(len) = usize::try_from(len) else { break };
+            let Some(item) = r.take(len) else { break };
+            let found =
+                item_header_with(item, ctl).filter(|h| h.0 == uuid).and_then(|(id, name, start, n)| Some((id, name, item.get(start..start.checked_add(n)?)?)));
+            ctl.check()?;
             if found.is_some() {
-                return found;
+                return Ok(found);
             }
             r.p = r.p.next_multiple_of(4);
         }
-        None
-    })
+        ctl.check()?;
+    }
+    Ok(None)
 }
 
 /// The size of embedded file `uuid` among PSD global blocks given as (key, data), when it is there
@@ -151,42 +183,80 @@ pub(crate) fn source_size_in_blocks<'a>(
     uuid: &str,
     ctl: &photocraft_raster::Interrupt,
 ) -> Option<(f64, f64)> {
-    let (_, _, bytes) = find_slice_in_blocks(blocks, uuid)?;
-    if ctl.cancelled() {
-        return None;
-    }
-    source_size_probe(bytes).filter(|(w, h)| *w > 0.0 && *h > 0.0)
+    source_size_in_blocks_with(blocks, uuid, photocraft_psd::LoadOptions::default(), ctl).ok().flatten()
 }
 
-/// Pixel size of an embedded source file from its header: PSD/PSB, TIFF (the default page's
-/// directory), PNG (`IHDR`) and JPEG (the frame header); WebP, GIF, BMP, EXR and the rest of
-/// `photocraft_codecs::probe_size`'s formats from their decoder's header; anything else (or a
-/// header that probe cannot read) is decoded flat by `photocraft-codecs`. It never imports a
-/// document: a layered TIFF can carry PSD layer data whose `lnkD` holds another file, so a full
-/// import here would nest without bound (#2465).
+pub(crate) fn source_size_in_blocks_with<'a>(
+    blocks: impl IntoIterator<Item = (&'a [u8; 4], &'a [u8])>,
+    uuid: &str,
+    limits: photocraft_psd::LoadOptions,
+    interrupt: &photocraft_raster::Interrupt,
+) -> Result<Option<(f64, f64)>, photocraft_codecs::CodecError> {
+    let ctl = photocraft_codecs::ProbeControl {
+        limits: photocraft_codecs::Limits { max_pixels: limits.max_pixels, max_alloc: limits.max_decoded_bytes, ..photocraft_codecs::Limits::none() },
+        max_input_bytes: limits.max_input_bytes,
+        cancelled: &|| interrupt.cancelled(),
+    };
+    let Some((_, _, bytes)) = find_slice_in_blocks_with(blocks, uuid, &ctl)? else { return Ok(None) };
+    source_size_probe_with(bytes, &ctl)
+}
+
+#[cfg(test)]
 pub(crate) fn source_size_probe(bytes: &[u8]) -> Option<(f64, f64)> {
-    let be32 = |at: usize| bytes.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
-    let size = |w: u32, h: u32| (f64::from(w), f64::from(h));
-    match bytes {
-        _ if crate::is_psd(bytes) => be32(18).zip(be32(14)).map(|(w, h)| size(w, h)),
+    source_size_probe_with(bytes, &photocraft_codecs::ProbeControl::default()).ok().flatten()
+}
+
+/// Read placement dimensions without decoding pixels. PSD/PNG/JPEG/TIFF retain their
+/// stored-size semantics; other formats use their codec's upright header dimensions.
+fn source_size_probe_with(bytes: &[u8], ctl: &photocraft_codecs::ProbeControl) -> Result<Option<(f64, f64)>, photocraft_codecs::CodecError> {
+    use photocraft_codecs::CodecError;
+    ctl.check()?;
+    if bytes.len() > ctl.max_input_bytes {
+        return Err(CodecError::LimitExceeded("embedded input byte budget".into()));
+    }
+    let be32 = |at: usize| bytes.get(at..at + 4).and_then(|b| b.try_into().ok()).map(u32::from_be_bytes);
+    let result: Result<Option<(u32, u32)>, CodecError> = match bytes {
+        _ if crate::is_psd(bytes) => Ok(be32(18).zip(be32(14))),
         [b'I', b'I', 42, 0, ..] | [b'M', b'M', 0, 42, ..] | [b'I', b'I', 43, 0, ..] | [b'M', b'M', 0, 43, ..] => {
-            let info = photocraft_codecs::tiff_info(bytes).ok()?;
-            let page = info.pages.get(info.default_page()?)?;
-            Some(size(page.width, page.height))
+            photocraft_codecs::tiff_info_with(bytes, ctl).map(|info| info.default_page().and_then(|i| info.pages.get(i)).map(|p| (p.width, p.height)))
         }
-        [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => be32(16).zip(be32(20)).map(|(w, h)| size(w, h)),
-        [0xFF, 0xD8, ..] => jpeg_size(bytes),
-        _ => photocraft_codecs::probe_size(bytes).or_else(|_| photocraft_codecs::decode(bytes).map(|img| img.dimensions())).ok().map(|(w, h)| size(w, h)),
+        [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, ..] => Ok(be32(16).zip(be32(20))),
+        [0xff, 0xd8, ..] => jpeg_size_with(bytes, ctl).map(|size| size.map(|(w, h)| (w as u32, h as u32))),
+        _ => photocraft_codecs::probe_size_with(bytes, ctl).map(Some),
+    };
+    ctl.check()?;
+    match result {
+        Ok(Some((w, h))) if w > 0 && h > 0 => {
+            ctl.limits.check_dimensions(w, h)?;
+            Ok(Some((f64::from(w), f64::from(h))))
+        }
+        Err(e @ (CodecError::Cancelled | CodecError::LimitExceeded(_))) => Err(e),
+        _ => Ok(None),
     }
 }
 
 /// A JPEG's size from its first start-of-frame marker (ITU-T T.81 B.2.2), walking the marker
 /// segments without decoding. Each step moves forward, so a malformed file ends the walk.
+#[cfg(test)]
 fn jpeg_size(bytes: &[u8]) -> Option<(f64, f64)> {
+    jpeg_size_with(bytes, &photocraft_codecs::ProbeControl::default()).ok().flatten()
+}
+
+fn jpeg_size_with(bytes: &[u8], ctl: &photocraft_codecs::ProbeControl) -> Result<Option<(f64, f64)>, photocraft_codecs::CodecError> {
+    let result = jpeg_size_checked(bytes, ctl);
+    ctl.check()?;
+    Ok(result)
+}
+
+fn jpeg_size_checked(bytes: &[u8], ctl: &photocraft_codecs::ProbeControl) -> Option<(f64, f64)> {
     let mut at = 2usize;
     loop {
+        ctl.check().ok()?;
         // Markers are 0xFF then a code; extra 0xFF fill bytes may come first.
         while bytes.get(at) == Some(&0xFF) && bytes.get(at + 1) == Some(&0xFF) {
+            if at.is_multiple_of(64 << 10) {
+                ctl.check().ok()?;
+            }
             at += 1;
         }
         if *bytes.get(at)? != 0xFF {

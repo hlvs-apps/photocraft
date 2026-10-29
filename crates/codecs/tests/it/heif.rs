@@ -87,6 +87,7 @@ fn single_picture_matches_apple_decode() {
         let want = reference(&corpus(png));
         assert_eq!((img.layout(), img.sample_type()), (ChannelLayout::Rgb, SampleType::U8));
         assert_eq!(img.dimensions(), want.dimensions());
+        assert_eq!(photocraft_codecs::probe_size(heic).unwrap(), img.dimensions());
         assert!(max_abs_diff(&img, &want) <= 3.0 / 255.0, "max diff {}", max_abs_diff(&img, &want) * 255.0);
         assert!(psnr(&img, &want) > 45.0);
     }

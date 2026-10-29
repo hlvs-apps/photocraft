@@ -4,6 +4,8 @@ use crate::format::Format;
 /// they return [`CodecError::Malformed`] instead.
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
+    #[error("cancelled")]
+    Cancelled,
     #[error("unrecognized image format")]
     UnknownFormat,
     #[error("{format:?}: {reason}")]
