@@ -66,7 +66,7 @@ fn par_threads(work: usize) -> usize {
     if let Some(n) = THREADS.with(std::cell::Cell::get) {
         return n;
     }
-    if cfg!(target_arch = "wasm32") || work < PAR_MIN { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, PAR_THREADS) }
+    if work < PAR_MIN { 1 } else { photocraft_raster::kernel_threads(PAR_THREADS) }
 }
 
 /// Runs `f(scratch, u, a_u, b_u)` for every unit `u` of two slices: unit `u` of `a` is

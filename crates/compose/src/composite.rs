@@ -16,6 +16,9 @@ pub(crate) fn composite_stack_at(layers: &[Layer], backdrop: &mut Buffer, cx: &C
     let floor = (!scope.root && advanced::needs_floor(layers)).then(|| backdrop.clone());
     let mut i = 0;
     while i < layers.len() {
+        if cx.ctl.cancelled() {
+            return;
+        }
         let base = &layers[i];
         // Collect the clipping group: following layers with `clipped = true`.
         let mut j = i + 1;
@@ -228,6 +231,9 @@ fn apply_blend_if(layer: &Layer, before: &Buffer, out: &mut Buffer, cx: &Ctx) {
 /// Composite `layer` (plus its clipping group) onto `backdrop`, honouring its channel restrictions
 /// and Blend If, and knocking out to `ko` when it has a knockout (see [`advanced`]).
 pub(crate) fn composite_layer(layer: &Layer, clipped: &[Layer], backdrop: &mut Buffer, cx: &Ctx, ko: Option<&Buffer>, scope: advanced::Scope) {
+    if cx.ctl.cancelled() {
+        return;
+    }
     // Blend Clipped Layers as Group off: the base alone, then each clipped layer in its own mode.
     if advanced::clips_individually(layer, clipped) {
         advanced::composite_clipped_individually(layer, clipped, backdrop, cx, ko, scope);
