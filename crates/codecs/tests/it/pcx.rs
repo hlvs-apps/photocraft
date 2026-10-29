@@ -135,3 +135,12 @@ fn decodes_four_plane_runs_across_planes() {
     b.extend([0xc8, 0xff]);
     assert_eq!(decode(&b).unwrap().data(), &[255, 255, 0, 255, 255, 0]);
 }
+
+#[test]
+fn pcx_dimensions_are_available_without_scanlines() {
+    let mut bytes = header(8, 3, 2, 1, 2);
+    assert_eq!(photocraft_codecs::probe_size(&bytes).unwrap(), (2, 1));
+    assert!(decode(&bytes).is_err());
+    rle_row(&mut bytes, &[255, 0, 0, 255, 0, 0]);
+    assert_eq!(photocraft_codecs::probe_size(&bytes).unwrap(), decode(&bytes).unwrap().dimensions());
+}

@@ -32,6 +32,11 @@ impl Default for Limits {
 }
 
 impl Limits {
+    /// Check dimensions without budgeting a decoded pixel buffer (for header-only probes).
+    pub fn check_dimensions(&self, width: u32, height: u32) -> Result<(), CodecError> {
+        self.check_bytes(width, height, 0)
+    }
+
     /// Effectively unlimited (still bounded by `usize` overflow checks).
     pub fn none() -> Self {
         Limits { max_width: u32::MAX, max_height: u32::MAX, max_pixels: u64::MAX, max_alloc: u64::MAX }

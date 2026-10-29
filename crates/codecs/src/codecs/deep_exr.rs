@@ -251,6 +251,28 @@ fn our_sample_type(t: ExrSample) -> SampleType {
     }
 }
 
+/// Shared display-stage choice for header probes and deep decoding.
+pub(super) fn display_stage(header: &exr::meta::header::Header, limits: &Limits) -> (Option<(u32, u32)>, (i32, i32)) {
+    let dw = header.data_window();
+    let (w, h) = (dw.size.0, dw.size.1);
+    let display = header.shared_attributes.display_window;
+    let display_size = (display.size.0.max(1) as u32, display.size.1.max(1) as u32);
+    match display_size {
+        (sw, sh)
+            if sw <= 1 << 15
+                && sh <= 1 << 15
+                && limits.check_bytes(sw, sh, 4).is_ok()
+                && dw.position.0 >= display.position.0
+                && dw.position.1 >= display.position.1
+                && dw.position.0.saturating_add(w as i32) <= display.position.0.saturating_add(sw as i32)
+                && dw.position.1.saturating_add(h as i32) <= display.position.1.saturating_add(sh as i32) =>
+        {
+            (Some((sw, sh)), (dw.position.0 - display.position.0, dw.position.1 - display.position.1))
+        }
+        _ => (None, (0, 0)),
+    }
+}
+
 /// Read the deep samples of the first deep part. `meta` must come from an unvalidated
 /// [`MetaData::read_from_buffered`] of the same bytes (deep headers fail validation).
 pub(crate) fn decode_deep(meta: &MetaData, bytes: &[u8], limits: &Limits) -> Result<DeepImage, CodecError> {
@@ -273,26 +295,7 @@ pub(crate) fn decode_deep(meta: &MetaData, bytes: &[u8], limits: &Limits) -> Res
     let npixels = w.checked_mul(h).ok_or_else(|| err("the data window is too large"))?;
     limits.check_bytes(w as u32, h as u32, (header.channels.list.len().max(1) as u64) * 4)?;
 
-    // The display window is the full stage the renderer composed onto (a render pass's data
-    // window is often its crop). Open on the stage when it plausibly holds the data region:
-    // sane size for the limits, and the data region inside it. Otherwise fall back to the
-    // data window alone, as before.
-    let display = header.shared_attributes.display_window;
-    let display_size = (display.size.0.max(1) as u32, display.size.1.max(1) as u32);
-    let (stage, origin) = match display_size {
-        (sw, sh)
-            if sw <= 1 << 15
-                && sh <= 1 << 15
-                && limits.check_bytes(sw, sh, 4).is_ok()
-                && dw.position.0 >= display.position.0
-                && dw.position.1 >= display.position.1
-                && dw.position.0.saturating_add(w as i32) <= display.position.0.saturating_add(sw as i32)
-                && dw.position.1.saturating_add(h as i32) <= display.position.1.saturating_add(sh as i32) =>
-        {
-            (Some((sw, sh)), (dw.position.0 - display.position.0, dw.position.1 - display.position.1))
-        }
-        _ => (None, (0, 0)),
-    };
+    let (stage, origin) = display_stage(header, limits);
 
     let exr_types: Vec<ExrSample> = header.channels.list.iter().map(|c| c.sample_type).collect();
     let bytes_per_sample: usize = exr_types.iter().map(|t| sample_bytes(*t)).sum();

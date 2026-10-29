@@ -36,13 +36,18 @@ fn map_exr(e: exr::error::Error) -> CodecError {
 /// Read the headers without the `exr` crate's validation (it rejects deep parts outright),
 /// after checking every part's declared size against the limits, before any pixel allocation.
 pub(super) fn read_meta(bytes: &[u8], limits: &Limits) -> Result<MetaData, CodecError> {
-    let meta = MetaData::read_from_buffered(Cursor::new(bytes), false).map_err(err)?;
+    read_meta_with(bytes, limits, &crate::ProbeControl::default())
+}
+
+fn read_meta_with(bytes: &[u8], limits: &Limits, ctl: &crate::ProbeControl) -> Result<MetaData, CodecError> {
+    let meta = MetaData::read_from_buffered(crate::probe::ProbeReader::new(bytes, *ctl), false).map_err(err)?;
     // Flat decoding reads every part at once, so the parts' sizes are also capped together.
     let mut total: u64 = 0;
     // DWAA/DWAB parts are counted apart: they go past 2^16:1 (a flat 8192x4320 frame with 12
     // alpha-scheme mattes is about 30 KB, over 75000:1).
     let mut dwa: u64 = 0;
     for header in meta.headers.iter() {
+        ctl.check()?;
         let size = header.layer_size;
         let (w, h) = (u32::try_from(size.0).unwrap_or(u32::MAX), u32::try_from(size.1).unwrap_or(u32::MAX));
         let bpp = header.channels.list.len().max(1) as u64 * 4;
@@ -190,12 +195,17 @@ pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError>
     Ok(img)
 }
 
-/// The size of the part [`decode`] opens, from the headers alone. Deep files are refused (their
-/// flattened size comes from the deep decoder), as is a part [`decode`] cannot show.
-pub(crate) fn probe(bytes: &[u8], limits: &Limits) -> Result<(u32, u32), CodecError> {
-    let meta = read_meta(bytes, limits)?;
+/// The size of the part [`decode`] opens, from headers alone. Deep files use the first deep
+/// part and the decoder's display-stage selection; flat parts keep the same channel checks.
+pub(crate) fn probe_with(bytes: &[u8], ctl: &crate::ProbeControl) -> Result<(u32, u32), CodecError> {
+    let meta = read_meta_with(bytes, &ctl.limits, ctl)?;
     if meta.requirements.has_deep_data {
-        return Err(CodecError::unsupported(F, "no header-only size probe for deep data"));
+        let header = meta.headers.iter().find(|h| h.deep).ok_or_else(|| err("the file has no deep part"))?;
+        let size = header.data_window().size;
+        let width = u32::try_from(size.0).map_err(|_| err("data window too large"))?;
+        let height = u32::try_from(size.1).map_err(|_| err("data window too large"))?;
+        ctl.limits.check_bytes(width, height, 1)?;
+        return Ok(super::deep_exr::display_stage(header, &ctl.limits).0.unwrap_or((width, height)));
     }
     let pick = pick_part(&meta);
     let info = meta.headers.get(pick).map(|h| part_info(pick, h)).ok_or_else(|| err("no parts"))?;

@@ -580,7 +580,22 @@ fn long_orientation_reads_and_rewrites_in_both_byte_orders() {
 #[test]
 fn probe_size_matches_decode() {
     let img = synth(7, 5, ChannelLayout::Rgb, SampleType::U8, 3, 0.0);
-    let probed = [Format::WebP, Format::Gif, Format::Bmp, Format::Tga, Format::Qoi, Format::Hdr, Format::Ico, Format::OpenExr];
+    let probed = [
+        Format::WebP,
+        Format::Gif,
+        Format::Bmp,
+        Format::Tga,
+        Format::Qoi,
+        Format::Hdr,
+        Format::Ico,
+        Format::OpenExr,
+        Format::Pnm,
+        Format::Dds,
+        Format::Fits,
+        Format::Dpx,
+        Format::Cineon,
+        Format::Iff,
+    ];
     assert!(probed.iter().all(|f| rw_formats().contains(f)));
     for format in rw_formats() {
         let bytes = encode(&img, format, &EncodeOptions::default()).unwrap();

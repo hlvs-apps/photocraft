@@ -121,3 +121,11 @@ fn xpm_is_import_only() {
     let image = Image::from_u8(1, 1, ChannelLayout::Rgba, vec![0, 0, 0, 0]).unwrap();
     assert!(matches!(encode(&image, Format::Xpm, &Default::default()), Err(CodecError::Unsupported { .. })));
 }
+
+#[test]
+fn xpm_probe_reads_only_the_header_string() {
+    assert_eq!(photocraft_codecs::probe_size(SAMPLE).unwrap(), decode(SAMPLE).unwrap().dimensions());
+    let header = b"/* XPM */\nstatic char *i[]={\"7 5 1 1\"";
+    assert_eq!(photocraft_codecs::probe_size(header).unwrap(), (7, 5));
+    assert!(decode(header).is_err());
+}

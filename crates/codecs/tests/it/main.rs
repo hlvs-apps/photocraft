@@ -20,6 +20,7 @@ mod orientation;
 mod pcx;
 mod png_jpeg;
 mod pnm_headers;
+mod probes;
 mod resolution;
 mod roundtrip;
 mod source_settings;

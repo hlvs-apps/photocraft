@@ -66,9 +66,16 @@ struct Chunk<'a> {
 /// Walk the `FORM`'s chunks from offset 12 to `end` (the form length), stopping at the first
 /// malformed length so a hostile file can't run past the buffer.
 fn chunks(b: &[u8]) -> impl Iterator<Item = Chunk<'_>> {
+    chunks_with(b, crate::ProbeControl::default())
+}
+
+fn chunks_with<'a>(b: &'a [u8], ctl: crate::ProbeControl<'a>) -> impl Iterator<Item = Chunk<'a>> {
     let end = be32(b, 4).map_or(b.len(), |n| (n as usize).saturating_add(8).min(b.len()));
     let mut pos = 12usize;
     std::iter::from_fn(move || {
+        if ctl.check().is_err() {
+            return None;
+        }
         if pos + 8 > end {
             return None;
         }
@@ -83,7 +90,11 @@ fn chunks(b: &[u8]) -> impl Iterator<Item = Chunk<'_>> {
 }
 
 fn parse_header(b: &[u8], chunky: bool) -> Result<Header, CodecError> {
-    let bmhd = chunks(b).find(|c| &c.id == b"BMHD").ok_or_else(|| bad("no BMHD chunk"))?;
+    parse_header_with(b, chunky, &crate::ProbeControl::default())
+}
+
+fn parse_header_with(b: &[u8], chunky: bool, ctl: &crate::ProbeControl) -> Result<Header, CodecError> {
+    let bmhd = chunks_with(b, *ctl).find(|c| &c.id == b"BMHD").ok_or_else(|| bad("no BMHD chunk"))?;
     let d = bmhd.data;
     if d.len() < 20 {
         return Err(bad("BMHD chunk is too short"));
@@ -143,6 +154,14 @@ fn unpack_byte_run1(src: &[u8], out: &mut [u8]) -> Result<usize, CodecError> {
         }
     }
     Ok(i)
+}
+
+pub(crate) fn probe(b: &[u8], ctl: &crate::ProbeControl) -> Result<(u32, u32), CodecError> {
+    if !looks_like_iff(b) {
+        return Err(bad("not an IFF/ILBM file (no FORM ... ILBM)"));
+    }
+    let h = parse_header_with(b, b.get(8..12) == Some(b"PBM "), ctl)?;
+    Ok((h.width, h.height))
 }
 
 pub(crate) fn decode(b: &[u8], limits: &Limits) -> Result<Image, CodecError> {

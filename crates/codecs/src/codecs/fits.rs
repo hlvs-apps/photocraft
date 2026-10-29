@@ -150,10 +150,11 @@ impl Header {
     }
 }
 
-fn parse_header(b: &[u8], start: usize) -> Result<Header, CodecError> {
+fn parse_header_with(b: &[u8], start: usize, ctl: &crate::ProbeControl) -> Result<Header, CodecError> {
     let mut cards = Vec::new();
     let mut pos = start;
     loop {
+        ctl.check()?;
         let raw = b.get(pos..pos.checked_add(CARD).ok_or_else(|| err("header too long"))?).ok_or_else(|| err("header ends before END"))?;
         pos += CARD;
         if raw.starts_with(b"END") && raw.get(3..).is_some_and(|r| r.iter().all(|&c| c == b' ')) {
@@ -179,6 +180,7 @@ fn parse_header(b: &[u8], start: usize) -> Result<Header, CodecError> {
     // `find(|c| !c.hierarch && c.key == key)` lookup while making `get` O(1).
     let mut index = HashMap::with_capacity(cards.len());
     for (i, c) in cards.iter().enumerate() {
+        ctl.check()?;
         if !c.hierarch {
             index.entry(c.key.clone()).or_insert(i);
         }
@@ -214,7 +216,11 @@ fn data_len(h: &Header, bitpix: i64) -> Result<u64, CodecError> {
 /// Finds the image HDU: the primary one when it has at least two axes, else the first `IMAGE`
 /// extension. Returns its header and the primary header (for its descriptive cards).
 fn find_image(b: &[u8]) -> Result<(Header, Option<Header>), CodecError> {
-    let primary = parse_header(b, 0)?;
+    find_image_with(b, &crate::ProbeControl::default())
+}
+
+fn find_image_with(b: &[u8], ctl: &crate::ProbeControl) -> Result<(Header, Option<Header>), CodecError> {
+    let primary = parse_header_with(b, 0, ctl)?;
     if primary.get("SIMPLE").is_none() {
         return Err(err("missing SIMPLE"));
     }
@@ -232,7 +238,7 @@ fn find_image(b: &[u8]) -> Result<(Header, Option<Header>), CodecError> {
         if next >= b.len() {
             break;
         }
-        let h = parse_header(b, next)?;
+        let h = parse_header_with(b, next, ctl)?;
         let kind = h.string("XTENSION").unwrap_or("").to_string();
         if kind == "IMAGE" && axes(&h)?.len() >= 2 {
             return Ok((h, Some(primary)));
@@ -249,6 +255,22 @@ fn find_image(b: &[u8]) -> Result<(Header, Option<Header>), CodecError> {
     Err(err("the file holds no image"))
 }
 
+pub(crate) fn probe(bytes: &[u8], ctl: &crate::ProbeControl) -> Result<(u32, u32), CodecError> {
+    let (header, _) = find_image_with(bytes, ctl)?;
+    image_dimensions(&header)
+}
+
+fn image_dimensions(h: &Header) -> Result<(u32, u32), CodecError> {
+    let ax = axes(h)?;
+    let (Some(&w), Some(&h)) = (ax.first(), ax.get(1)) else {
+        return Err(err("the image has fewer than two axes"));
+    };
+    Ok((
+        u32::try_from(w).map_err(|_| CodecError::LimitExceeded(format!("width {w}")))?,
+        u32::try_from(h).map_err(|_| CodecError::LimitExceeded(format!("height {h}")))?,
+    ))
+}
+
 pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError> {
     let (h, primary) = find_image(bytes)?;
     let bitpix = h.int("BITPIX").ok_or_else(|| err("missing BITPIX"))?;
@@ -256,9 +278,7 @@ pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError>
         return Err(err(format!("invalid BITPIX {bitpix}")));
     }
     let ax = axes(&h)?;
-    let (Some(&w), Some(&hgt)) = (ax.first(), ax.get(1)) else { return Err(err("the image has fewer than two axes")) };
-    let w = u32::try_from(w).map_err(|_| CodecError::LimitExceeded(format!("width {w}")))?;
-    let hgt = u32::try_from(hgt).map_err(|_| CodecError::LimitExceeded(format!("height {hgt}")))?;
+    let (w, hgt) = image_dimensions(&h)?;
     let planes = ax.iter().skip(2).try_fold(1u64, |a, &n| a.checked_mul(n)).ok_or_else(|| err("too many planes"))?;
     let (layout, nplanes) = if ax.get(2) == Some(&3) && planes == 3 { (ChannelLayout::Rgb, 3usize) } else { (ChannelLayout::Gray, 1) };
 

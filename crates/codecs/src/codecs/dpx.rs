@@ -267,6 +267,12 @@ fn narrow(v: u16, max: u64) -> u16 {
     ((u64::from(v) * 2 * max + 65535) / (2 * 65535)) as u16
 }
 
+pub(crate) fn probe(bytes: &[u8], limits: &Limits) -> Result<(u32, u32), CodecError> {
+    let h = parse(bytes)?;
+    limits.check_bytes(h.width, h.height, 1)?;
+    Ok((h.width, h.height))
+}
+
 pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError> {
     let h = parse(bytes)?;
     let e = h.element;
@@ -371,7 +377,14 @@ pub(crate) fn cineon_orientation(b: &[u8]) -> u16 {
 /// Decode a Cineon (`.cin`) frame: 10-bit logarithmic film scans, big-endian, one (gray) or
 /// three (RGB) channels. The 10-bit code values become U16 as `round(c × 65535 / 1023)`; the
 /// file's black/white reference points are not applied (a log conversion is a display choice).
-pub(crate) fn decode_cineon(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError> {
+struct CineonHeader {
+    image_offset: usize,
+    width: u32,
+    height: u32,
+    layout: ChannelLayout,
+}
+
+fn cineon_header(bytes: &[u8], limits: &Limits) -> Result<CineonHeader, CodecError> {
     if !is_cineon(bytes) {
         return Err(err("missing the Cineon magic number (802A5FD7)"));
     }
@@ -392,6 +405,17 @@ pub(crate) fn decode_cineon(bytes: &[u8], limits: &Limits) -> Result<Image, Code
     let height = o.u32(bytes, 204).ok_or_else(|| missing("the lines per image"))?;
     limits.check(width, height, layout, SampleType::U16)?;
 
+    Ok(CineonHeader { image_offset, width, height, layout })
+}
+
+pub(crate) fn probe_cineon(bytes: &[u8], limits: &Limits) -> Result<(u32, u32), CodecError> {
+    let h = cineon_header(bytes, limits)?;
+    Ok((h.width, h.height))
+}
+
+pub(crate) fn decode_cineon(bytes: &[u8], limits: &Limits) -> Result<Image, CodecError> {
+    let CineonHeader { image_offset, width, height, layout } = cineon_header(bytes, limits)?;
+    let o = Order::Big;
     let (w, h) = (width as usize, height as usize);
     let per_line = w.checked_mul(layout.channels()).ok_or_else(|| CodecError::LimitExceeded("line too long".into()))?;
     // Three 10-bit samples per 32-bit word, lines on a word boundary (DPX packing 1).

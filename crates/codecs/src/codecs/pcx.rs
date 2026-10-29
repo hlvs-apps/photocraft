@@ -57,12 +57,17 @@ fn read_row(b: &[u8], pos: &mut usize, out: &mut [u8]) -> Result<(), CodecError>
     Ok(())
 }
 
-pub(crate) fn decode(b: &[u8], limits: &Limits) -> Result<Image, CodecError> {
+pub(crate) fn probe(b: &[u8], limits: &Limits) -> Result<(u32, u32), CodecError> {
     if !looks_like_pcx(b) {
         return Err(bad("invalid PCX header or unsupported pixel layout"));
     }
     let (w, h) = (u32::from(le16(b, 8) - le16(b, 4)) + 1, u32::from(le16(b, 10) - le16(b, 6)) + 1);
     limits.check(w, h, ChannelLayout::Rgb, SampleType::U8)?;
+    Ok((w, h))
+}
+
+pub(crate) fn decode(b: &[u8], limits: &Limits) -> Result<Image, CodecError> {
+    let (w, h) = probe(b, limits)?;
     let (bits, planes, stride) = (usize::from(b[3]), usize::from(b[65]), usize::from(le16(b, 66)));
     let row_len = stride.checked_mul(planes).ok_or_else(|| bad("row size overflow"))?;
     let total = (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(3)).ok_or_else(|| bad("pixel size overflow"))?;

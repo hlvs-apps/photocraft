@@ -22,6 +22,8 @@ mod format;
 mod image;
 mod lab;
 mod options;
+mod probe;
+pub use probe::ProbeControl;
 pub mod orientation;
 pub mod resolution;
 pub mod source_settings;
@@ -111,25 +113,55 @@ pub fn decode_as_with(format: Format, bytes: &[u8], opts: &DecodeOptions) -> Res
     finish_decode(img, o, opts)
 }
 
-/// The upright pixel size [`decode`] would return, read from the file's header without decoding
-/// pixels, for WebP, OpenEXR (flat) and the GIF/BMP/TGA/ICO/QOI/HDR family. It runs the same
-/// header reads and size checks as the decoder (default [`Limits`]) and swaps the size for an
-/// EXIF orientation of 5–8, so wherever [`decode`] succeeds the two agree. Other formats (and
-/// deep EXR or AVIF) return [`CodecError::Unsupported`]: decode those to learn their size.
+/// Upright pixel dimensions from the same header parsers used by decoding, without pixels.
+/// Unsupported formats remain errors; there is never a full-decode fallback.
 pub fn probe_size(bytes: &[u8]) -> Result<(u32, u32), CodecError> {
+    probe_size_with(bytes, &ProbeControl::default())
+}
+
+/// Header-only inspection with explicit input/dimension limits and cooperative cancellation.
+/// Checks run between header records and reader chunks. The optional HEIF container parser
+/// runs as one upstream call without mid-call cancellation or an allocation quota. In-process
+/// servers handling untrusted input must leave the `heif` feature disabled. Foreign parser
+/// allocation and cleanup also run between checks; these are not hard deadline/RSS limits.
+pub fn probe_size_with(bytes: &[u8], ctl: &ProbeControl) -> Result<(u32, u32), CodecError> {
+    ctl.input(bytes)?;
+    let result = probe_size_stages(bytes, ctl);
+    ctl.check()?;
+    let (w, h) = result?;
+    ctl.limits.check_dimensions(w, h)?;
+    Ok((w, h))
+}
+
+fn probe_size_stages(bytes: &[u8], ctl: &ProbeControl) -> Result<(u32, u32), CodecError> {
     let format = detect(bytes).ok_or(CodecError::UnknownFormat)?;
     if !caps(format).read {
         return Err(CodecError::unsupported(format, "decoding is not available for this format"));
     }
-    let l = &Limits::default();
-    let (w, h, exif) = match format {
-        Format::WebP => webp::probe(bytes, l)?,
-        Format::OpenExr => exr::probe(bytes, l).map(|(w, h)| (w, h, None))?,
-        Format::Gif | Format::Bmp | Format::Tga | Format::Ico | Format::Qoi | Format::Hdr | Format::Avif => via_image::probe(format, bytes, l)?,
+    let l = &ctl.limits;
+    let ((w, h), orientation) = match format {
+        Format::WebP => {
+            let (w, h, exif) = webp::probe_with(bytes, ctl)?;
+            ((w, h), exif.as_deref().map_or(1, exif_orientation))
+        }
+        Format::OpenExr => (exr::probe_with(bytes, ctl)?, 1),
+        Format::Pnm => (pnm::probe(bytes, ctl)?, 1),
+        Format::Pcx => (pcx::probe(bytes, l)?, 1),
+        Format::Xpm => (xpm::probe(bytes, ctl)?, 1),
+        Format::Dds => (dds::probe(bytes, l)?, 1),
+        Format::Fits => (fits::probe(bytes, ctl)?, 1),
+        Format::Dpx => (dpx::probe(bytes, l)?, dpx::orientation(bytes)),
+        Format::Cineon => (dpx::probe_cineon(bytes, l)?, dpx::cineon_orientation(bytes)),
+        Format::Dicom => (dicom::probe(bytes, ctl)?, 1),
+        Format::Iff => (iff::probe(bytes, ctl)?, 1),
+        Format::Heif => (heif::probe(bytes, l)?, 1),
+        Format::Gif | Format::Bmp | Format::Tga | Format::Ico | Format::Qoi | Format::Hdr => {
+            let (w, h, exif) = via_image::probe_with(format, bytes, ctl)?;
+            ((w, h), exif.as_deref().map_or(1, exif_orientation))
+        }
         _ => return Err(CodecError::unsupported(format, "no header-only size probe")),
     };
-    let o = exif.as_deref().map_or(1, exif_orientation);
-    Ok(if (5..=8).contains(&o) { (h, w) } else { (w, h) })
+    Ok(if (5..=8).contains(&orientation) { (h, w) } else { (w, h) })
 }
 
 /// The colour table of a GIF's first frame (its Local Color Table, else the Global one) and the
@@ -154,6 +186,12 @@ pub fn encode_bmp_indexed(width: u32, height: u32, indices: &[u8], palette: &[[u
 /// mask) and storage. [`TiffInfo::default_page`] is the page [`decode`] opens.
 pub fn tiff_info(bytes: &[u8]) -> Result<TiffInfo, CodecError> {
     crate::codecs::tiff_ifd::tiff_info(bytes)
+}
+
+/// TIFF directories with bounded input and cooperative checks between entries.
+pub fn tiff_info_with(bytes: &[u8], ctl: &ProbeControl) -> Result<TiffInfo, CodecError> {
+    ctl.input(bytes)?;
+    crate::codecs::tiff_ifd::tiff_info_with(bytes, ctl)
 }
 
 /// Decodes page `page` (an index into [`tiff_info`]'s `pages`) of a TIFF or BigTIFF file,

@@ -969,6 +969,7 @@ fn cropped_deep_data_opens_on_the_display_stage() {
     };
     let bytes = gen_deep_cropped(w, h, dwx, dwy, sw, sh, &RGBA_NO_Z, &counts, &sample);
     let img = decode(&bytes).expect("cropped deep EXR decodes");
+    assert_eq!(photocraft_codecs::probe_size(&bytes).unwrap(), img.dimensions());
     assert_eq!((img.width(), img.height()), (sw as u32, sh as u32), "opens on the display window stage");
     assert!(img.warnings.iter().any(|w| matches!(w, photocraft_codecs::DecodeWarning::DisplayWindowStage { origin, .. } if *origin == (dwx, dwy))));
 
@@ -989,4 +990,13 @@ fn cropped_deep_data_opens_on_the_display_stage() {
     );
     let outside = px(0, 0);
     assert_eq!(outside, vec![0.0, 0.0, 0.0, 0.0], "outside the data region: transparent");
+}
+
+#[test]
+fn deep_dimensions_do_not_require_decoding_samples() {
+    let bytes = gen_deep(4, 4, &RGBAZ, 0, None, COUNTS_ONE, &sample_rgba);
+    let expected = decode(&bytes).unwrap().dimensions();
+    assert_eq!(photocraft_codecs::probe_size(&bytes).unwrap(), expected);
+    let prefix = (1..bytes.len()).find(|&n| photocraft_codecs::probe_size(&bytes[..n]).ok() == Some(expected) && decode(&bytes[..n]).is_err());
+    assert!(prefix.is_some(), "deep header must be readable without sample chunks");
 }

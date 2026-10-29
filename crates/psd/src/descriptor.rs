@@ -336,7 +336,12 @@ impl VersionedDescriptor {
     /// the number of bytes consumed (trailing data is allowed, e.g. the warp
     /// descriptor after the text descriptor in `TySh`).
     pub fn parse_prefix(data: &[u8]) -> Result<(Self, usize)> {
-        let mut r = Reader::new(data);
+        Self::parse_prefix_with(data, &crate::ReadControl::default())
+    }
+
+    /// Parse a descriptor prefix while checking cancellation between fields.
+    pub fn parse_prefix_with(data: &[u8], ctl: &crate::ReadControl) -> Result<(Self, usize)> {
+        let mut r = Reader::with_control(data, *ctl);
         let v = Self::read(&mut r)?;
         Ok((v, r.pos()))
     }
@@ -782,6 +787,20 @@ mod tests {
         b.put(b"null");
         b.put_u32(u32::MAX);
         assert!(Descriptor::from_bytes(&b).is_err());
+    }
+    #[test]
+    fn controlled_prefix_checks_cancellation_between_fields() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let bytes = VersionedDescriptor::new(Descriptor::new("null")).to_bytes();
+        assert_eq!(VersionedDescriptor::parse_prefix_with(&bytes, &crate::ReadControl::default()).unwrap().1, bytes.len());
+        for stop in [0, 2] {
+            let calls = AtomicUsize::new(0);
+            let cancel = || calls.fetch_add(1, Ordering::Relaxed) >= stop;
+            assert!(matches!(
+                VersionedDescriptor::parse_prefix_with(&bytes, &crate::ReadControl { cancelled: &cancel, ..Default::default() }),
+                Err(PsdError::Cancelled)
+            ));
+        }
     }
 }
 
