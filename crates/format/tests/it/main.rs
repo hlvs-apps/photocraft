@@ -8,6 +8,7 @@ mod directory_symlinks;
 mod float_roundtrip;
 mod frame_stroke;
 mod interrupt;
+mod interrupt_save;
 mod layer_labels;
 mod roundtrip;
 mod smart_contents;

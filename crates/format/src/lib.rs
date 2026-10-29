@@ -22,6 +22,17 @@
 //!
 //! This crate sits at L3 next to the compositor, so it does not render.
 //! Callers pass previews in [`SaveOptions`]; `photocraft-io` does that.
+//!
+//! Server callers can use [`save_to_bytes_interruptible`] or
+//! [`PcraftWriter::save_zip_interruptible`] with [`SaveLimits`] and the raster crate's
+//! `Interrupt`. Limits cover distinct payload bytes, serialized manifest bytes, archive
+//! bytes, preview pixels and compression workers. Cancellation returns an error and discards
+//! the archive; a writer remains reusable after failure. Previews encode sequentially, with
+//! checks between them. Their codec call, owned metadata clones and allocation/destruction
+//! are work units, so callers must also bound their source document. These are cooperative
+//! checks, not a deadline or total-process-memory guarantee. Native server saves need no
+//! previews: pass [`SaveOptions::default`]. The generic I/O export path also renders previews
+//! and is not a substitute for this explicitly bounded API.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -250,4 +261,31 @@ impl std::io::BufRead for InterruptReader<'_> {
         self.bytes = self.bytes.get(amount..).unwrap_or_default();
         self.offset += amount;
     }
+}
+
+/// Explicit budgets for an in-memory native save. Preview encoding and manifest memory are
+/// additional to the distinct tile/blob payload budget.
+#[derive(Clone, Copy, Debug)]
+pub struct SaveLimits {
+    /// Maximum distinct uncompressed tile/blob bytes.
+    pub max_total_bytes: u64,
+    /// Maximum serialized manifest bytes.
+    pub max_manifest_bytes: usize,
+    /// Maximum complete ZIP bytes.
+    pub max_output_bytes: usize,
+    /// Maximum pixels per optional preview.
+    pub max_preview_pixels: u64,
+    /// Maximum simultaneous compression workers; zero is invalid.
+    pub max_workers: usize,
+}
+
+impl Default for SaveLimits {
+    fn default() -> Self {
+        Self { max_total_bytes: u64::MAX, max_manifest_bytes: usize::MAX, max_output_bytes: usize::MAX, max_preview_pixels: u64::MAX, max_workers: 32 }
+    }
+}
+
+/// Save with explicit budgets and cancellation; no partial archive is returned.
+pub fn save_to_bytes_interruptible(doc: &Document, opts: &SaveOptions, limits: &SaveLimits, ctl: &photocraft_raster::Interrupt) -> Result<Vec<u8>> {
+    PcraftWriter::new().save_zip_interruptible(doc, opts, limits, ctl).map(|(b, _)| b)
 }

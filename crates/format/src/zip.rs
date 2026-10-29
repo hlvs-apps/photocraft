@@ -38,12 +38,21 @@ impl ZipWriter {
     }
 
     /// Reserves the complete archive from its entry names and payload sizes.
-    pub(crate) fn with_entries<'a>(entries: impl IntoIterator<Item = (&'a str, usize)>) -> Result<Self, FormatError> {
+    pub(crate) fn with_entries<'a>(
+        entries: impl IntoIterator<Item = (&'a str, usize)>,
+        max: usize,
+        ctl: &photocraft_raster::Interrupt,
+    ) -> Result<Self, FormatError> {
         let (size, directory) = entries.into_iter().try_fold((22usize, 0usize), |(size, directory), (name, bytes)| {
+            ctl.check()?;
             let directory = directory.checked_add(46 + name.len());
             let size = size.checked_add(76).and_then(|n| n.checked_add(name.len())).and_then(|n| n.checked_add(name.len())).and_then(|n| n.checked_add(bytes));
             size.zip(directory).ok_or_else(|| FormatError::Unsupported("zip size overflow".into()))
         })?;
+        if size > max {
+            return Err(FormatError::LimitExceeded("save ZIP bytes".into()));
+        }
+        ctl.check()?;
         let mut writer = Self::new();
         writer.out.try_reserve_exact(size).map_err(|_| FormatError::LimitExceeded("not enough memory for zip".into()))?;
         writer.central.try_reserve_exact(directory).map_err(|_| FormatError::LimitExceeded("not enough memory for zip directory".into()))?;
@@ -53,6 +62,12 @@ impl ZipWriter {
     /// Adds a STORE entry, rejecting names or data that exceed ZIP field limits.
     /// The entry path has a 16-bit byte length, independent of filesystem limits.
     pub fn add(&mut self, name: &str, data: &[u8]) -> Result<(), FormatError> {
+        self.add_interruptible(name, data, &photocraft_raster::Interrupt::NONE)
+    }
+
+    /// Append one entry cooperatively, discarding the writer if cancellation returns an error.
+    pub fn add_interruptible(&mut self, name: &str, data: &[u8], ctl: &photocraft_raster::Interrupt) -> Result<(), FormatError> {
+        ctl.check()?;
         if self.count == u16::MAX {
             return Err(FormatError::Unsupported("more than 65535 zip entries (ZIP64 not supported)".into()));
         }
@@ -66,7 +81,12 @@ impl ZipWriter {
             .ok_or_else(|| FormatError::Unsupported("zip entry size overflow".into()))?;
         self.out.try_reserve(local_len).map_err(|_| FormatError::LimitExceeded("not enough memory for zip entry".into()))?;
         self.central.try_reserve(46 + name_b.len()).map_err(|_| FormatError::LimitExceeded("not enough memory for zip directory".into()))?;
-        let crc = crc32(data);
+        let mut hasher = crc32fast::Hasher::new();
+        for chunk in data.chunks(64 << 10) {
+            ctl.check()?;
+            hasher.update(chunk);
+        }
+        let crc = hasher.finalize();
         // Local file header.
         let o = &mut self.out;
         o.extend_from_slice(&LOCAL_SIG.to_le_bytes());
@@ -81,7 +101,10 @@ impl ZipWriter {
         o.extend_from_slice(&name_len.to_le_bytes());
         o.extend_from_slice(&0u16.to_le_bytes());
         o.extend_from_slice(name_b);
-        o.extend_from_slice(data);
+        for chunk in data.chunks(64 << 10) {
+            ctl.check()?;
+            o.extend_from_slice(chunk);
+        }
         // Central directory entry.
         let c = &mut self.central;
         c.extend_from_slice(&CENTRAL_SIG.to_le_bytes());
@@ -104,11 +127,20 @@ impl ZipWriter {
     }
 
     /// Appends the central directory and returns the complete archive.
-    pub fn finish(mut self) -> Result<Vec<u8>, FormatError> {
+    pub fn finish(self) -> Result<Vec<u8>, FormatError> {
+        self.finish_interruptible(&photocraft_raster::Interrupt::NONE)
+    }
+
+    /// Finish the archive cooperatively; no partial archive is returned.
+    pub fn finish_interruptible(mut self, ctl: &photocraft_raster::Interrupt) -> Result<Vec<u8>, FormatError> {
+        ctl.check()?;
         let cd_offset = u32::try_from(self.out.len()).map_err(|_| FormatError::Unsupported("zip over 4 GiB".into()))?;
         let cd_size = u32::try_from(self.central.len()).map_err(|_| FormatError::Unsupported("zip directory over 4 GiB".into()))?;
         self.out.try_reserve(self.central.len().saturating_add(22)).map_err(|_| FormatError::LimitExceeded("not enough memory to finish zip".into()))?;
-        self.out.extend_from_slice(&self.central);
+        for chunk in self.central.chunks(64 << 10) {
+            ctl.check()?;
+            self.out.extend_from_slice(chunk);
+        }
         self.out.extend_from_slice(&EOCD_SIG.to_le_bytes());
         self.out.extend_from_slice(&[0; 4]); // disk numbers
         self.out.extend_from_slice(&self.count.to_le_bytes());
@@ -464,7 +496,8 @@ mod tests {
         let entries = [("层/é.png", &b"image"[..]), ("empty", &b""[..]), ("empty", &b"duplicate"[..])];
         for entries in [&entries[..0], &entries[..]] {
             let mut previous = ZipWriter::new();
-            let mut reserved = ZipWriter::with_entries(entries.iter().map(|(name, data)| (*name, data.len()))).unwrap();
+            let mut reserved =
+                ZipWriter::with_entries(entries.iter().map(|(name, data)| (*name, data.len())), usize::MAX, &photocraft_raster::Interrupt::NONE).unwrap();
             let (capacity, directory) = (reserved.out.capacity(), reserved.central.capacity());
             for (name, data) in entries {
                 previous.add(name, data).unwrap();
@@ -475,8 +508,11 @@ mod tests {
             assert_eq!(bytes.capacity(), capacity);
             assert_eq!(bytes, previous.finish().unwrap());
         }
-        assert!(matches!(ZipWriter::with_entries([("x", usize::MAX)]), Err(FormatError::Unsupported(_))));
-        assert!(matches!(ZipWriter::with_entries([("x", isize::MAX as usize)]), Err(FormatError::LimitExceeded(_))));
+        assert!(matches!(ZipWriter::with_entries([("x", usize::MAX)], usize::MAX, &photocraft_raster::Interrupt::NONE), Err(FormatError::Unsupported(_))));
+        assert!(matches!(
+            ZipWriter::with_entries([("x", isize::MAX as usize)], usize::MAX, &photocraft_raster::Interrupt::NONE),
+            Err(FormatError::LimitExceeded(_))
+        ));
     }
 
     /// Invalid UTF-8 names retain their lossy spelling and first-entry lookup.
