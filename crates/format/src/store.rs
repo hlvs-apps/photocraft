@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use photocraft_color::{PixelFormat, SampleType};
 use photocraft_doc::Document;
-use photocraft_raster::{Rgba8Image, Tile};
+use photocraft_raster::{Interrupt, Rgba8Image, Tile};
 
 use crate::convert::{self, Fetch, Loader, Sink, is_valid_hash, swap_to_le};
 use crate::manifest::{ContentM, FORMAT_VERSION, Hash, LayerM, Manifest};
@@ -37,12 +37,24 @@ fn compress(data: &[u8]) -> Vec<u8> {
 /// Decodes a zstd frame of at most `max` bytes (`LimitExceeded` beyond). With `exact`, the
 /// decoded length must be exactly that (`Corrupt` otherwise).
 fn decompress_bounded(data: &[u8], max: usize, exact: Option<usize>, what: &str) -> Result<Vec<u8>> {
-    let zstd = |e: &dyn std::fmt::Display| FormatError::corrupt(format!("{what}: zstd: {e}"));
-    let mut dec = ruzstd::decoding::StreamingDecoder::new(data).map_err(|e| zstd(&e))?;
+    decompress_bounded_with(data, max, exact, what, &Interrupt::NONE)
+}
+
+fn decompress_bounded_with(data: &[u8], max: usize, exact: Option<usize>, what: &str, ctl: &Interrupt) -> Result<Vec<u8>> {
+    ctl.check()?;
+    let zstd = |e: &dyn std::fmt::Display| {
+        if ctl.cancelled() { FormatError::Cancelled(photocraft_raster::Cancelled) } else { FormatError::corrupt(format!("{what}: zstd: {e}")) }
+    };
+    let input = crate::InterruptReader { bytes: data, offset: 0, ctl: *ctl, cancelled: false };
+    let mut dec = ruzstd::decoding::StreamingDecoder::new(input).map_err(|e| zstd(&e))?;
     let mut out = Vec::with_capacity(exact.unwrap_or(0).min(max).min(64 << 20));
     // `max` may be `usize::MAX`: one byte past it must not overflow.
     let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
-    (&mut dec).take(limit).read_to_end(&mut out).map_err(|e| zstd(&e))?;
+    let mut reader = (&mut dec).take(limit);
+    while reader.by_ref().take(64 << 10).read_to_end(&mut out).map_err(|e| zstd(&e))? > 0 {
+        ctl.check()?;
+    }
+    ctl.check()?;
     match exact {
         Some(n) if out.len() != n => Err(FormatError::corrupt(format!("{what}: expected {n} bytes, got {}", out.len()))),
         None if out.len() > max => Err(FormatError::LimitExceeded(format!("{what} exceeds {max} bytes"))),
@@ -56,6 +68,15 @@ fn decompress(data: &[u8], expected: usize, what: &str) -> Result<Vec<u8>> {
 
 fn hash_bytes(b: &[u8]) -> Hash {
     blake3::hash(b).to_hex().to_string()
+}
+
+fn hash_bytes_interruptible(bytes: &[u8], ctl: &Interrupt) -> Result<Hash> {
+    let mut hash = blake3::Hasher::new();
+    for chunk in bytes.chunks(64 << 10) {
+        ctl.check()?;
+        hash.update(chunk);
+    }
+    Ok(hash.finalize().to_hex().to_string())
 }
 
 fn png(img: &Rgba8Image) -> Result<Vec<u8>> {
@@ -102,17 +123,23 @@ pub trait ByteSource {
 
 pub(crate) struct ZipSource<'a> {
     zip: ZipReader<'a>,
+    ctl: Interrupt<'a>,
 }
 
 impl<'a> ZipSource<'a> {
     pub fn new(bytes: &'a [u8]) -> Result<Self> {
-        Ok(ZipSource { zip: ZipReader::new(bytes)? })
+        Self::new_interruptible(bytes, Interrupt::NONE)
+    }
+
+    pub fn new_interruptible(bytes: &'a [u8], ctl: Interrupt<'a>) -> Result<Self> {
+        Ok(ZipSource { zip: ZipReader::new_interruptible(bytes, &ctl)?, ctl })
     }
 }
 
 impl ByteSource for ZipSource<'_> {
     fn get(&self, path: &str, max: usize) -> Result<Vec<u8>> {
-        self.zip.read_by_name(path, max)
+        let e = self.zip.find(path).ok_or_else(|| FormatError::corrupt(format!("missing `{path}`")))?;
+        self.zip.read_interruptible(e, max, &self.ctl)
     }
 }
 
@@ -164,8 +191,15 @@ const MAX_MANIFEST_ITEMS: usize = 4 << 20;
 /// [`MAX_MANIFEST_ITEMS`] items with a linear scan (no recursion), so parsing with serde_json's
 /// recursion limit disabled can't exhaust the stack, nor tiny values the memory, on hostile input.
 fn check_manifest_depth(json: &[u8]) -> Result<()> {
+    check_manifest_depth_interruptible(json, &Interrupt::NONE)
+}
+
+fn check_manifest_depth_interruptible(json: &[u8], ctl: &Interrupt) -> Result<()> {
     let (mut depth, mut items, mut in_str, mut escaped) = (0usize, 0usize, false, false);
-    for &b in json {
+    for (i, &b) in json.iter().enumerate() {
+        if i.is_multiple_of(64 << 10) {
+            ctl.check()?;
+        }
         if in_str {
             match b {
                 _ if escaped => escaped = false,
@@ -197,17 +231,31 @@ fn check_manifest_depth(json: &[u8]) -> Result<()> {
 }
 
 pub(crate) fn read_manifest(src: &dyn ByteSource, opts: &LoadOptions) -> Result<Manifest> {
+    read_manifest_interruptible(src, opts, &Interrupt::NONE)
+}
+
+fn read_manifest_interruptible(src: &dyn ByteSource, opts: &LoadOptions, ctl: &Interrupt) -> Result<Manifest> {
+    ctl.check()?;
     let raw = src.get(MANIFEST, opts.max_manifest_bytes)?;
+    ctl.check()?;
     // serde_json stops at 128 levels (about 40 nested groups); the bounded check replaces that limit.
-    check_manifest_depth(&raw)?;
-    let mut de = serde_json::Deserializer::from_slice(&raw);
+    check_manifest_depth_interruptible(&raw, ctl)?;
+    // serde's reader parser asks for individual bytes. Check at bounded intervals,
+    // including inside a single large string, without calling the callback per byte.
+    let mut reader = crate::InterruptReader { bytes: &raw, offset: 0, ctl: *ctl, cancelled: false };
+    let mut de = serde_json::Deserializer::from_reader(&mut reader);
     de.disable_recursion_limit();
-    let mut v = <serde_json::Value as serde::Deserialize>::deserialize(&mut de)?;
-    de.end()?;
+    let parsed = <serde_json::Value as serde::Deserialize>::deserialize(&mut de).and_then(|v| de.end().map(|()| v));
+    if reader.cancelled {
+        return Err(photocraft_raster::Cancelled.into());
+    }
+    let mut v = parsed?;
+    ctl.check()?;
     crate::migrate::migrate(&mut v)?;
     let layers = take_array(&mut v, "/document/layers");
     let mut m: Manifest = serde_json::from_value(v)?;
-    m.document.layers = layers_from_json(layers)?;
+    m.document.layers = layers_from_json(layers, ctl)?;
+    ctl.check()?;
     // A number past f32's range decodes as infinity, which no save could write back (#6862).
     if let Err(crate::finite::Problem::NonFinite { path }) = crate::finite::check(&m) {
         return Err(FormatError::corrupt(format!("`{path}` is out of range")));
@@ -217,10 +265,11 @@ pub(crate) fn read_manifest(src: &dyn ByteSource, opts: &LoadOptions) -> Result<
 
 /// Decodes layers one at a time, group children first. Decoding the whole tree in one go costs
 /// kilobytes of stack per nesting level; here each level only holds a few pointers.
-fn layers_from_json(values: Vec<serde_json::Value>) -> Result<Vec<LayerM>> {
+fn layers_from_json(values: Vec<serde_json::Value>, ctl: &Interrupt) -> Result<Vec<LayerM>> {
     let mut out = Vec::with_capacity(values.len());
     for mut v in values {
-        let children = layers_from_json(take_array(&mut v, "/content/children"))?;
+        ctl.check()?;
+        let children = layers_from_json(take_array(&mut v, "/content/children"), ctl)?;
         out.push(layer_from_json(v, children)?);
     }
     Ok(out)
@@ -246,6 +295,7 @@ fn take_array(v: &mut serde_json::Value, pointer: &str) -> Vec<serde_json::Value
 
 struct LoadFetch<'a> {
     src: &'a dyn ByteSource,
+    ctl: Interrupt<'a>,
     opts: LoadOptions,
     total: u64,
     blobs: HashMap<String, Arc<Vec<u8>>>,
@@ -253,7 +303,8 @@ struct LoadFetch<'a> {
 
 impl LoadFetch<'_> {
     fn account(&mut self, n: usize) -> Result<()> {
-        self.total += n as u64;
+        self.ctl.check()?;
+        self.total = self.total.saturating_add(n as u64);
         if self.total > self.opts.max_total_bytes {
             return Err(FormatError::LimitExceeded(format!("bundle expands beyond {} bytes", self.opts.max_total_bytes)));
         }
@@ -262,6 +313,10 @@ impl LoadFetch<'_> {
 }
 
 impl Fetch for LoadFetch<'_> {
+    fn check(&self) -> Result<()> {
+        self.ctl.check().map_err(Into::into)
+    }
+
     fn tile(&mut self, hash: &str, len: usize) -> Result<Vec<u8>> {
         if !is_valid_hash(hash) {
             return Err(FormatError::corrupt(format!("invalid tile hash `{hash}`")));
@@ -269,14 +324,15 @@ impl Fetch for LoadFetch<'_> {
         self.account(len)?;
         let path = tile_path(hash);
         let z = self.src.get(&path, len + len / 8 + 4096)?;
-        let data = decompress(&z, len, &path)?;
-        if hash_bytes(&data) != hash {
+        let data = decompress_bounded_with(&z, len, Some(len), &path, &self.ctl)?;
+        if hash_bytes_interruptible(&data, &self.ctl)? != hash {
             return Err(FormatError::corrupt(format!("{path}: content does not match its hash")));
         }
         Ok(data)
     }
 
     fn blob(&mut self, hash: &str) -> Result<Arc<Vec<u8>>> {
+        self.ctl.check()?;
         if let Some(b) = self.blobs.get(hash) {
             return Ok(b.clone());
         }
@@ -287,9 +343,11 @@ impl Fetch for LoadFetch<'_> {
         let z = self.src.get(&path, self.opts.max_blob_bytes)?;
         // Blob length is not in the manifest; the frame header bounds it and
         // we cap at max_blob_bytes.
-        let data = decompress_bounded(&z, self.opts.max_blob_bytes, None, &path)?;
+        let remaining = usize::try_from(self.opts.max_total_bytes.saturating_sub(self.total)).unwrap_or(usize::MAX);
+        let max = self.opts.max_blob_bytes.min(remaining);
+        let data = decompress_bounded_with(&z, max, None, &path, &self.ctl)?;
         self.account(data.len())?;
-        if hash_bytes(&data) != hash {
+        if hash_bytes_interruptible(&data, &self.ctl)? != hash {
             return Err(FormatError::corrupt(format!("{path}: content does not match its hash")));
         }
         let data = Arc::new(data);
@@ -314,9 +372,13 @@ fn admit_canvas(size: photocraft_geom::Size, opts: &LoadOptions) -> Result<()> {
 }
 
 pub(crate) fn load(src: &dyn ByteSource, opts: &LoadOptions) -> Result<Document> {
-    let m = read_manifest(src, opts)?;
+    load_interruptible(src, opts, &Interrupt::NONE)
+}
+
+pub(crate) fn load_interruptible(src: &dyn ByteSource, opts: &LoadOptions, ctl: &Interrupt) -> Result<Document> {
+    let m = read_manifest_interruptible(src, opts, ctl)?;
     admit_canvas(m.document.size, opts)?;
-    let mut fetch = LoadFetch { src, opts: *opts, total: 0, blobs: HashMap::new() };
+    let mut fetch = LoadFetch { src, ctl: *ctl, opts: *opts, total: 0, blobs: HashMap::new() };
     let mut loader = Loader {
         fetch: &mut fetch,
         preserve_ids: opts.preserve_ids,
@@ -325,7 +387,9 @@ pub(crate) fn load(src: &dyn ByteSource, opts: &LoadOptions) -> Result<Document>
         legacy_linked_contents: HashMap::new(),
         tiles: HashMap::new(),
     };
-    loader.document(&m.document)
+    let doc = loader.document(&m.document)?;
+    ctl.check()?;
+    Ok(doc)
 }
 
 // ---------------------------------------------------------------------------
@@ -1410,3 +1474,31 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 
 #[cfg(all(test, windows))]
 mod durability_tests;
+
+#[cfg(test)]
+#[test]
+fn manifest_reader_interrupts_inside_a_string() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let json = format!("\"{}\"", "x".repeat(1 << 20));
+    let calls = AtomicUsize::new(0);
+    let cancel = || calls.fetch_add(1, Ordering::Relaxed) >= 2;
+    let mut reader = crate::InterruptReader { bytes: json.as_bytes(), offset: 0, ctl: Interrupt::cancel_only(&cancel), cancelled: false };
+    let result = serde_json::from_reader::<_, serde_json::Value>(&mut reader);
+    assert!(result.is_err());
+    assert!(reader.cancelled);
+    assert_eq!(reader.offset, 128 << 10);
+}
+
+#[cfg(test)]
+#[test]
+fn empty_zstd_blocks_still_check_cancellation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Single-segment frame of zero bytes, followed by empty raw blocks.
+    let mut data = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, 0];
+    data.extend(std::iter::repeat_n(0, 300_000));
+    data.extend([1, 0, 0]);
+    assert!(decompress_bounded(&data, 0, None, "empty").unwrap().is_empty());
+    let checks = AtomicUsize::new(0);
+    let cancel = || checks.fetch_add(1, Ordering::Relaxed) >= 3;
+    assert!(matches!(decompress_bounded_with(&data, 0, None, "empty", &Interrupt::cancel_only(&cancel)), Err(FormatError::Cancelled(_))));
+}

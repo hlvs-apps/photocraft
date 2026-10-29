@@ -460,6 +460,18 @@ pub fn import_file(name: &str, path: &std::path::Path, opts: &ImportOptions, ctl
     import_file_for_open_with(name, path, opts, ctl).map(|(result, _)| result)
 }
 
+/// Import a native bundle with caller-selected decompression and canvas budgets.
+/// See [`photocraft_format::load_from_bytes_interruptible`] for cancellation and memory limits.
+pub fn import_pcraft_with(bytes: &[u8], opts: &photocraft_format::LoadOptions, ctl: &photocraft_raster::Interrupt) -> Result<ImportResult, IoError> {
+    let document = photocraft_format::load_from_bytes_interruptible(bytes, opts, ctl).map_err(|e| match e {
+        photocraft_format::FormatError::Cancelled(_) => IoError::Cancelled,
+        e => e.into(),
+    })?;
+    let warnings = open_warnings(&document);
+    ctl.check().map_err(|_| IoError::Cancelled)?;
+    Ok(ImportResult { warnings, document, source_read_only: false, preview_only: false })
+}
+
 /// Import PSD/PSB bytes under explicit parser/decode budgets and cancellation.
 ///
 /// Pattern and smart-filter cache payloads share `max_auxiliary_bytes`; their source
@@ -486,8 +498,7 @@ pub fn import_psd_with_limits(
 fn import_stages(name: &str, bytes: &[u8], ctl: &photocraft_raster::Interrupt, opts: &ImportOptions, damaged: &mut bool) -> Result<ImportResult, IoError> {
     // A declared native extension must reach its loader so malformed bundles retain format errors.
     if has_extension(name, photocraft_format::EXTENSION) || photocraft_format::is_pcraft(bytes) {
-        let document = photocraft_format::load_from_bytes(bytes)?;
-        return Ok(ImportResult { warnings: open_warnings(&document), document, source_read_only: false, preview_only: false });
+        return import_pcraft_with(bytes, &photocraft_format::LoadOptions::default(), ctl);
     }
     // Magic first: an Affinity file renamed .psd is still Affinity (#5258 corpus
     // preview_never_saves_back_to_its_native_or_renamed_source).
@@ -763,6 +774,22 @@ pub fn merged_composite(file: &PsdFile) -> Result<Vec<[f32; 4]>, IoError> {
 mod tests {
     use super::{ImportOptions, import, import_for_open, is_psd_input, is_svg_input};
     use photocraft_psd::{Compression, Version, testgen};
+
+    #[test]
+    fn native_import_preserves_cancellation_and_budget_errors() {
+        let doc =
+            photocraft_doc::Document::new("native", photocraft_geom::Size::new(16, 16), photocraft_color::ColorMode::Rgb, photocraft_color::SampleType::U8);
+        let bytes = photocraft_format::save_to_bytes(&doc, &Default::default()).unwrap();
+        let opts = photocraft_format::LoadOptions { max_canvas_pixels: 1, ..Default::default() };
+        assert!(matches!(
+            super::import_pcraft_with(&bytes, &opts, &photocraft_raster::Interrupt::NONE),
+            Err(super::IoError::Pcraft(photocraft_format::FormatError::LimitExceeded(_)))
+        ));
+        assert!(matches!(super::import_pcraft_with(&bytes, &opts, &photocraft_raster::Interrupt::cancel_only(&|| true)), Err(super::IoError::Cancelled)));
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let cancel = || checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 3;
+        assert!(matches!(super::import_with("test.pcraft", &bytes, &photocraft_raster::Interrupt::cancel_only(&cancel)), Err(super::IoError::Cancelled)));
+    }
 
     #[test]
     fn controlled_psd_import_returns_typed_cancellation_and_budget_errors() {

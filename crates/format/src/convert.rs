@@ -42,6 +42,9 @@ pub(crate) trait Sink {
 }
 
 pub(crate) trait Fetch {
+    fn check(&self) -> Result<()> {
+        Ok(())
+    }
     /// Canonical (little-endian) tile bytes of the given expected length.
     fn tile(&mut self, hash: &str, len: usize) -> Result<Vec<u8>>;
     fn blob(&mut self, hash: &str) -> Result<Arc<Vec<u8>>>;
@@ -335,6 +338,7 @@ impl Loader<'_> {
     }
 
     fn surface(&mut self, m: &SurfaceM) -> Result<Surface> {
+        self.fetch.check()?;
         let f = m.format;
         let mut dp = unhex(&m.default)?;
         if dp.len() != f.bytes_per_pixel() {
@@ -347,6 +351,7 @@ impl Loader<'_> {
         // tile size): -8388608 ..= 8388606. A damaged manifest can name any index (#938).
         let fits = |i: i32| i.checked_mul(TILE_SIZE).is_some() && i.checked_add(1).and_then(|e| e.checked_mul(TILE_SIZE)).is_some();
         for t in &m.tiles {
+            self.fetch.check()?;
             if !fits(t.tx) || !fits(t.ty) {
                 return Err(FormatError::corrupt(format!("tile ({}, {}) is outside the coordinate range", t.tx, t.ty)));
             }
@@ -435,6 +440,7 @@ impl Loader<'_> {
     }
 
     fn layer(&mut self, m: &LayerM, depth: usize) -> Result<Layer> {
+        self.fetch.check()?;
         if depth > MAX_GROUP_DEPTH {
             return Err(too_deep());
         }
@@ -561,6 +567,7 @@ impl Loader<'_> {
     }
 
     pub(crate) fn document(&mut self, m: &DocM) -> Result<Document> {
+        self.fetch.check()?;
         // Reserve every stored id before allocating identities missing from older bundles. If an
         // id is implausibly large, remap the whole document while retaining shared contents groups.
         if self.preserve_ids {

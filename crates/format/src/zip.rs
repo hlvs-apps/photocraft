@@ -151,6 +151,12 @@ fn u32_at(b: &[u8], o: usize) -> Result<u32, FormatError> {
 impl<'a> ZipReader<'a> {
     /// Checks ZIP record bounds and indexes the first entry for each name.
     pub fn new(bytes: &'a [u8]) -> Result<Self, FormatError> {
+        Self::new_interruptible(bytes, &photocraft_raster::Interrupt::NONE)
+    }
+
+    /// Index ZIP entries, returning `Cancelled` when the interrupt is set.
+    pub fn new_interruptible(bytes: &'a [u8], ctl: &photocraft_raster::Interrupt) -> Result<Self, FormatError> {
+        ctl.check()?;
         if bytes.len() < 22 {
             return Err(FormatError::corrupt("not a zip archive (too short)"));
         }
@@ -181,6 +187,7 @@ impl<'a> ZipReader<'a> {
         let mut by_name = HashMap::with_capacity(entries.capacity());
         let mut p = cd_off;
         for _ in 0..count {
+            ctl.check()?;
             let header_end = p.checked_add(46).filter(|end| *end <= cd_end).ok_or_else(|| FormatError::corrupt("truncated zip central directory entry"))?;
             if u32_at(bytes, p)? != CENTRAL_SIG {
                 return Err(FormatError::corrupt("bad zip central directory entry"));
@@ -236,6 +243,13 @@ impl<'a> ZipReader<'a> {
 
     /// Entry payload (decompressed), at most `max` bytes, CRC-checked.
     pub fn read(&self, e: &Entry, max: usize) -> Result<Vec<u8>, FormatError> {
+        self.read_interruptible(e, max, &photocraft_raster::Interrupt::NONE)
+    }
+
+    /// Read and verify one entry under a decoded byte limit and cooperative cancellation.
+    /// Checks compressed input as well as output, including streams of empty blocks.
+    pub fn read_interruptible(&self, e: &Entry, max: usize, ctl: &photocraft_raster::Interrupt) -> Result<Vec<u8>, FormatError> {
+        ctl.check()?;
         if e.uncompressed > max {
             return Err(FormatError::LimitExceeded(format!("zip entry `{}` is {} bytes (max {max})", e.name, e.uncompressed)));
         }
@@ -246,27 +260,51 @@ impl<'a> ZipReader<'a> {
             .and_then(|end| self.bytes.get(e.data_offset..end))
             .ok_or_else(|| FormatError::corrupt(format!("zip entry `{}` out of range", e.name)))?;
         let data = match e.method {
-            0 => raw.to_vec(),
+            0 => {
+                if raw.len() != e.uncompressed {
+                    return Err(FormatError::corrupt(format!("zip entry `{}` has wrong size", e.name)));
+                }
+                let mut out = Vec::new();
+                for chunk in raw.chunks(64 << 10) {
+                    ctl.check()?;
+                    out.extend_from_slice(chunk);
+                }
+                out
+            }
             8 => {
                 // The uncompressed length comes from an untrusted ZIP header: a
                 // small forged archive must not reserve gigabytes up front, so the
                 // preallocation is capped (DEFLATE expands at most ~1032x).
                 let mut out = Vec::with_capacity(e.uncompressed.min(raw.len().saturating_mul(1032)).min(64 << 20));
                 // One surplus byte proves a false size without expanding to the caller's larger budget.
-                flate2::bufread::DeflateDecoder::new(raw)
-                    .take((e.uncompressed as u64).saturating_add(1))
-                    .read_to_end(&mut out)
-                    .map_err(|err| FormatError::corrupt(format!("zip entry `{}`: {err}", e.name)))?;
+                let input = crate::InterruptReader { bytes: raw, offset: 0, ctl: *ctl, cancelled: false };
+                let mut decoder = flate2::bufread::DeflateDecoder::new(input).take((e.uncompressed as u64).saturating_add(1));
+                while decoder.by_ref().take(64 << 10).read_to_end(&mut out).map_err(|err| {
+                    if ctl.cancelled() {
+                        FormatError::Cancelled(photocraft_raster::Cancelled)
+                    } else {
+                        FormatError::corrupt(format!("zip entry `{}`: {err}", e.name))
+                    }
+                })? > 0
+                {
+                    ctl.check()?;
+                }
                 out
             }
             m => {
                 return Err(FormatError::Unsupported(format!("zip compression method {m} for `{}`", e.name)));
             }
         };
+        ctl.check()?;
         if data.len() != e.uncompressed || data.len() > max {
             return Err(FormatError::corrupt(format!("zip entry `{}` has wrong size", e.name)));
         }
-        if crc32(&data) != e.crc {
+        let mut crc = crc32fast::Hasher::new();
+        for chunk in data.chunks(64 << 10) {
+            ctl.check()?;
+            crc.update(chunk);
+        }
+        if crc.finalize() != e.crc {
             return Err(FormatError::corrupt(format!("zip entry `{}` failed its CRC check", e.name)));
         }
         Ok(data)
@@ -587,4 +625,27 @@ mod tests {
         assert!(u16_at(&[], usize::MAX).is_err());
         assert!(u32_at(&[], usize::MAX - 3).is_err());
     }
+}
+
+#[cfg(test)]
+#[test]
+fn stored_entry_checks_actual_size_before_copying() {
+    let bytes = vec![0; 1 << 20];
+    let reader = ZipReader { bytes: &bytes, entries: Vec::new(), by_name: HashMap::new() };
+    let entry = Entry { name: "forged".into(), method: 0, crc: 0, compressed: bytes.len(), uncompressed: 0, data_offset: 0 };
+    assert!(matches!(reader.read(&entry, 0), Err(FormatError::Corrupt(_))));
+}
+
+#[cfg(test)]
+#[test]
+fn empty_deflate_blocks_still_check_cancellation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut raw = [0, 0, 0, 0xff, 0xff].repeat(100_000);
+    raw.extend([1, 0, 0, 0xff, 0xff]);
+    let reader = ZipReader { bytes: &raw, entries: Vec::new(), by_name: HashMap::new() };
+    let entry = Entry { name: "empty".into(), method: 8, crc: crc32(&[]), compressed: raw.len(), uncompressed: 0, data_offset: 0 };
+    assert!(reader.read(&entry, 0).unwrap().is_empty());
+    let checks = AtomicUsize::new(0);
+    let cancel = || checks.fetch_add(1, Ordering::Relaxed) >= 3;
+    assert!(matches!(reader.read_interruptible(&entry, 0, &photocraft_raster::Interrupt::cancel_only(&cancel)), Err(FormatError::Cancelled(_))));
 }
