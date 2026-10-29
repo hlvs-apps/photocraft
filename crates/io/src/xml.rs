@@ -4,8 +4,9 @@
 
 use roxmltree::{Document, ParsingOptions};
 
-/// Deepest element nesting accepted, the same as for SVG drawings: real files stay far below.
-pub const MAX_DEPTH: usize = crate::svg::MAX_XML_DEPTH;
+/// Deepest element nesting accepted: real files stay far below. SVG drawings have a lower limit
+/// ([`crate::svg::MAX_XML_DEPTH`]), as usvg's converter recurses on top of the parser.
+pub const MAX_DEPTH: usize = 512;
 
 /// Parses `text`, refusing nesting deeper than [`MAX_DEPTH`] before roxmltree sees it.
 ///
