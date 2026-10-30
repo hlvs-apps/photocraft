@@ -185,6 +185,61 @@ pub fn apply_filter_to_surface(
     selection: Option<&photocraft_raster::Surface>,
     canvas: photocraft_geom::Rect,
 ) -> Result<Option<photocraft_raster::Surface>> {
+    let out = apply_filter_to_surface_with(id, params, surf, bounds, selection, canvas, &photocraft_raster::Interrupt::NONE);
+    match out {
+        // Without an interrupt a pixel filter that cannot run (its geometry or working memory
+        // refused) leaves the pixels alone, as it always has.
+        Err(FilterRefused::NotApplied) => Ok(Some(surf.clone())),
+        Err(FilterRefused::Engine(e)) => Err(e),
+        Ok(out) => Ok(out),
+    }
+}
+
+/// Why [`apply_filter_to_surface_with`] returned no pixels.
+#[derive(Debug)]
+pub enum FilterRefused {
+    /// The authority denied the filter, it was cancelled ([`EngineError::Cancelled`]), or it failed.
+    Engine(EngineError),
+    /// A pixel filter's geometry or working memory was refused, so it did not run.
+    NotApplied,
+}
+
+impl From<EngineError> for FilterRefused {
+    fn from(e: EngineError) -> Self {
+        Self::Engine(e)
+    }
+}
+
+/// [`apply_filter_to_surface`] that stops once `ctl` is cancelled: the pixel filters check it
+/// before every tile, the others (Liquify, Puppet and Perspective Warp, Lens Correction, Adaptive
+/// Wide Angle, Camera Raw, adjustments, plug-ins) before and after running, as one unit each.
+/// Cancelled is `Err(Engine(Cancelled))`; a pixel filter that cannot run is `Err(NotApplied)`
+/// rather than the unfiltered pixels.
+pub fn apply_filter_to_surface_with(
+    id: &str,
+    params: &Value,
+    surf: &photocraft_raster::Surface,
+    bounds: photocraft_geom::Rect,
+    selection: Option<&photocraft_raster::Surface>,
+    canvas: photocraft_geom::Rect,
+    ctl: &photocraft_raster::Interrupt,
+) -> std::result::Result<Option<photocraft_raster::Surface>, FilterRefused> {
+    let check = || if ctl.cancelled() { Err(FilterRefused::Engine(EngineError::Cancelled)) } else { Ok(()) };
+    check()?;
+    let out = apply_one(id, params, surf, bounds, selection, canvas, ctl)?;
+    check()?;
+    Ok(out)
+}
+
+fn apply_one(
+    id: &str,
+    params: &Value,
+    surf: &photocraft_raster::Surface,
+    bounds: photocraft_geom::Rect,
+    selection: Option<&photocraft_raster::Surface>,
+    canvas: photocraft_geom::Rect,
+    ctl: &photocraft_raster::Interrupt,
+) -> std::result::Result<Option<photocraft_raster::Surface>, FilterRefused> {
     // Replays bypass command dispatch; nested paths must still obey the requesting session's
     // authority, including adjustment LUTs and plug-ins, before any resolver can read them.
     crate::jobs::authorize_render_command(id, params)?;
@@ -213,7 +268,11 @@ pub fn apply_filter_to_surface(
     let sel_bounds = selection.map(photocraft_raster::Surface::content_bounds);
     let content = surf.content_bounds();
     let area = algo::output_area(&fp, content, bounds, sel_bounds);
-    Ok(Some(algo::apply_in(surf, &fp, area, bounds, selection, canvas.union(&content))))
+    match algo::apply_in_with(surf, &fp, area, bounds, selection, canvas.union(&content), ctl) {
+        Some(out) => Ok(Some(out)),
+        None if ctl.cancelled() => Err(EngineError::Cancelled.into()),
+        None => Err(FilterRefused::NotApplied),
+    }
 }
 
 pub(crate) fn has_filterable_layer(s: &Session) -> std::result::Result<(), String> {
