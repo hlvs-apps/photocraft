@@ -8,7 +8,6 @@ use super::{
 /// Layer › Smart Objects › Stack Mode: the source's layers (or, when it holds a single group, the
 /// group's layers) combined per pixel with `mode`. Cached like [`source_image`], keyed by mode.
 pub fn stack_image(file_name: &str, bytes: &[u8], fmt: PixelFormat, mode: photocraft_doc::StackMode) -> Result<SourceImage> {
-    use photocraft_algo::stack::Stat;
     let mut key = cache_key(bytes, fmt);
     key.0 = *blake3::hash(&[&key.0[..], b"stack:", mode.id().as_bytes()].concat()).as_bytes();
     if let Some(img) = cache_get(&key) {
@@ -33,7 +32,16 @@ pub fn stack_image(file_name: &str, bytes: &[u8], fmt: PixelFormat, mode: photoc
     if frames.is_empty() {
         return Err(EngineError::Other("the smart object's contents have no visible layers".into()));
     }
-    let stat = match mode {
+    let buf = photocraft_compose::Buffer { rect: bounds, px: photocraft_algo::stack::combine(&frames, stack_stat(mode)) };
+    let img = SourceImage { surface: Arc::new(source_surface(&doc, &buf, fmt)?), bounds };
+    cache_put(key, img.clone());
+    Ok(img)
+}
+
+/// The per-pixel statistic a stack mode combines its layers with.
+pub(super) fn stack_stat(mode: photocraft_doc::StackMode) -> photocraft_algo::stack::Stat {
+    use photocraft_algo::stack::Stat;
+    match mode {
         photocraft_doc::StackMode::Entropy => Stat::Entropy,
         photocraft_doc::StackMode::Kurtosis => Stat::Kurtosis,
         photocraft_doc::StackMode::Maximum => Stat::Maximum,
@@ -45,11 +53,7 @@ pub fn stack_image(file_name: &str, bytes: &[u8], fmt: PixelFormat, mode: photoc
         photocraft_doc::StackMode::StandardDeviation => Stat::StandardDeviation,
         photocraft_doc::StackMode::Summation => Stat::Summation,
         photocraft_doc::StackMode::Variance => Stat::Variance,
-    };
-    let buf = photocraft_compose::Buffer { rect: bounds, px: photocraft_algo::stack::combine(&frames, stat) };
-    let img = SourceImage { surface: Arc::new(source_surface(&doc, &buf, fmt)?), bounds };
-    cache_put(key, img.clone());
-    Ok(img)
+    }
 }
 
 // ---------- rendering ----------
@@ -129,14 +133,14 @@ pub fn apply_smart_filters(placed: &Surface, sm: &SmartObject, canvas: Rect) -> 
 /// Photoshop's do: Lens Flare's centre is a fraction of the object, and Clouds and Fibers fill it
 /// and size their pattern by it. The object is its placed content's bounds (which leaves out
 /// fully transparent edges of the source); the other filters use the canvas, as on a layer.
-fn filter_bounds(f: &SmartFilter, placed: &Surface, canvas: Rect) -> Rect {
+pub(super) fn filter_bounds(f: &SmartFilter, placed: &Surface, canvas: Rect) -> Rect {
     match placed.content_bounds() {
         b if renders_in_object(f) && !b.is_empty() => b,
         _ => canvas,
     }
 }
 
-fn renders_in_object(f: &SmartFilter) -> bool {
+pub(super) fn renders_in_object(f: &SmartFilter) -> bool {
     matches!(f.command.as_str(), "filter.render.clouds" | "filter.render.differenceClouds" | "filter.render.fibers" | "filter.render.lensFlare")
 }
 
