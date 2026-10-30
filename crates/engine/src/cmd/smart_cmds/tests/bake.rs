@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use photocraft_geom::warp::{Warp, WarpStyle};
+use photocraft_text::TextEngine;
 
 use super::*;
 
@@ -17,6 +18,8 @@ fn options<'a>(decode: &'a BakeDecoder<'a>) -> BakeOptions<'a> {
         max_stack_bytes: 1 << 30,
         max_filter_bytes: 1 << 30,
         max_work: 1 << 34,
+        max_depth: 8,
+        text: None,
     }
 }
 
@@ -433,4 +436,198 @@ fn hostile_special_filters_are_refused_before_the_work() {
     refused(crate::lens_cmds::LENS, json!({"distortion": 30}), &tight, "lens correction");
     refused(crate::lens_cmds::RAW, json!({"clarity": 40}), &tight, "Camera Raw");
     refused("image.adjustments.shadowsHighlights", json!({"shadowAmount": 50}), &tight, "Shadows/Highlights");
+}
+
+// ---------- what the contents cache ----------
+
+/// What a layer of [`layered_contents`] stores as its rendering.
+#[derive(Clone, Copy, PartialEq)]
+enum Cached {
+    /// Drawn as the editor draws it.
+    Fresh,
+    /// A red block where the layer draws nothing (the contents were edited since).
+    Stale,
+    /// Nothing (a document built without renderings).
+    Missing,
+}
+
+fn red_block(fmt: PixelFormat) -> Surface {
+    let mut s = Surface::new(fmt);
+    s.fill_rect(Rect::new(0, 30, 10, 40), &[1.0, 0.0, 0.0, 1.0]);
+    s
+}
+
+fn title(font: &str, text: &str) -> photocraft_doc::TextLayer {
+    photocraft_doc::TextLayer {
+        text: text.into(),
+        font_family: font.into(),
+        size_pt: 18.0,
+        color: photocraft_color::Color::BLACK,
+        transform: Affine::translate(4.0, 22.0),
+        ..Default::default()
+    }
+}
+
+/// A smart object over a small blue square, with an Invert filter.
+fn inner_smart(fmt_depth: SampleType) -> SmartObject {
+    let mut square = Document::new("square", Size::new(8, 8), ColorMode::Rgb, fmt_depth);
+    let mut px = Surface::new(square.pixel_format());
+    px.fill_rect(Rect::new(0, 0, 8, 8), &[0.1, 0.2, 0.9, 1.0]);
+    square.layers.push(Layer::new("square", LayerContent::Raster(px)));
+    let mut sm = SmartObject::new(
+        SmartSource::Embedded { file_name: "square.pcraft".into(), bytes: Arc::new(encode_source(&square).unwrap()) },
+        Affine::translate(40.0, 25.0),
+        None,
+    );
+    sm.smart_filters =
+        vec![SmartFilter { command: "image.adjustments.invert".into(), params: json!({}), blend: BlendMode::Normal, opacity: 1.0, visible: true }];
+    sm
+}
+
+/// Contents of 60 × 40 with a fill, a text layer, a shape and a smart object (bottom to top),
+/// each storing `cached` as its rendering.
+fn layered_contents(cached: Cached, depth: SampleType) -> Document {
+    let mut doc = Document::new("contents", Size::new(60, 40), ColorMode::Rgb, depth);
+    let (fmt, canvas, dpi) = (doc.pixel_format(), doc.bounds(), doc.resolution_dpi);
+    let stale = || (cached == Cached::Stale).then(|| red_block(fmt));
+    let fill = photocraft_doc::Fill::Solid(photocraft_color::Color::rgba(0.9, 0.9, 0.8, 0.5));
+    let mut backdrop = Layer::new("Backdrop", LayerContent::Fill(fill.clone()));
+    backdrop.fill_cache = stale().map(|surface| photocraft_doc::FillCache { fill, surface });
+    let mut text = title("Inter", "Hi");
+    text.cache = match cached {
+        Cached::Fresh => {
+            TextEngine::new().render_layer(&mut text, dpi, fmt);
+            text.cache
+        }
+        _ => stale(),
+    };
+    let mut shape = photocraft_doc::ShapeLayer {
+        path: photocraft_vector::shapes::rect(30.0, 4.0, 20.0, 12.0),
+        fill: Some(photocraft_doc::Fill::Solid(photocraft_color::Color::rgb(0.0, 0.6, 0.2))),
+        ..Default::default()
+    };
+    shape.cache = match cached {
+        Cached::Fresh => Some(photocraft_vector::render_shape(&shape, fmt, canvas)),
+        _ => stale(),
+    };
+    doc.layers = vec![backdrop, Layer::new("Title", LayerContent::Text(text)), Layer::new("Badge", LayerContent::Shape(shape))];
+    let mut sm = inner_smart(depth);
+    sm.cache = match cached {
+        Cached::Fresh => super::render(&doc, &sm).unwrap(),
+        _ => stale(),
+    };
+    doc.layers.push(Layer::new("Inset", LayerContent::Smart(sm)));
+    doc
+}
+
+/// A page holding `contents` as one smart object, with Find Edges on it.
+fn page_with_contents(contents: &Document) -> (Document, SmartObject) {
+    let mut page = Document::new("page", Size::new(80, 60), contents.mode, contents.depth);
+    let mut sm = SmartObject::new(
+        SmartSource::Embedded { file_name: "contents.pcraft".into(), bytes: Arc::new(encode_source(contents).unwrap()) },
+        Affine::translate(6.0, 7.0),
+        None,
+    );
+    sm.smart_filters =
+        vec![SmartFilter { command: "filter.stylize.findEdges".into(), params: json!({}), blend: BlendMode::Normal, opacity: 1.0, visible: true }];
+    page.layers.push(Layer::new("Contents", LayerContent::Smart(sm.clone())));
+    (page, sm)
+}
+
+#[test]
+fn contents_are_drawn_from_what_they_are_not_from_their_caches() {
+    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+        // The editor's picture of the contents, drawn with their renderings fresh.
+        let (page, sm) = page_with_contents(&layered_contents(Cached::Fresh, depth));
+        let editor = render_below_filter(&page, &sm, 0).unwrap().unwrap();
+        let filtered = render_below_filter(&page, &sm, 1).unwrap().unwrap();
+        assert!(!editor.content_bounds().is_empty());
+        for cached in [Cached::Fresh, Cached::Stale, Cached::Missing] {
+            let (page, sm) = page_with_contents(&layered_contents(cached, depth));
+            let baked = bake(&page, &sm, 1).unwrap();
+            let what = format!(
+                "{depth:?}, caches {}",
+                match cached {
+                    Cached::Fresh => "fresh",
+                    Cached::Stale => "stale",
+                    Cached::Missing => "missing",
+                }
+            );
+            assert_same(&baked.original, &editor, &what);
+            assert_same(&baked.filtered, &filtered, &what);
+        }
+        // The stale renderings alone, composited as they are, would differ.
+        let (page, sm) = page_with_contents(&layered_contents(Cached::Stale, depth));
+        assert!(render_below_filter(&page, &sm, 0).unwrap().unwrap().read_region(editor.content_bounds()) != editor.read_region(editor.content_bounds()));
+    }
+}
+
+#[test]
+fn contents_the_bake_cannot_draw_are_refused_naming_the_layer() {
+    let refused = |contents: &Document, opts: &BakeOptions<'_>, want: &[&str]| {
+        let (page, sm) = page_with_contents(contents);
+        match bake_below_filter(&page, &sm, 1, opts, &photocraft_raster::Interrupt::NONE) {
+            Err(BakeError::Refused(m) | BakeError::Limit(m)) => assert!(want.iter().all(|w| m.contains(w)), "{m}"),
+            other => panic!("not refused: {other:?}"),
+        }
+    };
+    let opts = options(&decode);
+    let with = |l: Layer| {
+        let mut doc = layered_contents(Cached::Missing, SampleType::U8);
+        doc.layers.push(l);
+        doc
+    };
+    // A font the bake's text engine lacks: a substitute would not be the layer's text.
+    refused(&with(Layer::new("Headline", LayerContent::Text(title("No Such Sans", "Hello")))), &opts, &["Headline", "No Such Sans"]);
+    // Characters none of its fonts has.
+    refused(&with(Layer::new("Caption", LayerContent::Text(title("Inter", "日本語")))), &opts, &["Caption", "none of this server's fonts"]);
+    // Text too long to lay out as one step.
+    refused(&with(Layer::new("Essay", LayerContent::Text(title("Inter", &"a".repeat(MAX_TEXT_CHARS + 1))))), &opts, &["Essay", "characters"]);
+    // A nested smart object with a filter photocraft does not implement.
+    let mut odd = inner_smart(SampleType::U8);
+    odd.smart_filters[0].command = "psd.unsupportedFilter".into();
+    odd.smart_filters[0].params = json!({"name": "Oil Slick"});
+    refused(&with(Layer::new("Odd", LayerContent::Smart(odd))), &opts, &["Odd", "Oil Slick"]);
+    // A nested smart object whose linked file is not in the contents.
+    let lost = SmartObject::new(SmartSource::Linked { path: "/elsewhere/photo.psd".into() }, Affine::IDENTITY, Some(red_block(PixelFormat::RGBA8)));
+    refused(&with(Layer::new("Lost", LayerContent::Smart(lost))), &opts, &["Lost", "not in the contents"]);
+    // Nested in a group, named by its path.
+    refused(&with(Layer::group("Header", vec![Layer::new("Kicker", LayerContent::Text(title("No Such Sans", "x")))])), &opts, &["\"Header\" › \"Kicker\""]);
+    // Nesting past the depth: the contents are level 1 and their inset level 2.
+    let shallow = BakeOptions { max_depth: 1, ..options(&decode) };
+    refused(&layered_contents(Cached::Missing, SampleType::U8), &shallow, &["Inset", "deep"]);
+    let few = BakeOptions { render: photocraft_compose::RenderOptions { max_layers: 0, ..options(&decode).render }, ..options(&decode) };
+    refused(&layered_contents(Cached::Missing, SampleType::U8), &few, &["Inset", "smart objects"]);
+}
+
+#[test]
+fn a_host_text_engine_is_used_when_given() {
+    // The host's engine knows a family the bundled fonts lack (here: Inter registered again under
+    // its own name is enough to show the engine is the host's; a missing family is refused above).
+    let engine = std::sync::Mutex::new(TextEngine::new());
+    let opts = BakeOptions { text: Some(&engine), ..options(&decode) };
+    let (page, sm) = page_with_contents(&layered_contents(Cached::Stale, SampleType::U8));
+    let baked = bake_below_filter(&page, &sm, 1, &opts, &photocraft_raster::Interrupt::NONE).unwrap();
+    let (fresh, fsm) = page_with_contents(&layered_contents(Cached::Fresh, SampleType::U8));
+    assert_same(&baked.original, &render_below_filter(&fresh, &fsm, 0).unwrap().unwrap(), "host engine");
+}
+
+#[test]
+fn a_nested_bake_stops_when_interrupted() {
+    let (page, sm) = page_with_contents(&layered_contents(Cached::Stale, SampleType::U8));
+    let total = {
+        let n = AtomicUsize::new(0);
+        let count = || {
+            n.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        bake_below_filter(&page, &sm, 1, &options(&decode), &photocraft_raster::Interrupt::cancel_only(&count)).unwrap();
+        n.load(Ordering::Relaxed)
+    };
+    for stop in [1, 3, total / 4, total / 2, total - 1] {
+        let n = AtomicUsize::new(0);
+        let late = || n.fetch_add(1, Ordering::Relaxed) + 1 >= stop;
+        let out = bake_below_filter(&page, &sm, 1, &options(&decode), &photocraft_raster::Interrupt::cancel_only(&late));
+        assert!(matches!(out, Err(BakeError::Cancelled)), "stopping at check {stop} of {total}");
+    }
 }

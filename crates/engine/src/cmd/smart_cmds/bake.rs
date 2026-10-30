@@ -27,15 +27,28 @@
 //!   memory and solver work are held to [`BakeOptions::max_pixels`],
 //!   [`BakeOptions::max_filter_bytes`] and [`BakeOptions::max_work`]; past them a filter is a
 //!   [`BakeError::Limit`], never the unfiltered pixels.
-//! * **No caches.** Nothing is read from or written to the decoded-source or stage caches.
+//! * **No caches.** Nothing is read from or written to the decoded-source or stage caches, and
+//!   nothing the contents cache is drawn as it is: their text, shapes and smart objects are drawn
+//!   again from what they are (fonts, paths, nested contents, filters), and fill layers from
+//!   their fill, before the contents are composited. A stored rendering may be stale (contents
+//!   edited since), missing (a document built without one) or anything at all (a file nobody
+//!   vetted). Text in a font the bake's text engine lacks ([`BakeOptions::text`]), and a nested
+//!   smart object whose own contents or filters the bake cannot render, are refused instead.
+//!   Nesting is held to [`BakeOptions::max_depth`] levels, [`RenderOptions::max_layers`] smart
+//!   objects in all and [`BakeOptions::max_stack_bytes`] of contents open at once.
 //! * **The filter switch is ignored.** The bake point says which filters run; a host keeps the
 //!   stack's on/off state itself.
 //!
 //! [`render_below_filter`]: super::render_below_filter
 
+use std::cell::{Cell, OnceCell};
+use std::sync::{Mutex, PoisonError};
+
 use photocraft_algo::transform::Interp;
 use photocraft_compose::{RenderError, RenderOptions};
+use photocraft_doc::{LayerContent, ShapeLayer, TextLayer};
 use photocraft_raster::Interrupt;
+use photocraft_text::TextEngine;
 
 use super::rendering::{blend_surfaces, filter_bounds, renders_in_object, stack_stat, unapplied_filters};
 use super::source::{buffer_to_surface, embedded_source_bytes, source_surface, vector_scale};
@@ -62,9 +75,21 @@ pub struct BakeOptions<'a> {
     pub max_filter_bytes: u64,
     /// Most solver and geometry steps one filter may take (puppet and wide-angle solvers, mesh
     /// warps' triangles, plane lookups), in inner-loop steps; see
-    /// [`photocraft_algo::control::Budget::max_work`].
+    /// [`photocraft_algo::control::Budget::max_work`]. Drawing a text layer of the contents is held
+    /// to it too (its glyphs' areas).
     pub max_work: u64,
+    /// Most levels of contents: the baked smart object's are level 1, a smart object inside them
+    /// opens level 2, and so on.
+    pub max_depth: usize,
+    /// The engine text layers in the contents are drawn with; only its fonts are used. `None`: a
+    /// fresh [`TextEngine::new`] per bake (photocraft's bundled fonts). A host that serves fonts
+    /// registers them with its engine ([`photocraft_text::FontDb::register_font_data`]).
+    pub text: Option<&'a Mutex<TextEngine>>,
 }
+
+/// Longest text (in characters) a text layer of the contents may have: its layout is one step no
+/// interrupt splits.
+pub const MAX_TEXT_CHARS: usize = 1 << 16;
 
 /// What [`bake_below_filter`] made, in document pixels at the document's pixel format.
 #[derive(Clone, Debug)]
@@ -169,7 +194,8 @@ pub fn bake_below_filter(doc: &Document, sm: &SmartObject, upto: usize, opts: &B
         }));
     };
     let (fmt, canvas) = (doc.pixel_format(), doc.bounds());
-    let original = place(&name, &bytes, fmt, sm, opts, ctl)?;
+    let nest = Nesting::default();
+    let original = place(&name, &bytes, fmt, sm, opts, &nest, ctl)?;
     check(ctl)?;
     // Edge pixels repeat at the canvas ∪ placed-content edge, as for layer filters.
     let extent = canvas.union(&original.content_bounds());
@@ -250,13 +276,73 @@ fn apply(f: &SmartFilter, cur: &Surface, bounds: Rect, extent: Rect, opts: &Bake
     Ok(if f.blend == BlendMode::Normal && f.opacity >= 1.0 { out } else { blend_surfaces(cur, &out, f.blend, f.opacity.clamp(0.0, 1.0)) })
 }
 
-/// The contents in their own pixels: composited (or stacked) once, uncached.
-fn contents(name: &str, bytes: &[u8], fmt: PixelFormat, sm: &SmartObject, opts: &BakeOptions<'_>, ctl: &Interrupt<'_>) -> Result<(Surface, Rect), BakeError> {
-    let doc = (opts.decode)(name, bytes, ctl)?;
+/// What the levels of one bake share (see the module docs): how deep the contents open now are,
+/// how many nested smart objects were drawn, what the open levels hold, and the text engine.
+#[derive(Default)]
+struct Nesting {
+    depth: Cell<usize>,
+    drawn: Cell<usize>,
+    held: Cell<u64>,
+    text: OnceCell<Mutex<TextEngine>>,
+}
+
+impl Nesting {
+    fn text<'a>(&'a self, opts: &BakeOptions<'a>) -> &'a Mutex<TextEngine> {
+        opts.text.unwrap_or_else(|| self.text.get_or_init(|| Mutex::new(TextEngine::new())))
+    }
+}
+
+/// Bytes the layers of `doc` store (their own surfaces and caches, masks included).
+fn stored_bytes(layers: &[Layer]) -> u64 {
+    let surface = |s: &Surface| {
+        (s.tile_count() as u64)
+            .saturating_mul(photocraft_geom::TILE_SIZE as u64 * photocraft_geom::TILE_SIZE as u64)
+            .saturating_mul(s.format().bytes_per_pixel() as u64)
+    };
+    layers.iter().fold(0u64, |acc, l| {
+        let own = l.surface().map_or(0, surface).saturating_add(l.mask.as_ref().map_or(0, |m| surface(&m.surface)));
+        acc.saturating_add(own).saturating_add(l.children().map_or(0, stored_bytes))
+    })
+}
+
+/// The contents in their own pixels: composited (or stacked) once, uncached, their text, shape,
+/// fill and smart layers drawn again first ([`redraw`]).
+fn contents(
+    name: &str,
+    bytes: &[u8],
+    fmt: PixelFormat,
+    sm: &SmartObject,
+    opts: &BakeOptions<'_>,
+    nest: &Nesting,
+    ctl: &Interrupt<'_>,
+) -> Result<(Surface, Rect), BakeError> {
+    let depth = nest.depth.get() + 1;
+    if depth > opts.max_depth {
+        return Err(BakeError::Limit(format!("the contents nest smart objects more than {} deep", opts.max_depth)));
+    }
+    let mut doc = (opts.decode)(name, bytes, ctl)?;
     check(ctl)?;
+    let held = stored_bytes(&doc.layers);
+    if nest.held.get().saturating_add(held) > opts.max_stack_bytes {
+        return Err(BakeError::Limit(format!(
+            "the open contents would hold {} bytes; the limit is {}",
+            nest.held.get().saturating_add(held),
+            opts.max_stack_bytes
+        )));
+    }
+    nest.depth.set(depth);
+    nest.held.set(nest.held.get() + held);
+    let out = redraw(&mut doc, opts, nest, ctl).and_then(|()| composite(&doc, fmt, sm, opts, ctl));
+    nest.depth.set(depth - 1);
+    nest.held.set(nest.held.get() - held);
+    out
+}
+
+/// [`contents`] once its layers are drawn again.
+fn composite(doc: &Document, fmt: PixelFormat, sm: &SmartObject, opts: &BakeOptions<'_>, ctl: &Interrupt<'_>) -> Result<(Surface, Rect), BakeError> {
     let bounds = doc.bounds();
     let buf = match sm.stack_mode {
-        None => photocraft_compose::flatten_with(&doc, &opts.render, ctl).map_err(render_error("compositing the smart object's contents"))?,
+        None => photocraft_compose::flatten_with(doc, &opts.render, ctl).map_err(render_error("compositing the smart object's contents"))?,
         Some(mode) => {
             // As `stack_image`: the source's layers (or a single group's), each rendered alone.
             let layers: &[Layer] = match doc.layers.as_slice() {
@@ -287,12 +373,167 @@ fn contents(name: &str, bytes: &[u8], fmt: PixelFormat, sm: &SmartObject, opts: 
         }
     };
     check(ctl)?;
-    Ok((source_surface(&doc, &buf, fmt)?, bounds))
+    Ok((source_surface(doc, &buf, fmt)?, bounds))
+}
+
+/// Draws the layers of `doc` that the compositor would otherwise take from a stored rendering:
+/// text from its text and fonts, shapes from their paths, smart objects from their own contents
+/// and filters, fills from their fill (see the module docs).
+fn redraw(doc: &mut Document, opts: &BakeOptions<'_>, nest: &Nesting, ctl: &Interrupt<'_>) -> Result<(), BakeError> {
+    let mut layers = std::mem::take(&mut doc.layers);
+    let out = redraw_layers(&mut layers, doc, "", opts, nest, ctl);
+    doc.layers = layers;
+    out
+}
+
+/// `doc` holds everything but `layers` (its canvas, metadata and linked files); `path` names the
+/// group they are in.
+fn redraw_layers(layers: &mut [Layer], doc: &Document, path: &str, opts: &BakeOptions<'_>, nest: &Nesting, ctl: &Interrupt<'_>) -> Result<(), BakeError> {
+    for l in layers {
+        check(ctl)?;
+        let name = if path.is_empty() { format!("\"{}\"", l.name) } else { format!("{path} › \"{}\"", l.name) };
+        let named = |e: BakeError| match e {
+            BakeError::Limit(m) => BakeError::Limit(format!("the layer {name} of the smart object's contents: {m}")),
+            BakeError::Refused(m) => BakeError::Refused(format!("the layer {name} of the smart object's contents: {m}")),
+            e => e,
+        };
+        l.fill_cache = None;
+        match &mut l.content {
+            LayerContent::Group(g) => redraw_layers(&mut g.children, doc, &name, opts, nest, ctl)?,
+            LayerContent::Text(t) => redraw_text(t, doc, opts, nest, ctl).map_err(named)?,
+            LayerContent::Shape(sh) => redraw_shape(sh, doc).map_err(named)?,
+            LayerContent::Smart(sm) => {
+                let drawn = redraw_smart(doc, sm, opts, nest, ctl).map_err(named)?;
+                sm.cache = Some(drawn);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// A text layer drawn by the bake's text engine, with the fonts it has: a family it lacks, or a
+/// character none of its fonts has, is refused (a substitute font is not the layer's text).
+fn redraw_text(t: &mut TextLayer, doc: &Document, opts: &BakeOptions<'_>, nest: &Nesting, ctl: &Interrupt<'_>) -> Result<(), BakeError> {
+    let chars = t.text.chars().count();
+    if chars > MAX_TEXT_CHARS {
+        return Err(BakeError::Limit(format!("its text has {chars} characters; the most a bake draws is {MAX_TEXT_CHARS}")));
+    }
+    let mut engine = nest.text(opts).lock().unwrap_or_else(PoisonError::into_inner);
+    let layout = engine.layout(t, doc.resolution_dpi);
+    for style in &layout.styles {
+        let family = if style.font_family.is_empty() { photocraft_text::fonts::DEFAULT_FAMILY } else { style.font_family.as_str() };
+        if !engine.fonts.has_family(family) {
+            return Err(BakeError::Refused(format!("its font \"{family}\" is not one this server has")));
+        }
+    }
+    if layout.glyphs.iter().any(|g| g.id == 0) {
+        return Err(BakeError::Refused("some of its characters are in none of this server's fonts".into()));
+    }
+    // Its drawn area (text space through the layer's transform), and the glyphs' areas drawn into it.
+    let scale = t.transform.determinant().abs().sqrt();
+    if let Some([x0, y0, x1, y1]) = layout.bounds() {
+        let [a, b, c, d, e, f] = t.transform.m;
+        let at = |x: f32, y: f32| (a * f64::from(x) + c * f64::from(y) + e, b * f64::from(x) + d * f64::from(y) + f);
+        let corners = [at(x0, y0), at(x1, y0), at(x1, y1), at(x0, y1)];
+        let (lx, hx, ly, hy) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY), |(lx, hx, ly, hy), p| {
+            (lx.min(p.0), hx.max(p.0), ly.min(p.1), hy.max(p.1))
+        });
+        let (w, h) = (hx - lx, hy - ly);
+        // A warp bends the lines within about their own size again.
+        let warped = if t.warp.is_some() || !matches!(t.shape, photocraft_doc::text::TextShape::Point | photocraft_doc::text::TextShape::Box { .. }) {
+            2.0
+        } else {
+            1.0
+        };
+        let drawn = w * warped * h * warped;
+        if drawn.is_nan() || drawn > opts.max_pixels as f64 {
+            return Err(BakeError::Limit(format!(
+                "it would be drawn over {:.0} × {:.0} pixels; the limit is {} pixels",
+                w * warped,
+                h * warped,
+                opts.max_pixels
+            )));
+        }
+    }
+    let glyph_area = layout.glyphs.iter().fold(0f64, |acc, g| {
+        let px = layout.faces.get(g.face as usize).map_or(0.0, |f| f64::from(f.size_px)) * scale;
+        acc + px * px
+    });
+    if glyph_area.is_nan() || glyph_area > opts.max_work as f64 {
+        return Err(BakeError::Limit(format!("its glyphs cover about {glyph_area:.0} pixels; the limit is {}", opts.max_work)));
+    }
+    check(ctl)?;
+    let warp = photocraft_text::render::layout_deform(&layout, t);
+    let drawn = photocraft_text::render::rasterize_warped(&layout, &t.transform, doc.pixel_format(), t.antialias, warp.as_ref());
+    t.cache = Some(drawn.surface);
+    Ok(())
+}
+
+/// A shape layer drawn from its path, fill and stroke over the canvas, as the editor does after
+/// an edit, once its path passes the editor's own checks for one.
+fn redraw_shape(sh: &mut ShapeLayer, doc: &Document) -> Result<(), BakeError> {
+    photocraft_vector::flatten::validate_shape(&sh.path, sh.stroke.as_ref()).map_err(|e| BakeError::Limit(format!("its path: {e}")))?;
+    sh.cache = Some(photocraft_vector::render_shape(sh, doc.pixel_format(), doc.bounds()));
+    Ok(())
+}
+
+/// A smart object inside the contents, drawn as the editor draws it ([`super::render`]) from its
+/// own contents (one level deeper), its visible filters (when the stack is on) and its filter mask.
+fn redraw_smart(doc: &Document, sm: &SmartObject, opts: &BakeOptions<'_>, nest: &Nesting, ctl: &Interrupt<'_>) -> Result<Surface, BakeError> {
+    let drawn = nest.drawn.get() + 1;
+    if drawn > opts.render.max_layers {
+        return Err(BakeError::Limit(format!("the contents hold more than {} smart objects", opts.render.max_layers)));
+    }
+    nest.drawn.set(drawn);
+    let missing = unapplied_filters(sm);
+    if !missing.is_empty() {
+        return Err(BakeError::Refused(format!("photocraft does not implement its smart filter {}", missing.join(", "))));
+    }
+    let filters: Vec<&SmartFilter> = sm.smart_filters.iter().filter(|f| sm.filters_enabled && f.visible).collect();
+    for f in &filters {
+        deny_external_inputs(&f.command, &f.params)?;
+    }
+    let Some((name, bytes)) = embedded_source_bytes(&doc.metadata, &sm.source) else {
+        return Err(BakeError::Refused(match &sm.source {
+            SmartSource::Linked { path } => format!("its linked file {path} is not in the contents"),
+            SmartSource::Embedded { .. } => "it has no contents".into(),
+        }));
+    };
+    let (fmt, canvas) = (doc.pixel_format(), doc.bounds());
+    let placed = place(&name, &bytes, fmt, sm, opts, nest, ctl)?;
+    check(ctl)?;
+    if filters.is_empty() {
+        return Ok(placed);
+    }
+    let extent = canvas.union(&placed.content_bounds());
+    if area(extent) > opts.max_pixels {
+        return Err(BakeError::Limit(format!("its filters would work on {} pixels; the limit is {}", area(extent), opts.max_pixels)));
+    }
+    let mut cur = placed.clone();
+    let mut object_bounds: Option<Rect> = None;
+    for f in filters {
+        check(ctl)?;
+        let bounds = if renders_in_object(f) { *object_bounds.get_or_insert_with(|| filter_bounds(f, &placed, canvas)) } else { canvas };
+        cur = apply(f, &cur, bounds, extent, opts, ctl)?;
+    }
+    Ok(match sm.filter_mask.as_ref().filter(|m| m.enabled) {
+        Some(m) => photocraft_compose::filter_mask::mix(&placed, &cur, m),
+        None => cur,
+    })
 }
 
 /// The source placed in document pixels, as `rendering::place` does it, within the budget and
 /// cancellable.
-fn place(name: &str, bytes: &[u8], fmt: PixelFormat, sm: &SmartObject, opts: &BakeOptions<'_>, ctl: &Interrupt<'_>) -> Result<Surface, BakeError> {
+fn place(
+    name: &str,
+    bytes: &[u8],
+    fmt: PixelFormat,
+    sm: &SmartObject,
+    opts: &BakeOptions<'_>,
+    nest: &Nesting,
+    ctl: &Interrupt<'_>,
+) -> Result<Surface, BakeError> {
     // A vector source is rendered at the placement's scale, and the placement divided by it.
     if sm.stack_mode.is_none() && sm.warp.is_none() && photocraft_io::svg::is_svg(bytes) {
         let k = vector_scale(sm);
@@ -311,7 +552,7 @@ fn place(name: &str, bytes: &[u8], fmt: PixelFormat, sm: &SmartObject, opts: &Ba
         };
         return place_through(&src, buf.rect, &map, None, opts, ctl);
     }
-    let (src, rect) = contents(name, bytes, fmt, sm, opts, ctl)?;
+    let (src, rect) = contents(name, bytes, fmt, sm, opts, nest, ctl)?;
     let map = match &sm.perspective {
         Some(p) => Map::Projective(Homography(*p)),
         None => Map::Affine(sm.transform),

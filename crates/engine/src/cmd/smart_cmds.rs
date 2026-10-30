@@ -135,7 +135,7 @@ mod placing;
 mod rendering;
 mod source;
 
-pub use bake::{BakeDecoder, BakeError, BakeOptions, Baked, bake_below_filter, deny_external_inputs};
+pub use bake::{BakeDecoder, BakeError, BakeOptions, Baked, MAX_TEXT_CHARS, bake_below_filter, deny_external_inputs};
 pub(crate) use contents::on_close;
 pub use contents::{commit_child, contents_of, replace_contents_bytes, replace_contents_from_bytes};
 use contents::{edit_contents, export_contents, is_smart_child, path_param, replace_contents, set_source, update_all};
