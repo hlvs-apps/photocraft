@@ -16,12 +16,18 @@ const BAND_BYTES: usize = 32 << 20;
 /// Decodes a flat image into a single-layer document; a TIFF with Photoshop layer data opens
 /// layered (see [`crate::tiff_layers`]).
 pub fn import_flat(name: &str, bytes: &[u8]) -> Result<ImportResult, IoError> {
+    import_flat_with(name, bytes, &codecs::DecodeOptions::default())
+}
+
+/// [`import_flat`] decoding with `opts`: a host that opens untrusted files sets its own
+/// [`codecs::Limits`], which the decoders check before allocating pixels.
+pub fn import_flat_with(name: &str, bytes: &[u8], opts: &codecs::DecodeOptions) -> Result<ImportResult, IoError> {
     // Detected once; every step below branches on it.
     let format = codecs::detect(bytes);
     if format == Some(Format::Tiff) {
-        return import_tiff_page(name, bytes, None);
+        return tiff_page(name, bytes, None, opts.limits);
     }
-    let img = codecs::decode_as(format.ok_or(codecs::CodecError::UnknownFormat)?, bytes)?;
+    let img = codecs::decode_as_with(format.ok_or(codecs::CodecError::UnknownFormat)?, bytes, opts)?;
     // A palette BMP, PNG or GIF opens in Indexed Color mode with its colour table, as in
     // Photoshop (#3802, #4804, #7886). A GIF is always palette-based: the first frame's table.
     let palette = match format {
@@ -227,9 +233,13 @@ pub fn tga_alpha_channel_to_transparency(doc: &mut Document) {
 /// full-resolution one), `Some(i)` an index into [`codecs::tiff_info`]'s pages (every IFD and
 /// SubIFD). A page with Photoshop layer data opens layered.
 pub fn import_tiff_page(name: &str, bytes: &[u8], page: Option<usize>) -> Result<ImportResult, IoError> {
+    tiff_page(name, bytes, page, codecs::Limits::default())
+}
+
+fn tiff_page(name: &str, bytes: &[u8], page: Option<usize>, limits: codecs::Limits) -> Result<ImportResult, IoError> {
     // The orientation is applied after the layer check: rotating the composite but not the
     // layers would misalign them, so a layered TIFF keeps its stored orientation.
-    let keep = codecs::DecodeOptions { keep_orientation: true, ..Default::default() };
+    let keep = codecs::DecodeOptions { keep_orientation: true, limits };
     let (img, orientation) = match page {
         None => (codecs::decode_with(bytes, &keep)?, codecs::tiff_orientation(bytes)),
         Some(p) => (codecs::decode_tiff_page(bytes, p, &keep)?, codecs::tiff_page_orientation(bytes, p)),

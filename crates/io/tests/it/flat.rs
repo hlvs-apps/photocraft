@@ -1227,3 +1227,27 @@ fn dds_writes_the_alpha_channel_as_the_texture_alpha() {
     let img = photocraft_codecs::decode(&r.bytes).expect("decode dds");
     assert!(!img.layout().has_alpha() || img.data().as_chunks::<4>().0.iter().all(|p| p[3] == 255));
 }
+
+/// A host's decode limits are checked before the pixels are allocated, and within them the result
+/// is `import_flat`'s.
+#[test]
+fn import_flat_with_applies_the_callers_limits() {
+    let mut doc = photocraft_doc::Document::with_background(
+        "in",
+        photocraft_geom::Size::new(40, 30),
+        photocraft_color::ColorMode::Rgb,
+        photocraft_color::SampleType::U8,
+        photocraft_color::Color::rgba(0.2, 0.4, 0.6, 1.0),
+    );
+    doc.layers[0].surface_mut().unwrap().fill_rect(photocraft_geom::Rect::new(5, 5, 20, 12), &[1.0, 0.0, 0.0, 1.0]);
+    for format in ["png", "jpg", "webp"] {
+        let bytes = photocraft_io::export(&doc, &format!("in.{format}"), &Default::default()).unwrap().bytes;
+        let small = photocraft_codecs::DecodeOptions { limits: photocraft_codecs::Limits { max_pixels: 1199, ..Default::default() }, ..Default::default() };
+        let err = photocraft_io::import_flat_with("in", &bytes, &small).err().unwrap();
+        assert!(matches!(err, photocraft_io::IoError::Codec(photocraft_codecs::CodecError::LimitExceeded(_))), "{format}: {err}");
+        let fits = photocraft_codecs::DecodeOptions { limits: photocraft_codecs::Limits { max_pixels: 1200, ..Default::default() }, ..Default::default() };
+        let with = photocraft_io::import_flat_with("in", &bytes, &fits).unwrap().document;
+        let plain = photocraft_io::import("in", &bytes).unwrap().document;
+        assert_eq!(photocraft_compose::flatten(&with).px, photocraft_compose::flatten(&plain).px, "{format}");
+    }
+}
