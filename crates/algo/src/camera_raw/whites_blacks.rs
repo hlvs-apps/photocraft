@@ -21,7 +21,6 @@
 //!   by the curve's change of its luminance (closest to Photoshop on saturated colours).
 
 use super::Encoding;
-use crate::photo_util::par_rows;
 
 /// Grey levels the curves are sampled at: 0, 1/32, …, 1 (sRGB-encoded).
 pub(crate) const STEPS: usize = 33;
@@ -372,7 +371,7 @@ pub(crate) fn amounts(whites: f32, blacks: f32, bp: f32, wp: f32) -> (f32, f32) 
 
 /// Applies Whites and Blacks (internal amounts `w`, `b`) to straight RGBA pixels (`width` per
 /// row) encoded with `enc`. Values above 1 (float documents) keep their excess.
-pub(crate) fn apply(px: &mut [[f32; 4]], width: usize, w: f32, b: f32, enc: Encoding) {
+pub(crate) fn apply(px: &mut [[f32; 4]], width: usize, w: f32, b: f32, enc: Encoding, ctl: &photocraft_raster::Interrupt) {
     if w == 0.0 && b == 0.0 {
         return;
     }
@@ -382,7 +381,7 @@ pub(crate) fn apply(px: &mut [[f32; 4]], width: usize, w: f32, b: f32, enc: Enco
         if b != 0.0 { blacks(v, b) } else { v }
     };
     let per_channel = w > 0.0 || b < 0.0;
-    par_rows(px, width, 1, |_, row| {
+    crate::photo_util::par_rows_ctl(px, width, 1, ctl, |_, row| {
         for q in row.iter_mut() {
             let lin = [0, 1, 2].map(|c| enc.decode(q[c]));
             if per_channel {

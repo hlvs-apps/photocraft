@@ -12,15 +12,16 @@
 
 use std::cell::RefCell;
 
-use photocraft_algo::liquify::{LiquifyField, LiquifyStroke, apply_liquify, auto_cell};
+use photocraft_algo::control::{Budget, Refused};
+use photocraft_algo::liquify::{LiquifyField, LiquifyStroke, apply_liquify, apply_liquify_with, auto_cell};
 use photocraft_algo::perspective::{PerspectiveMap, Plane, Straighten, straighten};
 use photocraft_algo::puppet::{PuppetDensity, PuppetMode, PuppetPin, PuppetWarp, puppet_warp, puppet_warp_with_mask};
 use photocraft_algo::transform::Interp;
-use photocraft_algo::warp::{warp_mesh_gray, warp_mesh_surface};
+use photocraft_algo::warp::{warp_mesh_gray, warp_mesh_surface, warp_mesh_surface_controlled};
 use photocraft_color::PixelFormat;
 use photocraft_doc::{Document, Layer, LayerContent, LayerId, Locks, SmartFilter};
 use photocraft_geom::Rect;
-use photocraft_raster::Surface;
+use photocraft_raster::{Interrupt, Surface};
 use serde_json::{Value, json};
 
 use crate::commands::CommandSpec;
@@ -171,6 +172,79 @@ pub fn perspective_surface(surf: &Surface, planes: &[Plane], interp: Interp) -> 
     }
     let Some(m) = PerspectiveMap::new(planes) else { return surf.clone() };
     warp_mesh_surface(surf, b, &|x, y| m.map(x, y), interp)
+}
+
+/// Most planes a controlled Perspective Warp takes ([`perspective_surface_controlled`]): linking
+/// their corners (params), preparing the map and finding each grid vertex's plane compare every
+/// plane with every other, in steps no interrupt splits. Photoshop's planes are a handful.
+pub const MAX_CONTROLLED_PLANES: usize = 256;
+
+/// Most vertices of a mesh warp's grid (513 × 513, `photocraft_algo::warp`): a perspective warp
+/// finds the plane of each.
+const MESH_VERTICES: u64 = 513 * 513;
+
+/// [`puppet_surface`] for input nobody vetted ([`photocraft_algo::control`]): the same pixels,
+/// cancellable within one mesh, solver or tile step, every stage held to `budget`.
+pub fn puppet_surface_controlled(surf: &Surface, w: &PuppetWarp, interp: Interp, budget: &Budget, ctl: &Interrupt) -> std::result::Result<Surface, Refused> {
+    let b = surf.content_bounds();
+    if w.is_identity() || b.is_empty() {
+        return Ok(surf.clone());
+    }
+    photocraft_algo::puppet::puppet_warp_controlled(surf, b, w, interp, budget, ctl)
+}
+
+/// [`perspective_surface`] for input nobody vetted ([`photocraft_algo::control`]): the same
+/// pixels, the grid's plane lookups held to `budget.max_work`, the warp to the budget
+/// ([`warp_mesh_surface_controlled`]), cancellable per grid row and destination tile.
+pub fn perspective_surface_controlled(
+    surf: &Surface,
+    planes: &[Plane],
+    interp: Interp,
+    budget: &Budget,
+    ctl: &Interrupt,
+) -> std::result::Result<Surface, Refused> {
+    if planes.len() > MAX_CONTROLLED_PLANES {
+        return Err(Refused::Limit(format!("the perspective warp has {} planes; the most it takes here is {MAX_CONTROLLED_PLANES}", planes.len())));
+    }
+    let b = surf.content_bounds();
+    if PerspectiveMap::is_identity(planes) || b.is_empty() {
+        return Ok(surf.clone());
+    }
+    let Some(m) = PerspectiveMap::new(planes) else { return Ok(surf.clone()) };
+    budget.work("locating the perspective warp's planes", MESH_VERTICES.saturating_mul(planes.len() as u64))?;
+    warp_mesh_surface_controlled(surf, b, &|x, y| m.map(x, y), interp, budget, ctl)
+}
+
+/// [`apply_to_surface`] for input nobody vetted ([`photocraft_algo::control`]): the same pixels
+/// within `budget`, cancellable within one step of each kernel (a Liquify dab or tile batch, a
+/// puppet or perspective mesh step, a destination tile). Malformed params are an error here
+/// rather than `None`. `None` for other ids.
+pub fn apply_to_surface_controlled(
+    id: &str,
+    params: &Value,
+    surf: &Surface,
+    canvas: Rect,
+    budget: &Budget,
+    ctl: &Interrupt,
+) -> Option<std::result::Result<Surface, crate::filters::FilterRefused>> {
+    let run = || -> std::result::Result<Surface, crate::filters::FilterRefused> {
+        Ok(match id {
+            LIQUIFY => {
+                let (strokes, cell) = liquify_params(id, params, canvas)?;
+                let field = LiquifyField::from_strokes_with(canvas, cell, &strokes, ctl).ok_or(Refused::Cancelled)?;
+                apply_liquify_with(surf, &field, ctl).ok_or(Refused::Cancelled)?
+            }
+            PUPPET | PUPPET_SMART => puppet_surface_controlled(surf, &puppet_params(id, params)?, interp(params), budget, ctl)?,
+            _ => {
+                // Counted before parsing: straightening and validating the planes are pairwise too.
+                if let Some(n) = params.get("planes").and_then(Value::as_array).map(Vec::len).filter(|&n| n > MAX_CONTROLLED_PLANES) {
+                    return Err(Refused::Limit(format!("the perspective warp has {n} planes; the most it takes here is {MAX_CONTROLLED_PLANES}")).into());
+                }
+                perspective_surface_controlled(surf, &perspective_params(id, params)?, interp(params), budget, ctl)?
+            }
+        })
+    };
+    matches!(id, LIQUIFY | PUPPET | PUPPET_SMART | PERSPECTIVE | PERSPECTIVE_SMART).then(run)
 }
 
 /// Smart-filter hook: re-applies a stored Liquify / Puppet / Perspective Warp to a rendered

@@ -54,7 +54,7 @@ impl Default for ShadowsHighlights {
 }
 
 mod shadows_highlights;
-pub use shadows_highlights::shadows_highlights;
+pub use shadows_highlights::{shadows_highlights, shadows_highlights_with};
 
 /// Image › Adjustments › Replace Color: Color Range-style selection (fuzziness in 0..=200 levels)
 /// around `color`, then a hue (±180°), saturation and lightness (±100) shift weighted by it.

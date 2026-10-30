@@ -7,6 +7,7 @@
 //! [`photocraft_algo::wideangle`], [`photocraft_algo::camera_raw`].
 
 use photocraft_algo::camera_raw::{self, CameraRaw};
+use photocraft_algo::control::{Budget, Refused};
 use photocraft_algo::exif;
 use photocraft_algo::lens::{self, EdgeMode, LensCorrection};
 use photocraft_algo::transform::Interp;
@@ -14,7 +15,7 @@ use photocraft_algo::wideangle::{self, WideAngle};
 use photocraft_color::{ColorMode, SampleType};
 use photocraft_doc::{Document, Layer, LayerContent, LayerId, SmartFilter};
 use photocraft_geom::Rect;
-use photocraft_raster::{Surface, from_rgba_into};
+use photocraft_raster::{Interrupt, Surface, from_rgba_into};
 use serde_json::{Value, json};
 
 use crate::commands::CommandSpec;
@@ -207,6 +208,70 @@ pub fn camera_raw_surface(surf: &Surface, area: Rect, p: &CameraRaw) -> Surface 
     out
 }
 
+/// Bytes per pixel [`camera_raw_surface_controlled`] budgets on top of the region's own samples
+/// (read and written once each): the RGBA working copy (16) and the full-size planes the Detail
+/// and Tone stages hold at once (a guided filter's means and coefficients, the luminance and
+/// chroma planes: eighteen f32 planes).
+const RAW_WORKING_BYTES_PER_PIXEL: u64 = 16 + 18 * 4;
+
+/// [`camera_raw_surface`] for input nobody vetted ([`photocraft_algo::control`]): the same pixels,
+/// with `ctl` asked between stages and per row inside them, the area held to `budget.max_pixels`
+/// (not [`MAX_RAW_PIXELS`]) and its working memory to `budget.max_bytes`. An area over either is
+/// a [`Refused::Limit`], where the desktop returns the pixels unchanged.
+pub fn camera_raw_surface_controlled(surf: &Surface, area: Rect, p: &CameraRaw, budget: &Budget, ctl: &Interrupt) -> std::result::Result<Surface, Refused> {
+    let area = area.intersect(&surf.content_bounds().union(&area));
+    if area.is_empty() || p.is_identity() {
+        return Ok(surf.clone());
+    }
+    budget.pixels("Camera Raw", f64::from(area.width()), f64::from(area.height()))?;
+    let Some(len) = raw_pixels(area) else {
+        return Err(Refused::Limit(format!("Camera Raw develops at most {MAX_RAW_PIXELS} pixels in one pass")));
+    };
+    let fmt = surf.format();
+    let n = fmt.channels();
+    let per_pixel = RAW_WORKING_BYTES_PER_PIXEL.saturating_add(8 * n as u64);
+    budget.bytes("Camera Raw", (len as u64).saturating_mul(per_pixel))?;
+    let (w, h) = (area.width() as usize, area.height() as usize);
+    // Read and written a band of rows at a time, asking `ctl` between bands: one pass over a
+    // large region is longer than the stages' rows.
+    let bands = |f: &mut dyn FnMut(Rect, std::ops::Range<usize>) -> std::result::Result<(), Refused>| -> std::result::Result<(), Refused> {
+        for y0 in (area.y0..area.y1).step_by(RAW_BAND_ROWS) {
+            if ctl.cancelled() {
+                return Err(Refused::Cancelled);
+            }
+            let band = Rect::new(area.x0, y0, area.x1, y0.saturating_add(RAW_BAND_ROWS as i32).min(area.y1));
+            let at = (y0 - area.y0) as usize * w;
+            f(band, at..at + band.size().area() as usize)?;
+        }
+        Ok(())
+    };
+    let mut px = vec![[0.0f32; 4]; len];
+    bands(&mut |band, rows| {
+        surf.read_rgba_into(band, &mut px[rows]);
+        Ok(())
+    })?;
+    camera_raw::develop_with(&mut px, w, h, p, fmt.sample == SampleType::F32, ctl)?;
+    let mut out = surf.clone();
+    bands(&mut |band, rows| {
+        let orig = surf.read_region(band);
+        let mut data = vec![0.0f32; rows.len() * n];
+        for (i, (q, o)) in px[rows].iter().zip(data.chunks_exact_mut(n)).enumerate() {
+            from_rgba_into(&fmt, *q, o);
+            if fmt.alpha {
+                // Alpha is untouched.
+                o[n - 1] = orig[i * n + n - 1];
+            }
+        }
+        out.write_region(band, &data);
+        Ok(())
+    })?;
+    out.prune();
+    Ok(out)
+}
+
+/// Rows [`camera_raw_surface_controlled`] reads or writes between two interrupt checks: a tile's.
+const RAW_BAND_ROWS: usize = 256;
+
 /// Mixes `new` over `old` by the selection's coverage.
 fn mix_by_selection(old: &Surface, new: &Surface, sel: &Surface) -> Surface {
     let area = old.content_bounds().union(&new.content_bounds());
@@ -249,6 +314,27 @@ pub fn apply_to_surface(id: &str, params: &Value, surf: &Surface, canvas: Rect) 
         RAW => Some(camera_raw_surface(surf, canvas, &raw_params(id, params).ok()?)),
         _ => None,
     }
+}
+
+/// [`apply_to_surface`] for input nobody vetted ([`photocraft_algo::control`]): the same pixels
+/// within `budget`, cancellable within one tile, row or solver iteration. Malformed params are an
+/// error here rather than `None`. `None` for other ids.
+pub fn apply_to_surface_controlled(
+    id: &str,
+    params: &Value,
+    surf: &Surface,
+    canvas: Rect,
+    budget: &Budget,
+    ctl: &Interrupt,
+) -> Option<std::result::Result<Surface, crate::filters::FilterRefused>> {
+    let run = || -> std::result::Result<Surface, crate::filters::FilterRefused> {
+        Ok(match id {
+            LENS => lens::correct_controlled(surf, canvas, &lens_params(id, params, canvas, None)?, budget, ctl)?,
+            WIDE => wideangle::apply_controlled(surf, canvas, &wide_params(id, params, None)?, Interp::Bicubic, budget, ctl)?,
+            _ => camera_raw_surface_controlled(surf, canvas, &raw_params(id, params)?, budget, ctl)?,
+        })
+    };
+    matches!(id, LENS | WIDE | RAW).then(run)
 }
 
 // ---------- commands ----------

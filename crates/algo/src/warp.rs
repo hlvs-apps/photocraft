@@ -18,6 +18,7 @@ use photocraft_geom::{Rect, TileCoord};
 use photocraft_raster::{Interrupt, Surface, Tile};
 use std::sync::Arc;
 
+use crate::control::{Budget, Refused};
 use crate::transform::{Interp, bicubic};
 
 /// Grid cell size (source px) used to approximate the map.
@@ -84,11 +85,42 @@ pub fn warp_mesh_surface_with(src: &Surface, src_rect: Rect, f: &(dyn Fn(f64, f6
     (!ctl.cancelled()).then_some(out)
 }
 
+/// [`warp_mesh_surface`] for input nobody vetted ([`crate::control`]): the map is evaluated with
+/// `ctl` asked per grid row, and the warped bounds, the triangles' raster work, their binning and
+/// each destination tile's source window are held to `budget`. Past one of them it is a
+/// [`Refused::Limit`] where the desktop draws nothing (or leaves a tile empty).
+pub fn warp_mesh_surface_controlled(
+    src: &Surface,
+    src_rect: Rect,
+    f: &(dyn Fn(f64, f64) -> (f64, f64) + Sync),
+    interp: Interp,
+    budget: &Budget,
+    ctl: &Interrupt,
+) -> Result<Surface, Refused> {
+    if src_rect.is_empty() {
+        let fmt = src.format();
+        return Ok(Surface::new(PixelFormat::new(fmt.mode, fmt.sample, true)));
+    }
+    let (verts, tris) = mesh_grid(src_rect, f, ctl).ok_or(Refused::Cancelled)?;
+    triangles_in(src, src_rect, &verts, &tris, interp, ctl, Some(budget))
+}
+
 fn mesh(src: &Surface, src_rect: Rect, f: &(dyn Fn(f64, f64) -> (f64, f64) + Sync), interp: Interp, ctl: &Interrupt) -> Surface {
     if src_rect.is_empty() {
         let fmt = src.format();
         return Surface::new(PixelFormat::new(fmt.mode, fmt.sample, true));
     }
+    match mesh_grid(src_rect, f, ctl) {
+        Some((verts, tris)) => triangles(src, src_rect, &verts, &tris, interp, ctl),
+        None => Surface::new(PixelFormat::new(src.format().mode, src.format().sample, true)),
+    }
+}
+
+/// The forward-mapped grid over `src_rect` (non-empty): `(destination, source)` per vertex and
+/// two triangles per cell. `None` once `ctl` is cancelled (asked per row of vertices: the map can
+/// be costly, a perspective warp looks up its plane for every vertex).
+#[allow(clippy::type_complexity)]
+fn mesh_grid(src_rect: Rect, f: &(dyn Fn(f64, f64) -> (f64, f64) + Sync), ctl: &Interrupt) -> Option<(Vec<([f64; 2], [f64; 2])>, Vec<[usize; 3]>)> {
     let (sw, sh) = (f64::from(src_rect.width()), f64::from(src_rect.height()));
     // Cells are a few pixels across on both sides of the map: a thin source stretched far (a
     // 3 px column scaled into a wide band, then bent) needs many cells, or it comes out straight.
@@ -98,6 +130,9 @@ fn mesh(src: &Surface, src_rect: Rect, f: &(dyn Fn(f64, f64) -> (f64, f64) + Syn
     // Forward-mapped vertices (and their source positions).
     let mut verts = Vec::with_capacity((nx + 1) * (ny + 1));
     for j in 0..=ny {
+        if ctl.cancelled() {
+            return None;
+        }
         for i in 0..=nx {
             let sx = f64::from(src_rect.x0) + sw * i as f64 / nx as f64;
             let sy = f64::from(src_rect.y0) + sh * j as f64 / ny as f64;
@@ -114,7 +149,7 @@ fn mesh(src: &Surface, src_rect: Rect, f: &(dyn Fn(f64, f64) -> (f64, f64) + Syn
             tris.push([a, a + w1 + 1, a + w1]);
         }
     }
-    triangles(src, src_rect, &verts, &tris, interp, ctl)
+    Some((verts, tris))
 }
 
 /// Probe lines per axis [`mapped_lengths`] follows through the map.
@@ -162,14 +197,58 @@ pub fn warp_triangles(src: &Surface, src_rect: Rect, verts: &[([f64; 2], [f64; 2
     triangles(src, src_rect, verts, tris, interp, &Interrupt::NONE)
 }
 
-/// [`warp_triangles`], reporting progress per destination tile to `ctl`. A cancelled `ctl` skips
-/// the remaining tiles; the caller discards the result.
+/// [`warp_triangles`] for input nobody vetted ([`crate::control`]): the destination bounds are at
+/// most `budget.max_pixels`; the pixels the triangles' bounding boxes cover (the rasteriser's
+/// tests, folds counted again) at most `budget.max_work`; their per-tile bookkeeping and every
+/// worker's source window together at most `budget.max_bytes`. A non-finite vertex, a budget or a
+/// tile whose source window is over its share is a [`Refused::Limit`] (the desktop draws
+/// nothing, or leaves the tile empty); `ctl` is asked per destination tile.
+pub fn warp_triangles_controlled(
+    src: &Surface,
+    src_rect: Rect,
+    verts: &[([f64; 2], [f64; 2])],
+    tris: &[[usize; 3]],
+    interp: Interp,
+    budget: &Budget,
+    ctl: &Interrupt,
+) -> Result<Surface, Refused> {
+    triangles_in(src, src_rect, verts, tris, interp, ctl, Some(budget))
+}
+
 /// Destination tiles one triangle render may keep bookkeeping for (a 1M-tile render is 69 Gpx).
 const MAX_DST_TILES: u64 = 1 << 20;
 /// Source pixels one destination tile may read densely.
 const MAX_FOOTPRINT_PIXELS: u64 = 1 << 25;
 
+/// [`warp_triangles`], reporting progress per destination tile to `ctl`. A cancelled `ctl` skips
+/// the remaining tiles; the caller discards the result.
 fn triangles(src: &Surface, src_rect: Rect, verts: &[([f64; 2], [f64; 2])], tris: &[[usize; 3]], interp: Interp, ctl: &Interrupt) -> Surface {
+    match triangles_in(src, src_rect, verts, tris, interp, ctl, None) {
+        Ok(out) => out,
+        // Without a budget nothing is refused; keep the empty result regardless.
+        Err(_) => Surface::new(PixelFormat::new(src.format().mode, src.format().sample, true)),
+    }
+}
+
+/// [`triangles`], and with a `budget` [`warp_triangles_controlled`]: `Err` only then.
+#[allow(clippy::too_many_arguments)]
+fn triangles_in(
+    src: &Surface,
+    src_rect: Rect,
+    verts: &[([f64; 2], [f64; 2])],
+    tris: &[[usize; 3]],
+    interp: Interp,
+    ctl: &Interrupt,
+    budget: Option<&Budget>,
+) -> Result<Surface, Refused> {
+    let limit = |m: &str| Refused::Limit(m.to_string());
+    if let Some(b) = budget {
+        // The pixels the source reads and the alpha copy of an opaque one.
+        let sb = src.content_bounds().intersect(&src_rect);
+        let n = src.format().channels() + usize::from(!src.format().alpha);
+        b.bytes("the warp's source", crate::control::f32_bytes(sb.size().area(), n))?;
+        crate::control::check(ctl)?;
+    }
     let mut fmt = src.format();
     let converted;
     let src = if fmt.alpha {
@@ -181,10 +260,16 @@ fn triangles(src: &Surface, src_rect: Rect, verts: &[([f64; 2], [f64; 2])], tris
     };
     let mut out = Surface::new(fmt);
     if src_rect.is_empty() || tris.is_empty() {
-        return out;
+        return Ok(out);
+    }
+    if budget.is_some() && tris.iter().flatten().any(|&i| i >= verts.len()) {
+        return Err(limit("a warp triangle names a vertex the mesh does not have"));
     }
     if verts.iter().any(|v| !v.0[0].is_finite() || !v.0[1].is_finite()) {
-        return out;
+        return match budget {
+            Some(_) => Err(limit("the warp maps part of the surface to infinity")),
+            None => Ok(out),
+        };
     }
     let lim = f64::from(1 << 20);
     let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
@@ -194,13 +279,53 @@ fn triangles(src: &Surface, src_rect: Rect, verts: &[([f64; 2], [f64; 2])], tris
         x1 = x1.max(v.0[0]);
         y1 = y1.max(v.0[1]);
     }
+    if let Some(b) = budget {
+        b.pixels("the warped surface", x1 - x0 + 3.0, y1 - y0 + 3.0)?;
+    }
     let dst = Rect::new(x0.max(-lim).floor() as i32 - 1, y0.max(-lim).floor() as i32 - 1, x1.min(lim).ceil() as i32 + 1, y1.min(lim).ceil() as i32 + 1);
     // Bookkeeping is kept per destination tile, so a mesh flung across the whole coordinate range
     // would ask for millions of entries before drawing anything: draw nothing instead.
     let ts_px = photocraft_geom::TILE_SIZE as u64;
     if u64::from(dst.width()).div_ceil(ts_px).saturating_add(1).saturating_mul(u64::from(dst.height()).div_ceil(ts_px).saturating_add(1)) > MAX_DST_TILES {
-        return out;
+        return match budget {
+            Some(_) => Err(limit("the warped surface spans too many tiles")),
+            None => Ok(out),
+        };
     }
+    // Each worker's dense source window: its share of the byte budget (the desktop's own cap is
+    // per tile, whatever the pool).
+    let max_footprint = match budget {
+        Some(b) => {
+            // Per triangle: the pixels its box tests and the tiles it is binned into.
+            let (mut tested, mut binned) = (0u64, 0u64);
+            let ts = f64::from(photocraft_geom::TILE_SIZE);
+            let (dx0, dy0, dx1, dy1) = (f64::from(dst.x0), f64::from(dst.y0), f64::from(dst.x1), f64::from(dst.y1));
+            for tri in tris {
+                let ps = tri.map(|v| verts[v].0);
+                let bx0 = ps.iter().map(|p| p[0]).fold(f64::MAX, f64::min).floor().max(dx0);
+                let by0 = ps.iter().map(|p| p[1]).fold(f64::MAX, f64::min).floor().max(dy0);
+                let bx1 = ps.iter().map(|p| p[0]).fold(f64::MIN, f64::max).ceil().min(dx1);
+                let by1 = ps.iter().map(|p| p[1]).fold(f64::MIN, f64::max).ceil().min(dy1);
+                if bx1 > bx0 && by1 > by0 {
+                    tested = tested.saturating_add(((bx1 - bx0) * (by1 - by0)) as u64);
+                    binned = binned.saturating_add((((bx1 - bx0) / ts).ceil() as u64 + 1).saturating_mul(((by1 - by0) / ts).ceil() as u64 + 1));
+                }
+            }
+            b.work("drawing the warp's triangles", tested)?;
+            let workers = crate::control::workers();
+            let n = fmt.channels();
+            // Bins, and every worker's per-pixel source position and owner.
+            let fixed = binned
+                .saturating_mul(std::mem::size_of::<[usize; 3]>() as u64)
+                .saturating_add(workers.saturating_mul((ts_px * ts_px).saturating_mul(std::mem::size_of::<[f64; 2]>() as u64 + 4 + 4 * n as u64)));
+            b.bytes("the warp's bookkeeping", fixed)?;
+            let share = (b.max_bytes - fixed) / workers / (4 * n as u64).max(1);
+            crate::control::check(ctl)?;
+            share.min(MAX_FOOTPRINT_PIXELS)
+        }
+        None => MAX_FOOTPRINT_PIXELS,
+    };
+    let over = std::sync::atomic::AtomicBool::new(false);
     // Triangles: (vertex indices), binned per destination tile.
     let tiles: Vec<Rect> = dst.tiles().map(|tc| tc.rect().intersect(&dst)).filter(|r| !r.is_empty()).collect();
     let mut bins: Vec<Vec<[usize; 3]>> = vec![Vec::new(); tiles.len()];
@@ -319,7 +444,14 @@ fn triangles(src: &Surface, src_rect: Rect, verts: &[([f64; 2], [f64; 2])], tris
         // between them is not read (the tile stays empty). The pixel-area cap is checked first:
         // `has_tiles_in` walks the source tile grid, so an oversized footprint must return
         // without paying for that scan.
-        if foot.is_empty() || foot.size().area() > MAX_FOOTPRINT_PIXELS || !src.has_tiles_in(foot) {
+        if foot.is_empty() {
+            return None;
+        }
+        if foot.size().area() > max_footprint {
+            over.store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        if !src.has_tiles_in(foot) {
             return None;
         }
         let mut px = src.read_region(foot);
@@ -472,10 +604,16 @@ fn triangles(src: &Surface, src_rect: Rect, verts: &[([f64; 2], [f64; 2])], tris
     #[cfg(target_arch = "wasm32")]
     let done: Vec<(TileCoord, Arc<Tile>)> = tiles.iter().zip(bins.iter()).filter_map(work).collect();
     if ctl.cancelled() {
-        return out;
+        return match budget {
+            Some(_) => Err(Refused::Cancelled),
+            None => Ok(out),
+        };
+    }
+    if budget.is_some() && over.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(Refused::Limit(format!("a tile of the warp reads a source window of more than {max_footprint} pixels (its share of the memory budget)")));
     }
     out.put_tiles(done);
-    out
+    Ok(out)
 }
 
 /// [`warp_mesh_surface`] for single-channel surfaces whose outside reads as their default value

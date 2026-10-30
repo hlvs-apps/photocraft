@@ -19,8 +19,14 @@
 //!   transform of the source box, or of a warp's control hull, which holds the warped surface), so
 //!   a placement larger than [`BakeOptions::max_pixels`] is refused, not attempted.
 //! * **Cancellable.** The interrupt is checked between stages, per tile inside placement and inside
-//!   the tiled pixel filters and Liquify strokes. Puppet and Perspective Warp, Lens Correction, Adaptive Wide
-//!   Angle, Camera Raw and adjustments run as one unit each, bounded by the budgets above.
+//!   the tiled pixel filters. The special kernels run their controlled twins
+//!   ([`crate::filters::apply_filter_to_surface_controlled`]): Liquify per dab and tile batch,
+//!   Puppet and Perspective Warp per mesh step, solver iteration and destination tile, Lens
+//!   Correction per tile, Adaptive Wide Angle per solver iteration and tile, Camera Raw and
+//!   Shadows/Highlights per stage and row, the other adjustments per tile. Their output, working
+//!   memory and solver work are held to [`BakeOptions::max_pixels`],
+//!   [`BakeOptions::max_filter_bytes`] and [`BakeOptions::max_work`]; past them a filter is a
+//!   [`BakeError::Limit`], never the unfiltered pixels.
 //! * **No caches.** Nothing is read from or written to the decoded-source or stage caches.
 //! * **The filter switch is ignored.** The bake point says which filters run; a host keeps the
 //!   stack's on/off state itself.
@@ -54,6 +60,10 @@ pub struct BakeOptions<'a> {
     pub max_stack_bytes: u64,
     /// Estimated pixel buffers and concurrent filter source windows.
     pub max_filter_bytes: u64,
+    /// Most solver and geometry steps one filter may take (puppet and wide-angle solvers, mesh
+    /// warps' triangles, plane lookups), in inner-loop steps; see
+    /// [`photocraft_algo::control::Budget::max_work`].
+    pub max_work: u64,
 }
 
 /// What [`bake_below_filter`] made, in document pixels at the document's pixel format.
@@ -171,14 +181,15 @@ pub fn bake_below_filter(doc: &Document, sm: &SmartObject, upto: usize, opts: &B
     for f in filters {
         check(ctl)?;
         let bounds = if renders_in_object(f) { *object_bounds.get_or_insert_with(|| filter_bounds(f, &original, canvas)) } else { canvas };
-        cur = apply(f, &cur, bounds, extent, opts.max_filter_bytes, ctl)?;
+        cur = apply(f, &cur, bounds, extent, opts, ctl)?;
     }
     check(ctl)?;
     Ok(Baked { original, filtered: cur })
 }
 
 /// One visible filter over `cur`, blended by its mode and opacity (as the editor's re-render).
-fn apply(f: &SmartFilter, cur: &Surface, bounds: Rect, extent: Rect, max_bytes: u64, ctl: &Interrupt<'_>) -> Result<Surface, BakeError> {
+fn apply(f: &SmartFilter, cur: &Surface, bounds: Rect, extent: Rect, opts: &BakeOptions<'_>, ctl: &Interrupt<'_>) -> Result<Surface, BakeError> {
+    let max_bytes = opts.max_filter_bytes;
     // The algorithm's own source-window limit is per worker, not per bake. Account for
     // the caller's pool before it allocates windows (a large halo can exceed the canvas).
     let pixels = area(extent);
@@ -223,20 +234,18 @@ fn apply(f: &SmartFilter, cur: &Surface, bounds: Rect, extent: Rect, max_bytes: 
         }
         _ => {}
     }
-    let out = if f.command == crate::distort_cmds::LIQUIFY {
-        let (strokes, cell) = crate::distort_cmds::liquify_params(&f.command, &f.params, extent)?;
-        let field = photocraft_algo::liquify::LiquifyField::from_strokes_with(extent, cell, &strokes, ctl).ok_or(BakeError::Cancelled)?;
-        photocraft_algo::liquify::apply_liquify_with(cur, &field, ctl).ok_or(BakeError::Cancelled)?
-    } else {
-        match crate::filters::apply_filter_to_surface_with(&f.command, &f.params, cur, bounds, None, extent, ctl) {
-            Ok(Some(out)) => out,
-            // A registered command is not necessarily a renderable smart filter.
-            Ok(None) => return Err(BakeError::Refused(format!("photocraft cannot apply {} as a smart filter", f.command))),
-            Err(FilterRefused::NotApplied) => {
-                return Err(BakeError::Limit(format!("the smart filter {} did not run: its geometry or working memory was refused", f.command)));
-            }
-            Err(FilterRefused::Engine(e)) => return Err(e.into()),
+    // The special kernels hold their own buffers on top of what the estimate above reserves for
+    // the bake's surfaces; they get what it leaves.
+    let budget = photocraft_algo::control::Budget { max_pixels: opts.max_pixels, max_bytes: max_bytes - working, max_work: opts.max_work };
+    let out = match crate::filters::apply_filter_to_surface_controlled(&f.command, &f.params, cur, bounds, None, extent, &budget, ctl) {
+        Ok(Some(out)) => out,
+        // A registered command is not necessarily a renderable smart filter.
+        Ok(None) => return Err(BakeError::Refused(format!("photocraft cannot apply {} as a smart filter", f.command))),
+        Err(FilterRefused::NotApplied) => {
+            return Err(BakeError::Limit(format!("the smart filter {} did not run: its geometry or working memory was refused", f.command)));
         }
+        Err(FilterRefused::Limit(m)) => return Err(BakeError::Limit(format!("the smart filter {}: {m}", f.command))),
+        Err(FilterRefused::Engine(e)) => return Err(e.into()),
     };
     Ok(if f.blend == BlendMode::Normal && f.opacity >= 1.0 { out } else { blend_surfaces(cur, &out, f.blend, f.opacity.clamp(0.0, 1.0)) })
 }

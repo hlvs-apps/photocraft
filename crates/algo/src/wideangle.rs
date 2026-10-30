@@ -19,9 +19,10 @@
 //! rendered by textured triangles ([`crate::warp::warp_triangles`]).
 
 use photocraft_geom::Rect;
-use photocraft_raster::Surface;
+use photocraft_raster::{Interrupt, Surface};
 use serde::{Deserialize, Serialize};
 
+use crate::control::{Budget, Refused, check};
 use crate::photo_util::SparseLs;
 use crate::transform::Interp;
 
@@ -236,6 +237,19 @@ impl WideMesh {
 
 /// Solves the content-preserving warp for `p` over `frame`.
 pub fn solve(p: &WideAngle, frame: Rect) -> WideMesh {
+    match solve_in(p, frame, &Interrupt::NONE, None) {
+        Ok(mesh) => mesh,
+        // Nothing refuses without a budget or an interrupt.
+        Err(_) => WideMesh { nx: 0, ny: 0, verts: Vec::new(), curves: Vec::new(), residual: 0.0 },
+    }
+}
+
+/// Most CGLS iterations [`solve`] runs over its rounds (400, 600, 800 and 1000).
+const SOLVE_ITERATIONS: u64 = 2800;
+
+/// [`solve`] asking `ctl` per constraint curve and per solver iteration; with a `budget`, the
+/// solver's iterations over its rows are held to its work.
+fn solve_in(p: &WideAngle, frame: Rect, ctl: &Interrupt, budget: Option<&Budget>) -> Result<WideMesh, Refused> {
     let cam = Camera::new(p, frame);
     let (fw, fh) = (frame.width().max(1) as f64, frame.height().max(1) as f64);
     let cells = 48.0;
@@ -246,7 +260,15 @@ pub fn solve(p: &WideAngle, frame: Rect) -> WideMesh {
     let w1 = nx + 1;
     let nv = w1 * (ny + 1);
     let src: Vec<[f64; 2]> = (0..nv).map(|k| [frame.x0 as f64 + (k % w1) as f64 * cw, frame.y0 as f64 + (k / w1) as f64 * ch]).collect();
-    let curves: Vec<Vec<[f64; 2]>> = p.constraints.iter().map(|c| cam.arc(c.a, c.b, 24)).collect();
+    if let Some(b) = budget {
+        // Each constraint adds 24 rows of 16 entries, read twice per iteration.
+        b.work("the wide-angle constraints", (p.constraints.len() as u64).saturating_mul(24 * 16 * 2).saturating_mul(SOLVE_ITERATIONS))?;
+    }
+    let mut curves: Vec<Vec<[f64; 2]>> = Vec::with_capacity(p.constraints.len());
+    for c in &p.constraints {
+        check(ctl)?;
+        curves.push(cam.arc(c.a, c.b, 24));
+    }
     let mut x: Vec<f64> = src.iter().flat_map(|s| [s[0], s[1]]).collect();
     // Bilinear weights of a source point in the grid.
     let weights = |q: [f64; 2]| -> [(usize, f64); 4] {
@@ -320,7 +342,11 @@ pub fn solve(p: &WideAngle, frame: Rect) -> WideMesh {
                     ls.add(row, 0.0, 10.0);
                 }
             }
-            x = ls.solve(&x, 400 + 200 * round);
+            if let Some(b) = budget {
+                b.work("the wide-angle solver", ls.entries().saturating_mul(2).saturating_mul(SOLVE_ITERATIONS))?;
+            }
+            check(ctl)?;
+            x = ls.solve_in(&x, 400 + 200 * round, ctl).ok_or(Refused::Cancelled)?;
             // Re-estimate free normals from the current end points.
             let pos = |q: [f64; 2]| -> [f64; 2] { weights(q).iter().fold([0.0, 0.0], |acc, &(i, w)| [acc[0] + w * x[2 * i], acc[1] + w * x[2 * i + 1]]) };
             let mut changed = false;
@@ -364,7 +390,7 @@ pub fn solve(p: &WideAngle, frame: Rect) -> WideMesh {
         let _ = k;
     }
     mesh.residual = worst;
-    mesh
+    Ok(mesh)
 }
 
 /// Applies Adaptive Wide Angle to `src` over `frame` (pixels outside the warped image become
@@ -373,6 +399,18 @@ pub fn apply(src: &Surface, frame: Rect, p: &WideAngle, interp: Interp) -> Surfa
     let mesh = solve(p, frame);
     let tris = mesh.triangles();
     crate::warp::warp_triangles(src, frame, &mesh.verts, &tris, interp)
+}
+
+/// [`apply`] for input nobody vetted ([`crate::control`]): the same pixels, with `ctl` asked per
+/// constraint and solver iteration and per destination tile, the solver held to `budget.max_work`
+/// and the warped image to the budget's pixels, work and bytes
+/// ([`crate::warp::warp_triangles_controlled`]); a scale or constraints that throw the mesh far
+/// is a [`Refused::Limit`] rather than an image of that size.
+pub fn apply_controlled(src: &Surface, frame: Rect, p: &WideAngle, interp: Interp, budget: &Budget, ctl: &Interrupt) -> Result<Surface, Refused> {
+    check(ctl)?;
+    let mesh = solve_in(p, frame, ctl, Some(budget))?;
+    let tris = mesh.triangles();
+    crate::warp::warp_triangles_controlled(src, frame, &mesh.verts, &tris, interp, budget, ctl)
 }
 
 #[cfg(test)]

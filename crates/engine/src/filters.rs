@@ -189,7 +189,7 @@ pub fn apply_filter_to_surface(
     match out {
         // Without an interrupt a pixel filter that cannot run (its geometry or working memory
         // refused) leaves the pixels alone, as it always has.
-        Err(FilterRefused::NotApplied) => Ok(Some(surf.clone())),
+        Err(FilterRefused::NotApplied | FilterRefused::Limit(_)) => Ok(Some(surf.clone())),
         Err(FilterRefused::Engine(e)) => Err(e),
         Ok(out) => Ok(out),
     }
@@ -202,11 +202,23 @@ pub enum FilterRefused {
     Engine(EngineError),
     /// A pixel filter's geometry or working memory was refused, so it did not run.
     NotApplied,
+    /// A controlled kernel's budget refused the work ([`apply_filter_to_surface_controlled`]);
+    /// the message says which.
+    Limit(String),
 }
 
 impl From<EngineError> for FilterRefused {
     fn from(e: EngineError) -> Self {
         Self::Engine(e)
+    }
+}
+
+impl From<photocraft_algo::control::Refused> for FilterRefused {
+    fn from(r: photocraft_algo::control::Refused) -> Self {
+        match r {
+            photocraft_algo::control::Refused::Cancelled => Self::Engine(EngineError::Cancelled),
+            photocraft_algo::control::Refused::Limit(m) => Self::Limit(m),
+        }
     }
 }
 
@@ -226,11 +238,37 @@ pub fn apply_filter_to_surface_with(
 ) -> std::result::Result<Option<photocraft_raster::Surface>, FilterRefused> {
     let check = || if ctl.cancelled() { Err(FilterRefused::Engine(EngineError::Cancelled)) } else { Ok(()) };
     check()?;
-    let out = apply_one(id, params, surf, bounds, selection, canvas, ctl)?;
+    let out = apply_one(id, params, surf, bounds, selection, canvas, ctl, None)?;
     check()?;
     Ok(out)
 }
 
+/// [`apply_filter_to_surface_with`] for input nobody vetted (a server baking an upload's smart
+/// filters, [`photocraft_algo::control`]). The special kernels run their controlled twins: Liquify,
+/// Puppet and Perspective Warp, Lens Correction, Adaptive Wide Angle, Camera Raw and adjustments
+/// ask `ctl` per dab, mesh or solver step, row or tile, and hold their output, working memory and
+/// solver work to `budget`; past it they return [`FilterRefused::Limit`] where the desktop leaves
+/// the pixels alone or runs unbounded. Their malformed params are an `Err` rather than `Ok(None)`.
+/// The pixel filters behave as in [`apply_filter_to_surface_with`].
+#[allow(clippy::too_many_arguments)]
+pub fn apply_filter_to_surface_controlled(
+    id: &str,
+    params: &Value,
+    surf: &photocraft_raster::Surface,
+    bounds: photocraft_geom::Rect,
+    selection: Option<&photocraft_raster::Surface>,
+    canvas: photocraft_geom::Rect,
+    budget: &photocraft_algo::control::Budget,
+    ctl: &photocraft_raster::Interrupt,
+) -> std::result::Result<Option<photocraft_raster::Surface>, FilterRefused> {
+    let check = || if ctl.cancelled() { Err(FilterRefused::Engine(EngineError::Cancelled)) } else { Ok(()) };
+    check()?;
+    let out = apply_one(id, params, surf, bounds, selection, canvas, ctl, Some(budget))?;
+    check()?;
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_one(
     id: &str,
     params: &Value,
@@ -239,10 +277,22 @@ fn apply_one(
     selection: Option<&photocraft_raster::Surface>,
     canvas: photocraft_geom::Rect,
     ctl: &photocraft_raster::Interrupt,
+    budget: Option<&photocraft_algo::control::Budget>,
 ) -> std::result::Result<Option<photocraft_raster::Surface>, FilterRefused> {
     // Replays bypass command dispatch; nested paths must still obey the requesting session's
     // authority, including adjustment LUTs and plug-ins, before any resolver can read them.
     crate::jobs::authorize_render_command(id, params)?;
+    if let Some(budget) = budget {
+        if let Some(out) = crate::distort_cmds::apply_to_surface_controlled(id, params, surf, canvas, budget, ctl) {
+            return out.map(Some);
+        }
+        if let Some(out) = crate::lens_cmds::apply_to_surface_controlled(id, params, surf, canvas, budget, ctl) {
+            return out.map(Some);
+        }
+        if let Some(kind) = id.strip_prefix("image.adjustments.") {
+            return Ok(crate::adjust_cmds::adjust_as_filter_controlled(kind, params, surf, budget, ctl)?);
+        }
+    }
     // Liquify / Puppet Warp / Perspective Warp smart filters (distort_cmds).
     if let Some(out) = crate::distort_cmds::apply_to_surface(id, params, surf, canvas) {
         return Ok(Some(out));

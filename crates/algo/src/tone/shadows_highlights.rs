@@ -18,8 +18,9 @@
 //!   1 + h · ΔY / max Y for negative ones) and shortened where they would leave the gamut.
 //! - **Midtone** is a global S-curve on the luma, k · (Y − ½) · (4Y(1 − Y))^p.
 
-use crate::fxutil::gauss_blur_n;
-use crate::photo_util::par_rows;
+use crate::fxutil::gauss_blur_n_with;
+use crate::photo_util::par_rows_ctl;
+use photocraft_raster::{Cancelled, Interrupt};
 
 use super::ShadowsHighlights;
 
@@ -39,9 +40,9 @@ const RANGE: f32 = 1.0152;
 const LEVELS: usize = 17;
 
 /// Edge-aware neighbourhood brightness of `lum` (`w × h`) for Photoshop's Radius.
-fn neighbourhood(lum: &[f32], w: usize, h: usize, radius: f32) -> Vec<f32> {
+fn neighbourhood(lum: &[f32], w: usize, h: usize, radius: f32, ctl: &Interrupt) -> Vec<f32> {
     let mut guide = lum.to_vec();
-    gauss_blur_n(&mut guide, w, h, 1, GUIDE);
+    gauss_blur_n_with(&mut guide, w, h, 1, GUIDE, ctl);
     let sigma = SPATIAL * radius;
     if sigma < 0.3 {
         return guide;
@@ -56,6 +57,9 @@ fn neighbourhood(lum: &[f32], w: usize, h: usize, radius: f32) -> Vec<f32> {
     let mut avg = vec![0.0f32; LEVELS * cells];
     let mut buf = vec![0.0f32; 2 * cells];
     for (k, out) in avg.chunks_exact_mut(cells).enumerate() {
+        if ctl.cancelled() {
+            break;
+        }
         let g = k as f32 * step;
         buf.fill(0.0);
         for (i, &l) in lum.iter().enumerate() {
@@ -64,13 +68,16 @@ fn neighbourhood(lum: &[f32], w: usize, h: usize, radius: f32) -> Vec<f32> {
             buf[c] += wgt * l;
             buf[c + 1] += wgt;
         }
-        gauss_blur_n(&mut buf, rw, rh, 2, sigma / d as f32);
+        if ctl.cancelled() {
+            break;
+        }
+        gauss_blur_n_with(&mut buf, rw, rh, 2, sigma / d as f32, ctl);
         for (o, b) in out.iter_mut().zip(buf.as_chunks::<2>().0) {
             *o = if b[1] > 1e-6 { b[0] / b[1] } else { g };
         }
     }
     let mut out = vec![0.0f32; lum.len()];
-    par_rows(&mut out, w, 1, |y, row| {
+    par_rows_ctl(&mut out, w, 1, ctl, |y, row| {
         let fy = ((y as f32 + 0.5) / d as f32 - 0.5).clamp(0.0, (rh - 1) as f32);
         let (y0, ty) = (fy.floor() as usize, fy.fract());
         let y1 = (y0 + 1).min(rh - 1);
@@ -223,21 +230,38 @@ fn level(v: f32) -> usize {
 
 /// Image › Adjustments › Shadows/Highlights on straight RGBA `w × h`.
 pub fn shadows_highlights(px: &mut [[f32; 4]], w: usize, h: usize, p: &ShadowsHighlights) {
+    shadows_highlights_in(px, w, h, p, &Interrupt::NONE);
+}
+
+/// [`shadows_highlights`] asking `ctl` per brightness level of the neighbourhood averages and
+/// per row of the passes over the image. `Err(Cancelled)` leaves `px` partly adjusted; drop it.
+pub fn shadows_highlights_with(px: &mut [[f32; 4]], w: usize, h: usize, p: &ShadowsHighlights, ctl: &Interrupt) -> Result<(), Cancelled> {
+    shadows_highlights_in(px, w, h, p, ctl);
+    ctl.check()
+}
+
+fn shadows_highlights_in(px: &mut [[f32; 4]], w: usize, h: usize, p: &ShadowsHighlights, ctl: &Interrupt) {
     if px.is_empty() || px.len() != w * h {
         return;
     }
     let (sa, ha) = (p.shadow_amount, p.highlight_amount);
     let lum: Vec<f32> = px.iter().map(|q| (q[0].max(q[1]).max(q[2]) + luma([q[0], q[1], q[2]])) / 2.0).collect();
-    let ls = (sa > 0.0).then(|| neighbourhood(&lum, w, h, p.shadow_radius));
+    if ctl.cancelled() {
+        return;
+    }
+    let ls = (sa > 0.0).then(|| neighbourhood(&lum, w, h, p.shadow_radius, ctl));
     let lh = (ha > 0.0).then(|| match &ls {
         Some(l) if (p.highlight_radius - p.shadow_radius).abs() < 1e-3 => l.clone(),
-        _ => neighbourhood(&lum, w, h, p.highlight_radius),
+        _ => neighbourhood(&lum, w, h, p.highlight_radius, ctl),
     });
+    if ctl.cancelled() {
+        return;
+    }
     let (ms, mh) = (tonal_mask(p.shadow_tone), tonal_mask(p.highlight_tone));
     let (ss, hs) = (strength(sa), strength(ha));
     // The new luma of every pixel.
     let mut y2 = vec![0.0f32; px.len()];
-    par_rows(&mut y2, w, 1, |y, row| {
+    par_rows_ctl(&mut y2, w, 1, ctl, |y, row| {
         for (x, out) in row.iter_mut().enumerate() {
             let i = y * w + x;
             let q = px[i];
@@ -257,11 +281,14 @@ pub fn shadows_highlights(px: &mut [[f32; 4]], w: usize, h: usize, p: &ShadowsHi
             *out = midtone(p.midtone, luma(adj).clamp(0.0, 1.0));
         }
     });
+    if ctl.cancelled() {
+        return;
+    }
     clip_levels(&mut y2, px, p.black_clip, p.white_clip);
     let gain = |f: f32| {
         if p.color >= 0.0 { (interp(&COLOR_UP, p.color) * f).exp() } else { 1.0 + interp(&COLOR_DOWN, -p.color) * f }
     };
-    par_rows(px, w, 1, |y, row| {
+    par_rows_ctl(px, w, 1, ctl, |y, row| {
         for (x, q) in row.iter_mut().enumerate() {
             if q[3] <= 0.0 {
                 continue;

@@ -377,6 +377,79 @@ pub(crate) fn adjust_as_filter(kind: &str, p: &Value, surf: &Surface) -> Option<
     Some(out)
 }
 
+/// Bytes per pixel Shadows/Highlights holds besides the region's samples (read, then mixed back):
+/// the RGBA working copy and the original (16 each), the luminance, its neighbourhood averages
+/// and the new luma (f32 planes).
+const SHADOWS_HIGHLIGHTS_BYTES_PER_PIXEL: u64 = 32 + 6 * 4;
+
+/// [`adjust_as_filter`] for input nobody vetted ([`photocraft_algo::control`]): the same pixels,
+/// with `ctl` asked per tile (per row and brightness level for Shadows/Highlights, which reads
+/// the whole region at once and is held to `budget`). `Ok(None)` where [`adjust_as_filter`] is
+/// `None`.
+pub(crate) fn adjust_as_filter_controlled(
+    kind: &str,
+    p: &Value,
+    surf: &Surface,
+    budget: &photocraft_algo::control::Budget,
+    ctl: &photocraft_raster::Interrupt,
+) -> std::result::Result<Option<Surface>, photocraft_algo::control::Refused> {
+    use photocraft_algo::control::Refused;
+    // A Color Lookup filter re-reads its LUT `file` as `adjust_as_filter` does (and the bake's
+    // authority refuses it before this runs).
+    let resolved;
+    let p = match p.get("file").and_then(Value::as_str).filter(|f| kind == "colorLookup" && !f.is_empty()) {
+        Some(file) => {
+            let Some(path) = crate::doc_path::resolve(file).ok().and_then(|p| p.to_str().map(str::to_string)) else { return Ok(None) };
+            let mut q = p.clone();
+            q["file"] = json!(path);
+            resolved = q;
+            &resolved
+        }
+        None => p,
+    };
+    let mut out = surf.clone();
+    if kind == "shadowsHighlights" {
+        let sh = shadows_highlights_params(p);
+        let r = surf.content_bounds();
+        if !r.is_empty() {
+            budget.pixels("Shadows/Highlights", f64::from(r.width()), f64::from(r.height()))?;
+            let n = surf.format().channels() as u64;
+            budget.bytes("Shadows/Highlights", r.size().area().saturating_mul(SHADOWS_HIGHLIGHTS_BYTES_PER_PIXEL + 8 * n))?;
+        }
+        // `process_surface`, asking `ctl` between its passes over the region.
+        if !r.is_empty() {
+            let fmt = surf.format();
+            let raw = surf.read_region(r);
+            if ctl.cancelled() {
+                return Err(Refused::Cancelled);
+            }
+            let mut px: Vec<[f32; 4]> = raw.chunks_exact(fmt.channels()).map(|q| to_rgba(&fmt, q)).collect();
+            drop(raw);
+            let orig = px.clone();
+            if ctl.cancelled() {
+                return Err(Refused::Cancelled);
+            }
+            tone::shadows_highlights_with(&mut px, r.width() as usize, r.height() as usize, &sh, ctl)?;
+            let mixed = crate::pixels::mix_through_selection(&fmt, r, &orig, &px, None);
+            if ctl.cancelled() {
+                return Err(Refused::Cancelled);
+            }
+            out.write_region(r, &mixed);
+        }
+    } else {
+        let mode = surf.format().mode;
+        let Ok(adj) = crate::adjust_params::from_params(kind, p, None, mode) else { return Ok(None) };
+        if crate::pixels::adjust_surface_with(&mut out, &adj, None, mode, ctl).is_err() {
+            return if ctl.cancelled() { Err(Refused::Cancelled) } else { Ok(None) };
+        }
+        if ctl.cancelled() {
+            return Err(Refused::Cancelled);
+        }
+    }
+    out.prune();
+    Ok(Some(out))
+}
+
 fn shadows_highlights(s: &mut Session, p: &Value) -> Result<Value> {
     if adjust_as_smart_filter(s, "shadowsHighlights", "Shadows/Highlights", p)? {
         return Ok(Value::Null);

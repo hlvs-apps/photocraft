@@ -195,10 +195,17 @@ pub fn white_black_points(px: &[[f32; 4]], w: usize, h: usize, p: &CameraRaw) ->
     }
     let enc = Encoding::of(p.encoding_gamma);
     let (g, k_con) = (gains(p), contrast(p));
-    Some(super::luminance_points(px, w, h, enc, |q| {
-        let q = g.map_or(q, |g| super::balance(q, g));
-        k_con.map_or(q, |k| super::contrast(q, k))
-    }))
+    Some(super::luminance_points(
+        px,
+        w,
+        h,
+        enc,
+        |q| {
+            let q = g.map_or(q, |g| super::balance(q, g));
+            k_con.map_or(q, |k| super::contrast(q, k))
+        },
+        &photocraft_raster::Interrupt::NONE,
+    ))
 }
 
 /// Develop's stages for settings without spatial stages, on a `w × h` image; `points` are the

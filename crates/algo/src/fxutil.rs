@@ -111,12 +111,15 @@ pub(crate) fn unpremul_px(px: &mut [f32], alpha: bool) {
 
 /// In-place running-sum box blur of every row of a `w × h × n` interleaved
 /// buffer with radius `r` (edges clamped). `scratch` must hold `w × n`.
-fn box_rows_n(buf: &mut [f32], w: usize, n: usize, r: usize, scratch: &mut Vec<f32>) {
+fn box_rows_n(buf: &mut [f32], w: usize, n: usize, r: usize, scratch: &mut Vec<f32>, ctl: &photocraft_raster::Interrupt) {
     if r == 0 || w == 0 {
         return;
     }
     let norm = 1.0 / (2 * r + 1) as f64;
     for row in buf.chunks_exact_mut(w * n) {
+        if ctl.cancelled() {
+            return;
+        }
         scratch.clear();
         scratch.extend_from_slice(row);
         // f64 sums: rounding must not depend on where a window starts (tile independence).
@@ -132,12 +135,15 @@ fn box_rows_n(buf: &mut [f32], w: usize, n: usize, r: usize, scratch: &mut Vec<f
 }
 
 /// Same as [`box_rows_n`] over columns (no transpose; walks with a stride).
-fn box_cols_n(buf: &mut [f32], w: usize, h: usize, n: usize, r: usize, scratch: &mut Vec<f32>) {
+fn box_cols_n(buf: &mut [f32], w: usize, h: usize, n: usize, r: usize, scratch: &mut Vec<f32>, ctl: &photocraft_raster::Interrupt) {
     if r == 0 || h == 0 {
         return;
     }
     let norm = 1.0 / (2 * r + 1) as f64;
     for x in 0..w {
+        if ctl.cancelled() {
+            return;
+        }
         scratch.clear();
         for y in 0..h {
             scratch.extend_from_slice(&buf[(y * w + x) * n..(y * w + x + 1) * n]);
@@ -156,8 +162,8 @@ fn box_cols_n(buf: &mut [f32], w: usize, h: usize, n: usize, r: usize, scratch: 
 /// Box blur of an interleaved buffer (radius `r` in both directions).
 pub(crate) fn box_blur_n(buf: &mut [f32], w: usize, h: usize, n: usize, r: usize) {
     let mut scratch = Vec::with_capacity(w.max(h) * n);
-    box_rows_n(buf, w, n, r, &mut scratch);
-    box_cols_n(buf, w, h, n, r, &mut scratch);
+    box_rows_n(buf, w, n, r, &mut scratch, &photocraft_raster::Interrupt::NONE);
+    box_cols_n(buf, w, h, n, r, &mut scratch, &photocraft_raster::Interrupt::NONE);
 }
 
 /// Odd box widths whose 3-fold convolution approximates a Gaussian of `sigma`
@@ -189,15 +195,21 @@ pub(crate) fn gauss_box_radii(sigma: f32) -> [usize; 3] {
 /// Exact small kernels are not needed here: callers use it for smoothing
 /// fields and blur levels, where cost independent of `sigma` matters more.
 pub(crate) fn gauss_blur_n(buf: &mut [f32], w: usize, h: usize, n: usize, sigma: f32) {
+    gauss_blur_n_with(buf, w, h, n, sigma, &photocraft_raster::Interrupt::NONE);
+}
+
+/// [`gauss_blur_n`] asking `ctl` per row and per column of every pass; once it is cancelled the
+/// rest is skipped and the caller drops `buf`.
+pub(crate) fn gauss_blur_n_with(buf: &mut [f32], w: usize, h: usize, n: usize, sigma: f32, ctl: &photocraft_raster::Interrupt) {
     if sigma < 0.3 {
         return;
     }
     let mut scratch = Vec::with_capacity(w.max(h) * n);
     for r in gauss_box_radii(sigma) {
-        box_rows_n(buf, w, n, r, &mut scratch);
+        box_rows_n(buf, w, n, r, &mut scratch, ctl);
     }
     for r in gauss_box_radii(sigma) {
-        box_cols_n(buf, w, h, n, r, &mut scratch);
+        box_cols_n(buf, w, h, n, r, &mut scratch, ctl);
     }
 }
 

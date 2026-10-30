@@ -24,9 +24,10 @@
 
 use photocraft_color::{ColorMode, PixelFormat};
 use photocraft_geom::Rect;
-use photocraft_raster::Surface;
+use photocraft_raster::{Interrupt, Surface};
 use serde::{Deserialize, Serialize};
 
+use crate::control::{Budget, Refused};
 use crate::photo_util::{catmull_rom, par_map};
 
 /// What fills the output where the corrected image doesn't reach.
@@ -273,13 +274,49 @@ pub fn remap(src: &Surface, frame: Rect, out_area: Rect, edge: EdgeMode, map: &(
 }
 
 fn remap_impl(src: &Surface, frame: Rect, out_area: Rect, edge: EdgeMode, map: &(dyn Fn(f64, f64) -> Option<Sample> + Sync), shared: bool) -> Surface {
+    match remap_in(src, frame, out_area, edge, map, shared, &Interrupt::NONE, None) {
+        Ok(out) => out,
+        // Nothing refuses without a budget or an interrupt.
+        Err(_) => Surface::new(src.format()),
+    }
+}
+
+/// [`remap_impl`], asking `ctl` per output tile; with a `budget`, the output (and the tiles held
+/// until it is written) and every worker's source window are held to it, and a tile whose window
+/// is over its share is a [`Refused::Limit`].
+#[allow(clippy::too_many_arguments)]
+fn remap_in(
+    src: &Surface,
+    frame: Rect,
+    out_area: Rect,
+    edge: EdgeMode,
+    map: &(dyn Fn(f64, f64) -> Option<Sample> + Sync),
+    shared: bool,
+    ctl: &Interrupt,
+    budget: Option<&Budget>,
+) -> Result<Surface, Refused> {
     let sfmt = src.format();
     let needs_alpha = matches!(edge, EdgeMode::Transparency) && !sfmt.alpha;
     let ofmt = if needs_alpha { PixelFormat::new(sfmt.mode, sfmt.sample, true) } else { sfmt };
     let mut out = Surface::new(ofmt);
     if out_area.is_empty() || frame.is_empty() {
-        return out;
+        return Ok(out);
     }
+    // Each worker's source window, in pixels: its share of what the output leaves of the budget.
+    let max_window = match budget {
+        Some(b) => {
+            b.pixels("the corrected image", f64::from(out_area.width()), f64::from(out_area.height()))?;
+            // Every tile's samples and pixels are held until all are done, then written.
+            let held = crate::control::f32_bytes(out_area.size().area(), ofmt.channels()).saturating_mul(2);
+            let tile = crate::control::workers().saturating_mul((TILE as u64 * TILE as u64).saturating_mul(std::mem::size_of::<Option<Sample>>() as u64));
+            let fixed = held.saturating_add(tile);
+            b.bytes("the lens correction", fixed)?;
+            crate::control::check(ctl)?;
+            (b.max_bytes - fixed) / crate::control::workers() / (4 * sfmt.channels() as u64).max(1)
+        }
+        None => u64::MAX,
+    };
+    let over = std::sync::atomic::AtomicBool::new(false);
     let n_in = sfmt.channels();
     let n_out = ofmt.channels();
     let cc = sfmt.mode.color_channels();
@@ -302,6 +339,9 @@ fn remap_impl(src: &Surface, frame: Rect, out_area: Rect, edge: EdgeMode, map: &
     }
     let results = par_map(tiles.len(), |k| {
         let t = tiles[k];
+        if ctl.cancelled() || over.load(std::sync::atomic::Ordering::Relaxed) {
+            return (t, Vec::new());
+        }
         let (tw, th) = (t.width() as usize, t.height() as usize);
         let samples: Vec<Option<Sample>> = (0..tw * th).map(|i| map(t.x0 as f64 + (i % tw) as f64 + 0.5, t.y0 as f64 + (i / tw) as f64 + 0.5)).collect();
         // Source window: bbox of every sample, clamped to the frame.
@@ -322,6 +362,10 @@ fn remap_impl(src: &Surface, frame: Rect, out_area: Rect, edge: EdgeMode, map: &
             let clamp_y = |v: f64| (v as i32).clamp(frame.y0, frame.y1);
             Rect::new(clamp_x(bx0.floor() - 3.0), clamp_y(by0.floor() - 3.0), clamp_x(bx1.ceil() + 4.0), clamp_y(by1.ceil() + 4.0))
         };
+        if win.size().area() > max_window {
+            over.store(true, std::sync::atomic::Ordering::Relaxed);
+            return (t, Vec::new());
+        }
         let (ww, wh) = (win.width() as usize, win.height() as usize);
         let mut buf = if win.is_empty() { Vec::new() } else { src.read_region(win) };
         // Premultiply colour by alpha so transparent pixels don't bleed.
@@ -422,11 +466,19 @@ fn remap_impl(src: &Surface, frame: Rect, out_area: Rect, edge: EdgeMode, map: &
         }
         (t, data)
     });
+    if ctl.cancelled() {
+        return Err(Refused::Cancelled);
+    }
+    if over.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(Refused::Limit(format!(
+            "a tile of the lens correction samples a source window of more than {max_window} pixels (its share of the memory budget)"
+        )));
+    }
     for (t, data) in results {
         out.write_region(t, &data);
     }
     out.prune();
-    out
+    Ok(out)
 }
 
 fn sample_channels(buf: &[f32], win: Rect, frame: Rect, n: usize, p: [f64; 2]) -> Option<[f32; 8]> {
@@ -468,6 +520,16 @@ fn sample_channels_impl<const N: usize>(buf: &[f32], win: Rect, frame: Rect, p: 
 pub fn correct(src: &Surface, frame: Rect, lc: &LensCorrection) -> Surface {
     let map = LensMap::new(lc, frame);
     remap(src, frame, frame, lc.edge, &|x, y| map.sample(x, y))
+}
+
+/// [`correct`] for input nobody vetted ([`crate::control`]): the same pixels, with `ctl` asked per
+/// 128-pixel output tile, the output held to `budget.max_pixels` and the output plus every
+/// worker's source window to `budget.max_bytes`; a tile whose window is over its share (a
+/// keystone or scale that spreads one tile's samples across the frame) is a [`Refused::Limit`].
+pub fn correct_controlled(src: &Surface, frame: Rect, lc: &LensCorrection, budget: &Budget, ctl: &Interrupt) -> Result<Surface, Refused> {
+    crate::control::check(ctl)?;
+    let map = LensMap::new(lc, frame);
+    remap_in(src, frame, frame, lc.edge, &|x, y| map.sample(x, y), true, ctl, Some(budget))
 }
 
 #[cfg(test)]
