@@ -269,9 +269,13 @@ impl LiquifyField {
 
     /// Applies one stroke. Returns the document rectangle whose output changed.
     pub fn apply_stroke(&mut self, s: &LiquifyStroke) -> Rect {
+        self.apply_stroke_with(s, &photocraft_raster::Interrupt::NONE)
+    }
+
+    fn apply_stroke_with(&mut self, s: &LiquifyStroke, ctl: &photocraft_raster::Interrupt) -> Rect {
         self.cursor = None;
         match s.tool {
-            LiquifyTool::LassoMask => return self.apply_lasso(s),
+            LiquifyTool::LassoMask => return self.apply_lasso(s, ctl),
             LiquifyTool::ReconstructAll => {
                 let k = (s.amount.unwrap_or(100.0) / 100.0).clamp(0.0, 1.0) as f32;
                 for (v, f) in self.d.iter_mut().zip(&self.freeze) {
@@ -293,7 +297,10 @@ impl LiquifyField {
         let Some(&first) = pts.first() else { return Rect::EMPTY };
         let mut dirty = self.stroke_begin(s, first);
         for w in pts.windows(2) {
-            dirty = dirty.union(&self.stroke_segment(s, w[0], w[1]));
+            if ctl.cancelled() {
+                return dirty;
+            }
+            dirty = dirty.union(&self.walk_segment_with(s, w[0], w[1], true, ctl));
         }
         dirty
     }
@@ -302,7 +309,7 @@ impl LiquifyField {
     /// inside the closed polygon in `s.points` (even-odd rule; non-finite points are skipped).
     /// A scanline fill: each node row costs one pass over the edges, then only the nodes inside
     /// are written. Returns the document rectangle the mask changed in.
-    fn apply_lasso(&mut self, s: &LiquifyStroke) -> Rect {
+    fn apply_lasso(&mut self, s: &LiquifyStroke, ctl: &photocraft_raster::Interrupt) -> Rect {
         let poly: Vec<[f64; 2]> = s.points.iter().filter_map(|p| Some([*p.first()?, *p.get(1)?])).filter(|p| p[0].is_finite() && p[1].is_finite()).collect();
         if poly.len() < 3 || self.w == 0 || self.h == 0 {
             return Rect::EMPTY;
@@ -325,6 +332,9 @@ impl LiquifyField {
         let v = if s.amount.unwrap_or(1.0) > 0.5 { 1.0f32 } else { 0.0 };
         let mut xs: Vec<f64> = Vec::new();
         for j in (j0 as usize)..=(j1 as usize) {
+            if ctl.cancelled() {
+                return Rect::EMPTY;
+            }
             let y = self.node_pos(0, j)[1];
             xs.clear();
             let Some(mut prev) = poly.last().copied() else { return Rect::EMPTY };
@@ -372,6 +382,10 @@ impl LiquifyField {
     /// [`Self::stroke_segment`]; `skip` leaves out the dabs that cannot reach a field node (they
     /// would change nothing), which tests compare with the full walk.
     fn walk_segment(&mut self, s: &LiquifyStroke, a: [f64; 3], b: [f64; 3], skip: bool) -> Rect {
+        self.walk_segment_with(s, a, b, skip, &photocraft_raster::Interrupt::NONE)
+    }
+
+    fn walk_segment_with(&mut self, s: &LiquifyStroke, a: [f64; 3], b: [f64; 3], skip: bool, ctl: &photocraft_raster::Interrupt) -> Rect {
         let mut dirty = Rect::EMPTY;
         let (pa, pb) = (a[2].clamp(0.0, 1.0), b[2].clamp(0.0, 1.0));
         let stationary = s.tool.is_stationary();
@@ -418,6 +432,9 @@ impl LiquifyField {
         if k0 <= k1 {
             let mut prev = if k0 > 0.0 { at(first + (k0 - 1.0) * spacing) } else { cur.last_dab };
             for k in (k0 as u64)..=(k1 as u64) {
+                if ctl.cancelled() {
+                    return dirty;
+                }
                 let dist = (first + k as f64 * spacing).min(len);
                 let c = at(dist);
                 let delta = [c[0] - prev[0], c[1] - prev[1]];
@@ -595,6 +612,22 @@ impl LiquifyField {
         f
     }
 
+    /// Replays strokes with cancellation between strokes, segments and dabs. A partial
+    /// displacement field is discarded on cancellation.
+    pub fn from_strokes_with(bounds: Rect, cell: f64, strokes: &[LiquifyStroke], ctl: &photocraft_raster::Interrupt) -> Option<Self> {
+        if ctl.cancelled() {
+            return None;
+        }
+        let mut f = Self::new(bounds, cell);
+        for s in strokes {
+            if ctl.cancelled() {
+                return None;
+            }
+            f.apply_stroke_with(s, ctl);
+        }
+        (!ctl.cancelled()).then_some(f)
+    }
+
     /// Catmull-Rom (bicubic) displacement at grid coordinates.
     fn sample_cubic(&self, xs: &[(usize, f64); 4], ys: &[(usize, f64); 4]) -> [f64; 2] {
         let mut acc = [0.0f64; 2];
@@ -671,6 +704,19 @@ fn cubic_taps(g: f64, len: usize) -> [(usize, f64); 4] {
 /// `p + d(p)` (bicubic field, bicubic premultiplied source, edge pixels repeat past the field
 /// bounds); everything outside the bounds is kept. Same format as `src`.
 pub fn apply_liquify(src: &Surface, field: &LiquifyField) -> Surface {
+    apply_liquify_inner(src, field, &photocraft_raster::Interrupt::NONE)
+}
+
+/// Applies a field with cancellation before each tile batch, discarding partial output.
+pub fn apply_liquify_with(src: &Surface, field: &LiquifyField, ctl: &photocraft_raster::Interrupt) -> Option<Surface> {
+    if ctl.cancelled() {
+        return None;
+    }
+    let out = apply_liquify_inner(src, field, ctl);
+    (!ctl.cancelled()).then_some(out)
+}
+
+fn apply_liquify_inner(src: &Surface, field: &LiquifyField, ctl: &photocraft_raster::Interrupt) -> Surface {
     let fmt = src.format();
     let n = fmt.channels();
     let alpha = fmt.alpha;
@@ -787,6 +833,9 @@ pub fn apply_liquify(src: &Surface, field: &LiquifyField) -> Surface {
         Some((*t, outp))
     };
     for batch in tiles.chunks(RENDER_BATCH_TILES) {
+        if ctl.cancelled() {
+            return out;
+        }
         for (r, v) in par::map(batch.len(), true, |i| batch.get(i).and_then(work)).into_iter().flatten() {
             out.write_region(r, &v);
         }

@@ -15,6 +15,7 @@ fn options<'a>(decode: &'a BakeDecoder<'a>) -> BakeOptions<'a> {
         render: photocraft_compose::RenderOptions { max_pixels: 1 << 26, max_layers: 1000, max_effect_bytes: 1 << 30, max_mask_bytes: 1 << 30 },
         max_pixels: 1 << 26,
         max_stack_bytes: 1 << 30,
+        max_filter_bytes: 1 << 30,
     }
 }
 
@@ -280,4 +281,47 @@ fn a_bake_point_past_the_stack_is_refused() {
     let s = filtered(8);
     let doc = &s.active().unwrap().doc;
     assert!(matches!(bake(doc, &active_smart(&s), 4), Err(BakeError::Engine(EngineError::BadParams { .. }))));
+}
+
+#[test]
+fn a_bake_refuses_registered_commands_that_are_not_filters() {
+    let s = filtered(8);
+    let doc = &s.active().unwrap().doc;
+    let mut sm = active_smart(&s);
+    sm.smart_filters[0].command = "layer.new.frame".into();
+    assert!(crate::commands::find("layer.new.frame").is_some());
+    assert!(matches!(bake(doc, &sm, 1), Err(BakeError::Refused(_))));
+}
+
+#[test]
+fn a_bake_refuses_invalid_special_filter_parameters() {
+    let s = filtered(8);
+    let doc = &s.active().unwrap().doc;
+    let mut sm = active_smart(&s);
+    sm.smart_filters[0].command = "filter.liquify".into();
+    sm.smart_filters[0].params = json!({"meshSize": 0});
+    assert!(bake(doc, &sm, 1).is_err());
+}
+
+#[test]
+fn a_bake_budgets_filter_windows_before_running_them() {
+    let s = filtered(8);
+    let doc = &s.active().unwrap().doc;
+    let opts = BakeOptions { max_filter_bytes: 1, ..options(&decode) };
+    assert!(matches!(bake_below_filter(doc, &active_smart(&s), 1, &opts, &photocraft_raster::Interrupt::NONE), Err(BakeError::Limit(_))));
+}
+
+#[test]
+fn a_liquify_bake_stops_inside_a_stroke() {
+    let s = filtered(8);
+    let doc = &s.active().unwrap().doc;
+    let mut sm = active_smart(&s);
+    sm.smart_filters[0].command = "filter.liquify".into();
+    sm.smart_filters[0].params = json!({"strokes": [{"size": 1, "points": [[0, 20], [60, 20], [0, 20], [60, 20]]}]});
+    let count = AtomicUsize::new(0);
+    let stop = || count.fetch_add(1, Ordering::Relaxed) >= 100;
+    let result = bake_below_filter(doc, &sm, 1, &options(&decode), &photocraft_raster::Interrupt::cancel_only(&stop));
+    assert!(matches!(result, Err(BakeError::Cancelled)));
+    // The same stroke completes when not interrupted.
+    assert!(bake(doc, &sm, 1).is_ok());
 }
