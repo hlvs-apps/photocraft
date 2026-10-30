@@ -23,9 +23,10 @@
 use std::collections::{HashMap, HashSet};
 
 use photocraft_geom::Rect;
-use photocraft_raster::Surface;
+use photocraft_raster::{Interrupt, Surface};
 use serde::{Deserialize, Serialize};
 
+use crate::control::{Budget, Refused, check};
 use crate::transform::Interp;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,7 +148,8 @@ struct Field {
 }
 
 impl Field {
-    fn new(src: &Surface, bounds: Rect, expansion: f64) -> Field {
+    /// `None` once `ctl` is cancelled (asked per block row of the coverage scan).
+    fn new(src: &Surface, bounds: Rect, expansion: f64, ctl: &Interrupt) -> Option<Field> {
         let long = f64::from(bounds.width().max(bounds.height()));
         let grow = expansion.max(0.0).ceil();
         let g = ((long + 2.0 * grow + 8.0) / FIELD_BLOCKS).ceil().max(1.0) as i32;
@@ -168,6 +170,9 @@ impl Field {
         } else {
             // One block row per task (rows are independent).
             let scan = |by: usize, out: &mut [bool]| {
+                if ctl.cancelled() {
+                    return;
+                }
                 let r = Rect::new(area.x0, area.y0 + by as i32 * g, area.x0 + bw as i32 * g, area.y0 + (by as i32 + 1) * g).intersect(&bounds);
                 if r.is_empty() || !src.has_tiles_in(r) {
                     return;
@@ -191,6 +196,9 @@ impl Field {
             #[cfg(target_arch = "wasm32")]
             cov.chunks_mut(bw).enumerate().for_each(|(by, out)| scan(by, out));
         }
+        if ctl.cancelled() {
+            return None;
+        }
         let outside = edt(&cov, true, bw, bh);
         let inside = edt(&cov, false, bw, bh);
         let gf = f64::from(g);
@@ -199,7 +207,7 @@ impl Field {
             .zip(outside.iter().zip(&inside))
             .map(|(&c, (&o, &i))| if c { (-(i.sqrt() - 0.5) * gf) as f32 } else { ((o.sqrt() - 0.5) * gf) as f32 })
             .collect();
-        Field { x0: f64::from(area.x0), y0: f64::from(area.y0), g: gf, bw, bh, sd, expansion }
+        Some(Field { x0: f64::from(area.x0), y0: f64::from(area.y0), g: gf, bw, bh, sd, expansion })
     }
 
     /// The field at a block centre (exact, no interpolation).
@@ -222,10 +230,11 @@ impl Field {
 
     /// The outline (where the field crosses zero) as closed loops, traced by marching squares
     /// over the block centres. The field's border blocks lie outside, so every loop closes.
-    fn outline(&self) -> Vec<Vec<[f64; 2]>> {
+    /// `None` once `ctl` is cancelled (asked per row of blocks).
+    fn outline(&self, ctl: &Interrupt) -> Option<Vec<Vec<[f64; 2]>>> {
         let (bw, bh) = (self.bw, self.bh);
         if bw < 2 || bh < 2 {
-            return Vec::new();
+            return Some(Vec::new());
         }
         let inside = |x: usize, y: usize| self.at(x, y) < 0.0;
         // A crossing is named by its block edge: 2·block for the edge to the right neighbour,
@@ -252,6 +261,9 @@ impl Field {
             }
         };
         for y in 0..bh - 1 {
+            if ctl.cancelled() {
+                return None;
+            }
             for x in 0..bw - 1 {
                 let c = [inside(x, y), inside(x + 1, y), inside(x + 1, y + 1), inside(x, y + 1)];
                 if c.iter().all(|&v| v == c[0]) {
@@ -284,6 +296,9 @@ impl Field {
             if seen.contains(&start) {
                 continue;
             }
+            if ctl.cancelled() {
+                return None;
+            }
             let mut lp = Vec::new();
             let (mut prev, mut cur) = (usize::MAX, start);
             loop {
@@ -300,7 +315,7 @@ impl Field {
                 loops.push(lp);
             }
         }
-        loops
+        Some(loops)
     }
 }
 
@@ -375,10 +390,11 @@ fn seg_dist(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
 }
 
 /// Simplifies a closed loop (Douglas–Peucker, within `tol` px), which keeps its corners.
-fn simplify(lp: &[[f64; 2]], tol: f64) -> Vec<[f64; 2]> {
+/// `None` once `ctl` is cancelled (asked per span: one span is one pass over its points).
+fn simplify(lp: &[[f64; 2]], tol: f64, ctl: &Interrupt) -> Option<Vec<[f64; 2]>> {
     let n = lp.len();
     if n < 4 {
-        return lp.to_vec();
+        return Some(lp.to_vec());
     }
     let far = (1..n).max_by(|&a, &b| dist2(lp[0], lp[a]).total_cmp(&dist2(lp[0], lp[b]))).unwrap_or(n / 2);
     let mut keep = vec![false; n];
@@ -387,6 +403,9 @@ fn simplify(lp: &[[f64; 2]], tol: f64) -> Vec<[f64; 2]> {
     // Spans (a, b) of the loop; b == n stands for point 0.
     let mut stack = vec![(0, far), (far, n)];
     while let Some((a, b)) = stack.pop() {
+        if ctl.cancelled() {
+            return None;
+        }
         let (pa, pb) = (lp[a], lp[b % n]);
         let mut best = (0.0, 0);
         for (i, &p) in lp.iter().enumerate().take(b).skip(a + 1) {
@@ -403,10 +422,10 @@ fn simplify(lp: &[[f64; 2]], tol: f64) -> Vec<[f64; 2]> {
     }
     let out: Vec<[f64; 2]> = (0..n).filter(|&i| keep[i]).map(|i| lp[i]).collect();
     if out.len() >= 3 {
-        return out;
+        return Some(out);
     }
     // A speck thinner than the tolerance: keep a few of its points.
-    (0..n).step_by((n / 4).max(1)).map(|i| lp[i]).collect()
+    Some((0..n).step_by((n / 4).max(1)).map(|i| lp[i]).collect())
 }
 
 /// Splits the sides of a closed loop longer than `step` into equal parts.
@@ -611,23 +630,41 @@ const MAX_OUTLINE_POINTS: usize = 20_000;
 /// Delaunay triangulation of those points with the outline's sides recovered (split until
 /// each is an edge), minus the triangles outside the outline.
 pub fn build_mesh(src: &Surface, bounds: Rect, density: PuppetDensity, expansion: f64) -> PuppetMesh {
+    build_mesh_in(src, bounds, density, expansion, &Interrupt::NONE, false).unwrap_or_default()
+}
+
+/// [`build_mesh`] asking `ctl` per block row, outline span, mesh insertion and recovery round.
+/// `strict`: an outline still over [`MAX_OUTLINE_POINTS`] at the coarsest simplification is a
+/// [`Refused::Limit`] (the desktop meshes it anyway, however long that takes).
+fn build_mesh_in(src: &Surface, bounds: Rect, density: PuppetDensity, expansion: f64, ctl: &Interrupt, strict: bool) -> Result<PuppetMesh, Refused> {
     if bounds.is_empty() {
-        return PuppetMesh::default();
+        return Ok(PuppetMesh::default());
     }
     let e = if expansion.is_finite() { expansion.clamp(-200.0, 200.0) } else { 0.0 };
     // The density counts steps across the region the mesh covers (grown by the expansion).
     let long = f64::from(bounds.width().max(bounds.height())) + 2.0 * e.max(0.0);
     let spacing = (long / density.cells()).max(2.0);
-    let field = Field::new(src, bounds, e);
-    let loops = field.outline();
+    let field = Field::new(src, bounds, e, ctl).ok_or(Refused::Cancelled)?;
+    let loops = field.outline(ctl).ok_or(Refused::Cancelled)?;
     let empty = PuppetMesh { spacing, ..Default::default() };
     if loops.is_empty() {
-        return empty;
+        return Ok(empty);
+    }
+    // Each loop keeps three points or more however coarsely it is simplified.
+    if strict && loops.len().saturating_mul(3) > MAX_OUTLINE_POINTS {
+        return Err(Refused::Limit(format!("the puppet's outline has {} separate loops; the mesh takes at most {MAX_OUTLINE_POINTS} points", loops.len())));
     }
     let mut tol = (0.5 * field.g).max(0.5);
     let rings = loop {
-        let rings: Vec<Vec<[f64; 2]>> = loops.iter().map(|l| densify(&simplify(l, tol), spacing)).collect();
-        if rings.iter().map(Vec::len).sum::<usize>() <= MAX_OUTLINE_POINTS || tol > spacing {
+        let mut rings: Vec<Vec<[f64; 2]>> = Vec::with_capacity(loops.len());
+        for l in &loops {
+            rings.push(densify(&simplify(l, tol, ctl).ok_or(Refused::Cancelled)?, spacing));
+        }
+        let points = rings.iter().map(Vec::len).sum::<usize>();
+        if points <= MAX_OUTLINE_POINTS || tol > spacing {
+            if strict && points > MAX_OUTLINE_POINTS {
+                return Err(Refused::Limit(format!("the puppet's outline keeps {points} points at its coarsest; the mesh takes at most {MAX_OUTLINE_POINTS}")));
+            }
             break rings;
         }
         tol *= 2.0;
@@ -636,7 +673,11 @@ pub fn build_mesh(src: &Surface, bounds: Rect, density: PuppetDensity, expansion
     let mut dl = Delaunay::new(lo, hi);
     let mut segs: Vec<(usize, usize)> = Vec::new();
     for ring in &rings {
-        let idx: Vec<usize> = ring.iter().filter_map(|&p| dl.insert(p)).collect();
+        let mut idx: Vec<usize> = Vec::with_capacity(ring.len());
+        for &p in ring {
+            check(ctl)?;
+            idx.extend(dl.insert(p));
+        }
         for (k, &a) in idx.iter().enumerate() {
             let b = idx[(k + 1) % idx.len()];
             if a != b {
@@ -652,6 +693,7 @@ pub fn build_mesh(src: &Surface, bounds: Rect, density: PuppetDensity, expansion
         for i in 0..=cols {
             let p = [lo[0] + (i as f64 + 0.5 * (j % 2) as f64) * spacing, lo[1] + j as f64 * rise];
             if field.value(p) < -0.5 * spacing {
+                check(ctl)?;
                 dl.insert(p);
             }
         }
@@ -659,6 +701,7 @@ pub fn build_mesh(src: &Surface, bounds: Rect, density: PuppetDensity, expansion
     // Recover the outline's sides: split a side the triangulation lacks at its midpoint.
     let mut budget = segs.len() * 2;
     for _ in 0..8 {
+        check(ctl)?;
         let edges = dl.edges();
         let mut next = Vec::with_capacity(segs.len());
         let mut split = false;
@@ -667,6 +710,7 @@ pub fn build_mesh(src: &Surface, bounds: Rect, density: PuppetDensity, expansion
                 next.push((a, b));
                 continue;
             }
+            check(ctl)?;
             match dl.insert(lerp(dl.pts[a], dl.pts[b], 0.5)) {
                 Some(c) if c != a && c != b => {
                     next.push((a, c));
@@ -691,8 +735,9 @@ pub fn build_mesh(src: &Surface, bounds: Rect, density: PuppetDensity, expansion
         }
     }
     if tris.is_empty() {
-        return empty;
+        return Ok(empty);
     }
+    check(ctl)?;
     // Keep the vertices in use, numbered for a narrow band in the solver's matrix.
     let pos = &dl.pts;
     let order = band_order(pos, &tris);
@@ -700,7 +745,7 @@ pub fn build_mesh(src: &Surface, bounds: Rect, density: PuppetDensity, expansion
     for (new, &old) in order.iter().enumerate() {
         remap[old] = new;
     }
-    PuppetMesh { verts: order.iter().map(|&i| pos[i]).collect(), tris: tris.iter().map(|t| t.map(|i| remap[i])).collect(), spacing }
+    Ok(PuppetMesh { verts: order.iter().map(|&i| pos[i]).collect(), tris: tris.iter().map(|t| t.map(|i| remap[i])).collect(), spacing })
 }
 
 /// The vertices `tris` use, in reverse Cuthill–McKee order (breadth first from the topmost
@@ -793,8 +838,9 @@ impl Csr {
         }
     }
 
-    /// Jacobi-preconditioned conjugate gradients, warm-started from `x`.
-    fn solve(&self, b: &[f64], x: &mut [f64]) {
+    /// Jacobi-preconditioned conjugate gradients, warm-started from `x`. Stops early (leaving `x`
+    /// unfinished) once `ctl` is cancelled; asked per iteration.
+    fn solve(&self, b: &[f64], x: &mut [f64], ctl: &Interrupt) {
         let n = b.len();
         let mut r = vec![0.0; n];
         self.mul(x, &mut r);
@@ -806,8 +852,8 @@ impl Csr {
         let mut p = z.clone();
         let mut rz: f64 = r.iter().zip(&z).map(|(a, b)| a * b).sum();
         let mut ap = vec![0.0; n];
-        for _ in 0..(4 * n).clamp(50, 2000) {
-            if r.iter().map(|v| v * v).sum::<f64>().sqrt() <= 1e-12 * bn {
+        for _ in 0..cg_iterations(n) {
+            if ctl.cancelled() || r.iter().map(|v| v * v).sum::<f64>().sqrt() <= 1e-12 * bn {
                 break;
             }
             self.mul(&p, &mut ap);
@@ -833,6 +879,11 @@ impl Csr {
     }
 }
 
+/// Most iterations [`Csr::solve`] runs on a system of `n` unknowns.
+fn cg_iterations(n: usize) -> usize {
+    (4 * n).clamp(50, 2000)
+}
+
 /// Banded Cholesky factor `A = L Lᵀ` (the mesh numbers its vertices in reverse Cuthill–McKee
 /// order, so the system's bandwidth is about one breadth-first front): factored once per pin
 /// set, then each global step is two triangular solves.
@@ -844,16 +895,29 @@ struct BandChol {
 }
 
 impl BandChol {
-    /// `None` when the band would be too large (or the matrix isn't positive definite).
-    fn new(a: &Csr) -> Option<BandChol> {
-        let n = a.diag.len();
+    /// The band's half width: the farthest any entry of `a` lies from the diagonal.
+    fn bandwidth(a: &Csr) -> usize {
         let mut p = 0;
-        for i in 0..n {
+        for i in 0..a.diag.len() {
             for k in a.rows[i]..a.rows[i + 1] {
                 p = p.max(i.abs_diff(a.cols[k]));
             }
         }
-        if n.saturating_mul(p + 1) > 40_000_000 {
+        p
+    }
+
+    /// Whether the desktop factors a system of `n` unknowns with half bandwidth `p` (else it
+    /// solves by conjugate gradients).
+    fn fits(n: usize, p: usize) -> bool {
+        n.saturating_mul(p + 1) <= 40_000_000
+    }
+
+    /// `None` when the band would be too large (or the matrix isn't positive definite), or once
+    /// `ctl` is cancelled (asked per row).
+    fn new(a: &Csr, ctl: &Interrupt) -> Option<BandChol> {
+        let n = a.diag.len();
+        let p = Self::bandwidth(a);
+        if !Self::fits(n, p) {
             return None;
         }
         let w = p + 1;
@@ -867,6 +931,9 @@ impl BandChol {
             }
         }
         for i in 0..n {
+            if ctl.cancelled() {
+                return None;
+            }
             let lo = i.saturating_sub(p);
             for j in lo..=i {
                 let jlo = j.saturating_sub(p).max(lo);
@@ -964,7 +1031,34 @@ impl PuppetSolver {
     /// Prepares the solver for pins placed at `pin_src` (rotation-fixed pins listed in
     /// `fixed_rotation`).
     pub fn new(mesh: PuppetMesh, pin_src: &[[f64; 2]], fixed_rotation: &[bool]) -> Self {
+        // Nothing refuses without a budget or an interrupt.
+        Self::new_in(mesh, pin_src, fixed_rotation, &Interrupt::NONE, None).unwrap_or_else(|_| Self::empty())
+    }
+
+    fn empty() -> Self {
+        let matrix = Csr { rows: vec![0], cols: Vec::new(), vals: Vec::new(), diag: Vec::new() };
+        PuppetSolver {
+            mesh: PuppetMesh::default(),
+            w: Vec::new(),
+            bound: Vec::new(),
+            pin_tris: Vec::new(),
+            anchored: Vec::new(),
+            matrix,
+            chol: None,
+            pin_weight: 1.0,
+        }
+    }
+
+    /// [`Self::new`] asking `ctl` per pin and per factor row. With a `budget`, binding the pins
+    /// (a pass over the triangles each) and the factor (or, where the desktop falls back to
+    /// conjugate gradients, their [`ITERATIONS`] solves) are held to its work, the factor to its
+    /// bytes.
+    fn new_in(mesh: PuppetMesh, pin_src: &[[f64; 2]], fixed_rotation: &[bool], ctl: &Interrupt, budget: Option<&Budget>) -> Result<Self, Refused> {
         let nv = mesh.verts.len();
+        if let Some(b) = budget {
+            // `locate` per pin, the rotation-fixed pins' triangles, the draw order's nearest pin.
+            b.work("binding the puppet's pins", (pin_src.len() as u64).saturating_mul(mesh.tris.len() as u64).saturating_mul(3))?;
+        }
         let w: Vec<[f64; 3]> = mesh
             .tris
             .iter()
@@ -975,7 +1069,13 @@ impl PuppetSolver {
             .collect();
         // Without vertices there is nothing to bind a pin to (`locate` would fall back to a vertex 0
         // that doesn't exist, #951); every pin loop zips `bound`, so the pins are then ignored.
-        let bound: Vec<Bound> = if nv == 0 { Vec::new() } else { pin_src.iter().map(|p| locate(&mesh, *p)).collect() };
+        let mut bound: Vec<Bound> = Vec::with_capacity(if nv == 0 { 0 } else { pin_src.len() });
+        if nv > 0 {
+            for p in pin_src {
+                check(ctl)?;
+                bound.push(locate(&mesh, *p));
+            }
+        }
         // Connected components (union-find over triangle edges).
         let mut parent: Vec<usize> = (0..nv).collect();
         fn find(p: &mut [usize], mut i: usize) -> usize {
@@ -1002,18 +1102,16 @@ impl PuppetSolver {
         }
         let anchored: Vec<bool> = (0..nv).map(|v| !pinned_root[find(&mut parent, v)]).collect();
         // Rotation-fixed pins: the triangles around the pin's nearest vertex.
-        let pin_tris: Vec<Vec<usize>> = bound
-            .iter()
-            .zip(pin_src)
-            .enumerate()
-            .map(|(k, (b, p))| {
-                if !fixed_rotation.get(k).copied().unwrap_or(false) {
-                    return Vec::new();
-                }
-                let v = *b.verts.iter().min_by(|&&a, &&c| dist2(mesh.verts[a], *p).total_cmp(&dist2(mesh.verts[c], *p))).unwrap_or(&0);
-                mesh.tris.iter().enumerate().filter(|(_, t)| t.contains(&v)).map(|(i, _)| i).collect()
-            })
-            .collect();
+        let mut pin_tris: Vec<Vec<usize>> = Vec::with_capacity(bound.len());
+        for (k, (b, p)) in bound.iter().zip(pin_src).enumerate() {
+            if !fixed_rotation.get(k).copied().unwrap_or(false) {
+                pin_tris.push(Vec::new());
+                continue;
+            }
+            check(ctl)?;
+            let v = *b.verts.iter().min_by(|&&a, &&c| dist2(mesh.verts[a], *p).total_cmp(&dist2(mesh.verts[c], *p))).unwrap_or(&0);
+            pin_tris.push(mesh.tris.iter().enumerate().filter(|(_, t)| t.contains(&v)).map(|(i, _)| i).collect());
+        }
         let mut trip: Vec<(usize, usize, f64)> = Vec::with_capacity(mesh.tris.len() * 12 + nv);
         let mut diag_sum = 0.0;
         for (t, wt) in mesh.tris.iter().zip(&w) {
@@ -1040,9 +1138,31 @@ impl PuppetSolver {
                 trip.push((v, v, pin_weight));
             }
         }
+        check(ctl)?;
         let matrix = Csr::from_triplets(nv, trip);
-        let chol = BandChol::new(&matrix);
-        PuppetSolver { mesh, w, bound, pin_tris, anchored, matrix, chol, pin_weight }
+        // The solver the desktop takes: the band when it fits, else (or when the factor turns out
+        // not positive definite) conjugate gradients, up to their iteration cap for every solve.
+        let (n, p) = (nv as u64, BandChol::bandwidth(&matrix) as u64);
+        let globals = ITERATIONS as u64 + 1;
+        let cg = || {
+            let per_solve = (cg_iterations(nv) as u64).saturating_mul((matrix.vals.len() as u64).saturating_add(n.saturating_mul(6)));
+            budget.map_or(Ok(()), |b| b.work("the puppet solver", globals.saturating_mul(2).saturating_mul(per_solve)))
+        };
+        let banded = BandChol::fits(nv, p as usize);
+        if let Some(b) = budget.filter(|_| banded) {
+            b.bytes("the puppet solver's factor", n.saturating_mul(p + 1).saturating_mul(8))?;
+            let factor = n.saturating_mul((p + 1).saturating_mul(p + 1));
+            let solves = globals.saturating_mul(4).saturating_mul(n.saturating_mul(p + 1));
+            b.work("factoring the puppet solver", factor.saturating_add(solves))?;
+        } else {
+            cg()?;
+        }
+        let chol = BandChol::new(&matrix, ctl);
+        check(ctl)?;
+        if banded && chol.is_none() {
+            cg()?;
+        }
+        Ok(PuppetSolver { mesh, w, bound, pin_tris, anchored, matrix, chol, pin_weight })
     }
 
     /// The ARAP energy of `v` for the given per-triangle linear maps (plus the pin terms).
@@ -1108,7 +1228,7 @@ impl PuppetSolver {
         rots
     }
 
-    fn global(&self, rots: &[[f64; 4]], pin_dst: &[[f64; 2]], v: &mut [[f64; 2]]) {
+    fn global(&self, rots: &[[f64; 4]], pin_dst: &[[f64; 2]], v: &mut [[f64; 2]], ctl: &Interrupt) {
         let nv = v.len();
         let x = &self.mesh.verts;
         let mut bx = vec![0.0; nv];
@@ -1144,8 +1264,8 @@ impl PuppetSolver {
                 c.solve(&by, &mut sy);
             }
             None => {
-                self.matrix.solve(&bx, &mut sx);
-                self.matrix.solve(&by, &mut sy);
+                self.matrix.solve(&bx, &mut sx, ctl);
+                self.matrix.solve(&by, &mut sy, ctl);
             }
         }
         for (i, p) in v.iter_mut().enumerate() {
@@ -1164,13 +1284,27 @@ impl PuppetSolver {
         iterations: usize,
         init: Option<&[[f64; 2]]>,
     ) -> (Vec<[f64; 2]>, Vec<f64>) {
+        self.solve_in(pin_dst, rotations, mode, iterations, init, &Interrupt::NONE).unwrap_or_else(|| (self.mesh.verts.clone(), Vec::new()))
+    }
+
+    /// [`Self::solve`] asking `ctl` per round (and inside a round's conjugate gradients); `None`
+    /// once it is cancelled.
+    fn solve_in(
+        &self,
+        pin_dst: &[[f64; 2]],
+        rotations: &[Option<f64>],
+        mode: PuppetMode,
+        iterations: usize,
+        init: Option<&[[f64; 2]]>,
+        ctl: &Interrupt,
+    ) -> Option<(Vec<[f64; 2]>, Vec<f64>)> {
         let nv = self.mesh.verts.len();
         let mut v: Vec<[f64; 2]> = match init {
             Some(i) if i.len() == nv => i.to_vec(),
             _ => self.mesh.verts.clone(),
         };
         if nv == 0 {
-            return (v, Vec::new());
+            return Some((v, Vec::new()));
         }
         if init.is_none_or(|i| i.len() != nv) {
             // Start from R = I, or with rotated pins, each triangle turned by the inverse-distance
@@ -1209,16 +1343,19 @@ impl PuppetSolver {
                     [co, -s, s, co]
                 })
                 .collect();
-            self.global(&r, pin_dst, &mut v);
+            self.global(&r, pin_dst, &mut v, ctl);
         }
         let mut energies = Vec::with_capacity(iterations);
         for _ in 0..iterations {
+            if ctl.cancelled() {
+                return None;
+            }
             let rots = self.local(&v, mode, rotations);
-            self.global(&rots, pin_dst, &mut v);
+            self.global(&rots, pin_dst, &mut v, ctl);
             let rigid = self.local(&v, PuppetMode::Rigid, rotations);
             energies.push(self.energy_with(&v, &rigid, pin_dst));
         }
-        (v, energies)
+        (!ctl.cancelled()).then_some((v, energies))
     }
 
     /// Energy of the current state with the rigid best fit (for monitoring).
@@ -1300,6 +1437,45 @@ pub fn puppet_warp_with_mask(src: &Surface, bounds: Rect, w: &PuppetWarp, interp
     }
     let out = render(src, bounds, &solver.mesh, &v, &order, interp);
     Some((out, mask.map(|m| render_mask(m, &solver.mesh, &v, &order, interp))))
+}
+
+/// [`puppet_warp`] for input nobody vetted ([`crate::control`]). The same pixels, but:
+///
+/// * `ctl` is asked per block row of the coverage scan, outline row and span, mesh insertion,
+///   pin, factor row, solver round and conjugate-gradient iteration, and per destination tile;
+/// * an outline the mesh cannot take ([`MAX_OUTLINE_POINTS`] at the coarsest simplification),
+///   binding the pins, the solver's factor and iterations, and the drawing are held to `budget`;
+/// * the deformed mesh's bounds are held to `budget.max_pixels` (the desktop's [`MAX_WARP_PIXELS`]
+///   is 2³⁰).
+///
+/// Every refusal is a [`Refused`]; nothing is returned half done.
+pub fn puppet_warp_controlled(src: &Surface, bounds: Rect, w: &PuppetWarp, interp: Interp, budget: &Budget, ctl: &Interrupt) -> Result<Surface, Refused> {
+    check(ctl)?;
+    let mesh = build_mesh_in(src, bounds, w.density, w.expansion, ctl, true)?;
+    if mesh.tris.is_empty() {
+        return Ok(src.clone());
+    }
+    let pin_src: Vec<[f64; 2]> = w.pins.iter().map(|p| p.src).collect();
+    let fixed: Vec<bool> = w.pins.iter().map(|p| p.rotate.is_some()).collect();
+    let solver = PuppetSolver::new_in(mesh, &pin_src, &fixed, ctl, Some(budget))?;
+    let dst: Vec<[f64; 2]> = w.pins.iter().map(|p| p.dst).collect();
+    let rot: Vec<Option<f64>> = w.pins.iter().map(|p| p.rotate).collect();
+    let (v, _) = solver.solve_in(&dst, &rot, w.mode, ITERATIONS, None, ctl).ok_or(Refused::Cancelled)?;
+    let depths: Vec<i32> = w.pins.iter().map(|p| p.depth).collect();
+    let order = solver.draw_order(&depths, &pin_src);
+    check(ctl)?;
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for p in &v {
+        (x0, y0, x1, y1) = (x0.min(p[0]), y0.min(p[1]), x1.max(p[0]), y1.max(p[1]));
+    }
+    let area = (x1 - x0 + 1.0) * (y1 - y0 + 1.0);
+    if area.is_nan() || area > MAX_WARP_PIXELS {
+        return Err(Refused::Limit(format!("the puppet warp would cover {area:.0} pixels; the most it can draw is {MAX_WARP_PIXELS}")));
+    }
+    budget.pixels("the puppet warp", x1 - x0 + 1.0, y1 - y0 + 1.0)?;
+    let verts: Vec<([f64; 2], [f64; 2])> = v.iter().zip(&solver.mesh.verts).map(|(d, s)| (*d, *s)).collect();
+    let tris: Vec<[usize; 3]> = order.iter().map(|&t| solver.mesh.tris[t]).collect();
+    crate::warp::warp_triangles_controlled(src, bounds, &verts, &tris, interp, budget, ctl)
 }
 
 /// Moves a one-channel layer mask with a deformed mesh: the mask under the mesh is lifted,

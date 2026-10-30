@@ -77,8 +77,14 @@ impl SparseLs {
     pub fn add(&mut self, row: Vec<(usize, f64)>, rhs: f64, w: f64) {
         self.rows.push((row.into_iter().map(|(i, c)| (i, c * w)).collect(), rhs * w));
     }
-    /// CGLS from `x0`; at most `iters` iterations.
-    pub fn solve(&self, x0: &[f64], iters: usize) -> Vec<f64> {
+    /// Entries of the system's rows: one iteration reads each twice.
+    pub fn entries(&self) -> u64 {
+        self.rows.iter().map(|(r, _)| r.len() as u64).sum()
+    }
+
+    /// CGLS from `x0`; at most `iters` iterations, asking `ctl` before each. `None` once it is
+    /// cancelled.
+    pub fn solve_in(&self, x0: &[f64], iters: usize, ctl: &photocraft_raster::Interrupt) -> Option<Vec<f64>> {
         let n = self.n;
         let mut x = x0.to_vec();
         let ax = |x: &[f64]| -> Vec<f64> { self.rows.iter().map(|(r, _)| r.iter().map(|&(i, c)| c * x[i]).sum()).collect() };
@@ -97,6 +103,9 @@ impl SparseLs {
         let mut gamma: f64 = s.iter().map(|v| v * v).sum();
         let g0 = gamma.max(1e-30);
         for _ in 0..iters {
+            if ctl.cancelled() {
+                return None;
+            }
             if gamma <= g0 * 1e-20 {
                 break;
             }
@@ -120,7 +129,7 @@ impl SparseLs {
                 p[i] = s[i] + beta * p[i];
             }
         }
-        x
+        Some(x)
     }
 }
 
@@ -134,6 +143,16 @@ pub(crate) fn par_rows<T: Send + Sync>(buf: &mut [T], w: usize, ch: usize, f: im
     }
     #[cfg(target_arch = "wasm32")]
     buf.chunks_mut(stride).enumerate().for_each(|(y, row)| f(y, row));
+}
+
+/// [`par_rows`] that skips the rows left once `ctl` is cancelled (the caller then drops the
+/// buffer).
+pub(crate) fn par_rows_ctl<T: Send + Sync>(buf: &mut [T], w: usize, ch: usize, ctl: &photocraft_raster::Interrupt, f: impl Fn(usize, &mut [T]) + Sync + Send) {
+    par_rows(buf, w, ch, |y, row| {
+        if !ctl.cancelled() {
+            f(y, row);
+        }
+    });
 }
 
 /// Like [`par_rows`] but over two row-aligned buffers in lockstep (e.g. index + pixels).
@@ -261,7 +280,7 @@ mod tests {
             sp.add(vec![(0, x as f64), (1, 1.0)], y, 1.0);
         }
         let a = ne.solve().unwrap();
-        let b = sp.solve(&[0.0, 0.0], 50);
+        let b = sp.solve_in(&[0.0, 0.0], 50, &photocraft_raster::Interrupt::NONE).unwrap();
         assert!((a[0] - 2.0).abs() < 1e-9 && (a[1] - 1.0).abs() < 1e-9);
         assert!((b[0] - 2.0).abs() < 1e-6 && (b[1] - 1.0).abs() < 1e-6, "{b:?}");
         assert!(solve_dense(2, vec![1.0, 2.0, 2.0, 4.0], vec![1.0, 2.0]).is_none());

@@ -16,6 +16,7 @@ fn options<'a>(decode: &'a BakeDecoder<'a>) -> BakeOptions<'a> {
         max_pixels: 1 << 26,
         max_stack_bytes: 1 << 30,
         max_filter_bytes: 1 << 30,
+        max_work: 1 << 34,
     }
 }
 
@@ -324,4 +325,112 @@ fn a_liquify_bake_stops_inside_a_stroke() {
     assert!(matches!(result, Err(BakeError::Cancelled)));
     // The same stroke completes when not interrupted.
     assert!(bake(doc, &sm, 1).is_ok());
+}
+
+/// A smart filter of each special kernel ([`crate::filters::apply_filter_to_surface_controlled`])
+/// with parameters it takes, over the painted block at (-6, 5)-(40, 38).
+fn special_filters() -> Vec<(&'static str, Value)> {
+    vec![
+        (crate::distort_cmds::PUPPET_SMART, json!({"pins": [{"src": [5, 10], "dst": [5, 10]}, {"src": [35, 33], "dst": [45, 25]}]})),
+        (
+            crate::distort_cmds::PERSPECTIVE_SMART,
+            json!({"planes": [{"src": [[0, 5], [40, 5], [40, 38], [0, 38]], "dst": [[2, 8], [44, 3], [40, 41], [0, 36]]}]}),
+        ),
+        (crate::lens_cmds::LENS, json!({"distortion": 30, "vertical": 20, "redCyan": 30, "vignetteAmount": -30, "angle": 2})),
+        (crate::lens_cmds::WIDE, json!({"model": "fisheye", "focalLength": 10, "constraints": [{"a": [5, 10], "b": [38, 14], "orientation": "horizontal"}]})),
+        (
+            crate::lens_cmds::RAW,
+            json!({"clarity": 40, "dehaze": 30, "shadows": 40, "highlights": -30, "noiseLuminance": 30, "sharpenAmount": 50, "whites": 10}),
+        ),
+        ("image.adjustments.shadowsHighlights", json!({"shadowAmount": 50, "highlightAmount": 30})),
+        ("image.adjustments.brightnessContrast", json!({"brightness": 30, "contrast": 20})),
+    ]
+}
+
+fn with_filter(sm: &SmartObject, command: &str, params: &Value) -> SmartObject {
+    let mut sm = sm.clone();
+    sm.smart_filters = vec![SmartFilter { command: command.into(), params: params.clone(), blend: BlendMode::Normal, opacity: 1.0, visible: true }];
+    sm
+}
+
+#[test]
+fn special_filters_bake_like_the_editor() {
+    for depth in [8, 16, 32] {
+        let s = filtered(depth);
+        let doc = &s.active().unwrap().doc;
+        for (command, params) in special_filters() {
+            let sm = with_filter(&active_smart(&s), command, &params);
+            let baked = bake(doc, &sm, 1).unwrap_or_else(|e| panic!("{command} at {depth}: {e}"));
+            let editor = render_below_filter(doc, &sm, 1).unwrap().unwrap();
+            assert!(!baked.filtered.content_bounds().is_empty(), "{command} at {depth}: nothing baked");
+            assert_same(&baked.filtered, &editor, &format!("{command} at {depth}"));
+        }
+    }
+}
+
+#[test]
+fn special_filters_stop_inside_the_kernel() {
+    let s = filtered(16);
+    let doc = &s.active().unwrap().doc;
+    for (command, params) in special_filters() {
+        let sm = with_filter(&active_smart(&s), command, &params);
+        let total = {
+            let n = AtomicUsize::new(0);
+            let count = || {
+                n.fetch_add(1, Ordering::Relaxed);
+                false
+            };
+            bake_below_filter(doc, &sm, 1, &options(&decode), &photocraft_raster::Interrupt::cancel_only(&count)).unwrap();
+            n.load(Ordering::Relaxed)
+        };
+        // The bake's own stages check a handful of times; the kernel adds its rows, tiles or steps.
+        assert!(total > 12, "{command}: checked {total} times");
+        for stop in [total / 2, total - 3] {
+            let n = AtomicUsize::new(0);
+            let late = || n.fetch_add(1, Ordering::Relaxed) + 1 >= stop;
+            let out = bake_below_filter(doc, &sm, 1, &options(&decode), &photocraft_raster::Interrupt::cancel_only(&late));
+            assert!(matches!(out, Err(BakeError::Cancelled)), "{command}: stopping at check {stop} of {total}");
+        }
+    }
+}
+
+#[test]
+fn hostile_special_filters_are_refused_before_the_work() {
+    let s = filtered(8);
+    let doc = &s.active().unwrap().doc;
+    let base = active_smart(&s);
+    // `quick`: refused before the work (not after a solve that places the result).
+    let refusal = |command: &str, params: Value, opts: &BakeOptions<'_>, what: &str, quick: bool| {
+        let started = std::time::Instant::now();
+        let out = bake_below_filter(doc, &with_filter(&base, command, &params), 1, opts, &photocraft_raster::Interrupt::NONE);
+        match out {
+            Err(BakeError::Limit(m)) => assert!(m.contains(what), "{command}: refused for another reason: {m}"),
+            other => panic!("{command}: not a limit: {other:?}"),
+        }
+        assert!(!quick || started.elapsed().as_secs() < 2, "{command}: took {:?}", started.elapsed());
+    };
+    let refused = |command: &str, params: Value, opts: &BakeOptions<'_>, what: &str| refusal(command, params, opts, what, true);
+    let opts = options(&decode);
+    // A pin dragged a million pixels: the desktop leaves the layer as it is; a bake says why.
+    refused(crate::distort_cmds::PUPPET_SMART, json!({"pins": [{"src": [5, 10], "dst": [5, 10]}, {"src": [35, 33], "dst": [1e6, 1e6]}]}), &opts, "puppet warp");
+    // Pins enough to make binding them the work.
+    let pins: Vec<Value> = (0..20_000).map(|i| json!({"src": [5 + i % 30, 10 + i % 20], "dst": [6 + i % 30, 10 + i % 20]})).collect();
+    let work = BakeOptions { max_work: 1 << 24, ..options(&decode) };
+    refused(crate::distort_cmds::PUPPET_SMART, json!({ "pins": pins }), &work, "pins");
+    // More planes than the controlled warp takes, counted before they are parsed.
+    let plane = json!({"src": [[0, 5], [40, 5], [40, 38], [0, 38]], "dst": [[2, 8], [44, 3], [40, 41], [0, 36]]});
+    refused(crate::distort_cmds::PERSPECTIVE_SMART, json!({ "planes": vec![plane; crate::distort_cmds::MAX_CONTROLLED_PLANES + 1] }), &opts, "planes");
+    // A perspective warp thrown far off: its grid is placed, then refused, before it is drawn.
+    let far = json!({"planes": [{"src": [[0, 5], [40, 5], [40, 38], [0, 38]], "dst": [[0, 5], [90000, 5], [90000, 70000], [0, 38]]}]});
+    refused(crate::distort_cmds::PERSPECTIVE_SMART, far, &opts, "warped surface");
+    // Adaptive Wide Angle at 150 % (the most its params take) over a budget that holds the
+    // canvas (3072 pixels) but not the scaled image.
+    let few = BakeOptions { max_pixels: 5_000, ..options(&decode) };
+    // Its warped bounds are known once its mesh is solved.
+    refusal(crate::lens_cmds::WIDE, json!({"model": "fisheye", "focalLength": 10, "scale": 150}), &few, "pixels", false);
+    // Lens Correction, Camera Raw and Shadows/Highlights past the memory left to them.
+    let tight = BakeOptions { max_filter_bytes: 300_000, ..options(&decode) };
+    refused(crate::lens_cmds::LENS, json!({"distortion": 30}), &tight, "lens correction");
+    refused(crate::lens_cmds::RAW, json!({"clarity": 40}), &tight, "Camera Raw");
+    refused("image.adjustments.shadowsHighlights", json!({"shadowAmount": 50}), &tight, "Shadows/Highlights");
 }

@@ -89,6 +89,18 @@ const TOO_SPARSE: &str = "the adjustment would have to fill too large an area ar
 /// Works tile by tile in parallel, so a large layer needs one tile's buffers per thread rather
 /// than four full-layer copies, and the result is the same as one pass over the whole region.
 pub fn adjust_surface(s: &mut Surface, adj: &Adjustment, selection: Option<&Surface>, mode: photocraft_color::ColorMode) -> Result<(), String> {
+    adjust_surface_with(s, adj, selection, mode, &photocraft_raster::Interrupt::NONE)
+}
+
+/// [`adjust_surface`] asking `ctl` before each tile: once it is cancelled the remaining tiles go
+/// back unadjusted, so the caller drops `s`.
+pub fn adjust_surface_with(
+    s: &mut Surface,
+    adj: &Adjustment,
+    selection: Option<&Surface>,
+    mode: photocraft_color::ColorMode,
+    ctl: &photocraft_raster::Interrupt,
+) -> Result<(), String> {
     use rayon::prelude::*;
     let r = s.content_bounds();
     if r.is_empty() {
@@ -111,6 +123,10 @@ pub fn adjust_surface(s: &mut Surface, adj: &Adjustment, selection: Option<&Surf
         .flat_map_iter(|(tc, tile)| {
             // A one-tile surface, so `adjusted` reads and writes this tile only.
             let mut one = Surface::new(fmt);
+            if ctl.cancelled() {
+                one.put_tiles([(tc, tile)]);
+                return one.take_tiles(tc.rect());
+            }
             one.put_tiles([(tc, tile)]);
             let tr = tc.rect().intersect(&r);
             let out = adjusted(&one, tr, adj, selection, mode);

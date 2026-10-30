@@ -227,7 +227,7 @@ fn gaussian(p: Plane, n: usize) -> Vec<Plane> {
 }
 
 /// The local Laplacian filter of `u` with `remap(value, reference)`; the coarsest level is kept.
-fn llf(u: &Plane, remap: impl Fn(f32, f32) -> f32 + Sync) -> Plane {
+fn llf(u: &Plane, remap: impl Fn(f32, f32) -> f32 + Sync, ctl: &photocraft_raster::Interrupt) -> Plane {
     let n = depth(u.w, u.h);
     let g = gaussian(Plane { w: u.w, h: u.h, v: u.v.clone() }, n);
     // References span the image's tones; the deepest 0.1 % (noise down to the floor) share the
@@ -241,6 +241,9 @@ fn llf(u: &Plane, remap: impl Fn(f32, f32) -> f32 + Sync) -> Plane {
     let step = (hi - lo) / (refs - 1) as f32;
     let mut lap: Vec<Vec<f32>> = g[..n - 1].iter().map(|p| vec![0.0; p.v.len()]).collect();
     for k in 0..refs {
+        if ctl.cancelled() {
+            break;
+        }
         let r = lo + step * k as f32;
         let mut m = Plane { w: u.w, h: u.h, v: u.v.clone() };
         rows(&mut m.v, u.w, |_, row| {
@@ -313,49 +316,66 @@ fn knot(t: f32, k: &[f32; KNOTS]) -> f32 {
 /// The Highlights pass on the log luminance `u` (`amount` −1 … 1): pixels brighter than their
 /// surroundings move toward them (or away, for positive values) by the part of the difference
 /// past `sigma`, then the darkest content is put back where it was.
-fn highlights_pass(u: &Plane, amount: f32, side: &Side) -> Plane {
+fn highlights_pass(u: &Plane, amount: f32, side: &Side, ctl: &photocraft_raster::Interrupt) -> Plane {
     let (lo, hi) = range(u);
     let span = (hi - lo).max(1.0);
     let strengths = if amount < 0.0 { &side.pull } else { &side.push };
-    let o = llf(u, |x, g| x + knot((g - lo) / span, strengths) * amount * excess((x - g).max(0.0), side.sigma));
+    let o = llf(u, |x, g| x + knot((g - lo) / span, strengths) * amount * excess((x - g).max(0.0), side.sigma), ctl);
     let shift = quantile(&u.v, 0.01) - quantile(&o.v, 0.01);
     Plane { w: o.w, h: o.h, v: o.v.iter().map(|v| v + shift).collect() }
 }
 
 /// The Shadows pass on the log luminance `u` (`amount` −1 … 1).
-fn shadows_pass(u: &Plane, amount: f32) -> Plane {
+fn shadows_pass(u: &Plane, amount: f32, ctl: &photocraft_raster::Interrupt) -> Plane {
     let (lo, hi) = range(u);
     let span = (hi - lo).max(1.0);
     let k = if amount > 0.0 { amount } else { amount * SHADOWS.down };
-    let o = llf(u, |x, g| {
-        let below = ((g - x) / SHADOWS.sigma).clamp(0.0, 1.0);
-        if below == 0.0 {
-            return x;
-        }
-        let w = below * below * (3.0 - 2.0 * below);
-        x + k * knot((x - lo) / span, &SHADOWS.own) * knot((g - lo) / span, &SHADOWS.around) * w
-    });
+    let o = llf(
+        u,
+        |x, g| {
+            let below = ((g - x) / SHADOWS.sigma).clamp(0.0, 1.0);
+            if below == 0.0 {
+                return x;
+            }
+            let w = below * below * (3.0 - 2.0 * below);
+            x + k * knot((x - lo) / span, &SHADOWS.own) * knot((g - lo) / span, &SHADOWS.around) * w
+        },
+        ctl,
+    );
     // Keep the brightest content.
     let shift = quantile(&u.v, 0.99) - quantile(&o.v, 0.99);
     Plane { w: o.w, h: o.h, v: o.v.iter().map(|v| v + shift).collect() }
 }
 
 /// Applies Shadows and Highlights (−100 … 100) to straight RGBA pixels encoded with `enc`.
-pub(crate) fn apply(px: &mut [[f32; 4]], w: usize, h: usize, shadows: f32, highlights: f32, enc: Encoding) {
+pub(crate) fn apply(px: &mut [[f32; 4]], w: usize, h: usize, shadows: f32, highlights: f32, enc: Encoding, ctl: &photocraft_raster::Interrupt) {
     if (shadows == 0.0 && highlights == 0.0) || w < 2 || h < 2 {
         return;
     }
     const FLOOR: f32 = 1.0 / 65536.0;
-    let u = Plane { w, h, v: px.iter().map(|q| (luma([0, 1, 2].map(|c| enc.decode(q[c]))).max(0.0) + FLOOR).log2()).collect() };
+    // By rows, asking `ctl` per row: one pass of `decode` and `log2` over a large image is long.
+    let mut v = vec![0.0f32; w * h];
+    crate::photo_util::par_rows_ctl(&mut v, w, 1, ctl, |y, row| {
+        for (o, q) in row.iter_mut().zip(&px[y * w..]) {
+            *o = (luma([0, 1, 2].map(|c| enc.decode(q[c]))).max(0.0) + FLOOR).log2();
+        }
+    });
+    if ctl.cancelled() {
+        return;
+    }
+    let u = Plane { w, h, v };
     // The filter on a copy at most WORK_SIDE across (box-averaged in log).
     let f = w.max(h).div_ceil(WORK_SIDE).max(1);
     let small = if f == 1 { Plane { w, h, v: u.v.clone() } } else { shrink(&u, f) };
     let mut o = Plane { w: small.w, h: small.h, v: small.v.clone() };
     if highlights != 0.0 {
-        o = highlights_pass(&o, highlights.clamp(-100.0, 100.0) / 100.0, &HIGHLIGHTS);
+        o = highlights_pass(&o, highlights.clamp(-100.0, 100.0) / 100.0, &HIGHLIGHTS, ctl);
     }
-    if shadows != 0.0 {
-        o = shadows_pass(&o, shadows.clamp(-100.0, 100.0) / 100.0);
+    if shadows != 0.0 && !ctl.cancelled() {
+        o = shadows_pass(&o, shadows.clamp(-100.0, 100.0) / 100.0, ctl);
+    }
+    if ctl.cancelled() {
+        return;
     }
     // The change in log luminance, at full size.
     let change: Vec<f32> = if f == 1 {
@@ -364,7 +384,7 @@ pub(crate) fn apply(px: &mut [[f32; 4]], w: usize, h: usize, shadows: f32, highl
         let d: Vec<f32> = o.v.iter().zip(&small.v).map(|(a, b)| a - b).collect();
         guided_upsample(&small, &d, &u)
     };
-    par_rows(px, w, 1, |y, row| {
+    crate::photo_util::par_rows_ctl(px, w, 1, ctl, |y, row| {
         for (x, q) in row.iter_mut().enumerate() {
             let gain = change[y * w + x].exp2();
             for c in 0..3 {
@@ -513,7 +533,7 @@ mod tests {
     #[test]
     fn a_flat_image_is_unchanged() {
         let mut px = grey(64, 48, |_, _| 0.4);
-        apply(&mut px, 64, 48, 100.0, -100.0, SRGB);
+        apply(&mut px, 64, 48, 100.0, -100.0, SRGB, &photocraft_raster::Interrupt::NONE);
         assert!(px.iter().all(|q| (q[0] - 0.4).abs() < 1e-5));
     }
 
@@ -523,7 +543,7 @@ mod tests {
         // moves either): the bright half stays, and no halo forms on either side of the edge.
         let (w, h) = (256, 128);
         let mut px = grey(w, h, |x, _| if x < w / 2 { 0.1 } else { 0.6 });
-        apply(&mut px, w, h, 100.0, 0.0, SRGB);
+        apply(&mut px, w, h, 100.0, 0.0, SRGB, &photocraft_raster::Interrupt::NONE);
         let row = &px[64 * w..65 * w];
         assert!((row[w / 2 + 1][0] - 0.6).abs() < 0.002 && (row[w - 5][0] - 0.6).abs() < 0.002);
         let (far, near) = (row[10][0], row[w / 2 - 1][0]);
@@ -548,7 +568,7 @@ mod tests {
         };
         for (s, hl, want) in [(100.0, 0.0, 165.3), (0.0, -100.0, 89.6)] {
             let mut px = image(0.5);
-            apply(&mut px, n, n, s, hl, SRGB);
+            apply(&mut px, n, n, s, hl, SRGB, &photocraft_raster::Interrupt::NONE);
             let got = px[175 * n + 100][0] * 255.0;
             assert!((got - want).abs() < 5.0, "{s} {hl}: {got} vs {want}");
         }
@@ -558,7 +578,7 @@ mod tests {
     fn highlights_lower_a_bright_area_and_keep_the_darkest() {
         let (w, h) = (192, 192);
         let mut px = grey(w, h, |x, y| if (64..128).contains(&x) && (64..128).contains(&y) { 0.8 } else { 0.2 });
-        apply(&mut px, w, h, 0.0, -100.0, SRGB);
+        apply(&mut px, w, h, 0.0, -100.0, SRGB, &photocraft_raster::Interrupt::NONE);
         assert!(px[96 * w + 96][0] < 0.75, "{}", px[96 * w + 96][0]);
         assert!((px[5 * w + 5][0] - 0.2).abs() < 0.01, "{}", px[5 * w + 5][0]);
     }
@@ -572,7 +592,7 @@ mod tests {
         let mut px = grey(w, h, |x, _| crate::photo_util::linear_to_srgb((x as f32 / (w - 1) as f32 * 8.0 - 9.0).exp2()));
         for (s, hl) in [(100.0, 0.0), (0.0, -100.0), (-100.0, 100.0)] {
             let mut p = px.clone();
-            apply(&mut p, w, h, s, hl, SRGB);
+            apply(&mut p, w, h, s, hl, SRGB, &photocraft_raster::Interrupt::NONE);
             let row: Vec<f32> = (0..w).map(|x| crate::photo_util::srgb_to_linear(p[24 * w + x][0]).max(1e-6).log2()).collect();
             let steps: Vec<f32> = row.windows(2).map(|d| d[1] - d[0]).collect();
             assert!(steps.iter().all(|d| *d > 0.0), "{s} {hl}: the ramp reverses");
@@ -588,7 +608,7 @@ mod tests {
     fn the_result_does_not_depend_on_the_image_size() {
         let at = |n: usize| {
             let mut px = grey(n, n, |x, y| if x < n / 3 || y < n / 4 { 0.08 } else { 0.7 });
-            apply(&mut px, n, n, 70.0, -60.0, SRGB);
+            apply(&mut px, n, n, 70.0, -60.0, SRGB, &photocraft_raster::Interrupt::NONE);
             [px[(n / 8) * n + n / 8][0], px[(3 * n / 4) * n + 3 * n / 4][0]]
         };
         let (a, b) = (at(96), at(384));

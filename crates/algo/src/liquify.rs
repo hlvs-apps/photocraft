@@ -731,6 +731,10 @@ fn apply_liquify_inner(src: &Surface, field: &LiquifyField, ctl: &photocraft_ras
     let has_freeze = field.freeze.iter().any(|&f| f > 0.0);
     let tiles: Vec<Rect> = b.tiles().map(|t| t.rect().intersect(&b)).filter(|r| !r.is_empty() && field.touches(*r)).collect();
     let work = |t: &Rect| -> Option<(Rect, Vec<f32>)> {
+        // Per tile as well as per batch: one batch on one worker is many tiles.
+        if ctl.cancelled() {
+            return None;
+        }
         let w = t.width() as usize;
         let h = t.height() as usize;
         // Field per pixel (bicubic), with axis taps shared across rows and columns.
