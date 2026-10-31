@@ -101,7 +101,7 @@ pub fn warp_mesh_surface_controlled(
         let fmt = src.format();
         return Ok(Surface::new(PixelFormat::new(fmt.mode, fmt.sample, true)));
     }
-    let (verts, tris) = mesh_grid(src_rect, f, ctl).ok_or(Refused::Cancelled)?;
+    let (verts, tris) = mesh_grid(src_rect, f, ctl, Some(budget))?;
     triangles_in(src, src_rect, &verts, &tris, interp, ctl, Some(budget))
 }
 
@@ -110,28 +110,37 @@ fn mesh(src: &Surface, src_rect: Rect, f: &(dyn Fn(f64, f64) -> (f64, f64) + Syn
         let fmt = src.format();
         return Surface::new(PixelFormat::new(fmt.mode, fmt.sample, true));
     }
-    match mesh_grid(src_rect, f, ctl) {
-        Some((verts, tris)) => triangles(src, src_rect, &verts, &tris, interp, ctl),
-        None => Surface::new(PixelFormat::new(src.format().mode, src.format().sample, true)),
+    match mesh_grid(src_rect, f, ctl, None) {
+        Ok((verts, tris)) => triangles(src, src_rect, &verts, &tris, interp, ctl),
+        Err(_) => Surface::new(PixelFormat::new(src.format().mode, src.format().sample, true)),
     }
 }
 
 /// The forward-mapped grid over `src_rect` (non-empty): `(destination, source)` per vertex and
-/// two triangles per cell. `None` once `ctl` is cancelled (asked per row of vertices: the map can
+/// two triangles per cell. Refused once `ctl` is cancelled (asked per row of vertices: the map can
 /// be costly, a perspective warp looks up its plane for every vertex).
 #[allow(clippy::type_complexity)]
-fn mesh_grid(src_rect: Rect, f: &(dyn Fn(f64, f64) -> (f64, f64) + Sync), ctl: &Interrupt) -> Option<(Vec<([f64; 2], [f64; 2])>, Vec<[usize; 3]>)> {
+fn mesh_grid(
+    src_rect: Rect,
+    f: &(dyn Fn(f64, f64) -> (f64, f64) + Sync),
+    ctl: &Interrupt,
+    budget: Option<&Budget>,
+) -> Result<(Vec<([f64; 2], [f64; 2])>, Vec<[usize; 3]>), Refused> {
     let (sw, sh) = (f64::from(src_rect.width()), f64::from(src_rect.height()));
     // Cells are a few pixels across on both sides of the map: a thin source stretched far (a
     // 3 px column scaled into a wide band, then bent) needs many cells, or it comes out straight.
     let (lu, lv) = mapped_lengths(src_rect, f);
     let cells = |s: f64, d: f64| ((s.max(d) / CELL).ceil() as usize).clamp(1, MAX_CELLS);
     let (nx, ny) = (cells(sw, lu), cells(sh, lv));
+    if let Some(b) = budget {
+        b.bytes("the warp grid", ((nx + 1) * (ny + 1) * size_of::<([f64; 2], [f64; 2])>() + nx * ny * 2 * size_of::<[usize; 3]>()) as u64)?;
+        b.work("mapping the warp grid", ((nx + 1) * (ny + 1)) as u64)?;
+    }
     // Forward-mapped vertices (and their source positions).
     let mut verts = Vec::with_capacity((nx + 1) * (ny + 1));
     for j in 0..=ny {
         if ctl.cancelled() {
-            return None;
+            return Err(Refused::Cancelled);
         }
         for i in 0..=nx {
             let sx = f64::from(src_rect.x0) + sw * i as f64 / nx as f64;
@@ -149,7 +158,7 @@ fn mesh_grid(src_rect: Rect, f: &(dyn Fn(f64, f64) -> (f64, f64) + Sync), ctl: &
             tris.push([a, a + w1 + 1, a + w1]);
         }
     }
-    Some((verts, tris))
+    Ok((verts, tris))
 }
 
 /// Probe lines per axis [`mapped_lengths`] follows through the map.
@@ -301,6 +310,7 @@ fn triangles_in(
             let ts = f64::from(photocraft_geom::TILE_SIZE);
             let (dx0, dy0, dx1, dy1) = (f64::from(dst.x0), f64::from(dst.y0), f64::from(dst.x1), f64::from(dst.y1));
             for tri in tris {
+                crate::control::check(ctl)?;
                 let ps = tri.map(|v| verts[v].0);
                 let bx0 = ps.iter().map(|p| p[0]).fold(f64::MAX, f64::min).floor().max(dx0);
                 let by0 = ps.iter().map(|p| p[1]).fold(f64::MAX, f64::min).floor().max(dy0);
@@ -315,8 +325,16 @@ fn triangles_in(
             let workers = crate::control::workers();
             let n = fmt.channels();
             // Bins, and every worker's per-pixel source position and owner.
+            let tiles = u64::from(dst.width()).div_ceil(ts_px).saturating_add(1).saturating_mul(u64::from(dst.height()).div_ceil(ts_px).saturating_add(1));
+            let retained = tiles
+                .saturating_mul(ts_px * ts_px)
+                .saturating_mul(fmt.bytes_per_pixel() as u64)
+                .saturating_add((size_of_val(verts) + size_of_val(tris)) as u64)
+                .saturating_add(tiles.saturating_mul(64));
             let fixed = binned
-                .saturating_mul(std::mem::size_of::<[usize; 3]>() as u64)
+                .saturating_mul(2 * std::mem::size_of::<[usize; 3]>() as u64)
+                .saturating_add(retained)
+                .saturating_add(workers.saturating_mul(tris.len() as u64).saturating_mul(size_of::<([f64; 4], usize, usize)>() as u64))
                 .saturating_add(workers.saturating_mul((ts_px * ts_px).saturating_mul(std::mem::size_of::<[f64; 2]>() as u64 + 4 + 4 * n as u64)));
             b.bytes("the warp's bookkeeping", fixed)?;
             let share = (b.max_bytes - fixed) / workers / (4 * n as u64).max(1);
@@ -340,6 +358,7 @@ fn triangles_in(
         lookup[grid_of(t)] = k;
     }
     for &tri in tris {
+        crate::control::check(ctl)?;
         let ps = tri.map(|v| verts[v].0);
         let bx0 = ps.iter().map(|p| p[0]).fold(f64::MAX, f64::min).floor() as i32;
         let by0 = ps.iter().map(|p| p[1]).fold(f64::MAX, f64::min).floor() as i32;
@@ -389,6 +408,9 @@ fn triangles_in(
         let mut owner = vec![0u32; w * h];
         let mut jac: Vec<([f64; 4], usize, usize)> = Vec::with_capacity(tris.len());
         for (k, tri) in tris.iter().enumerate() {
+            if ctl.cancelled() {
+                return None;
+            }
             let [(p0, s0), (p1, s1), (p2, s2)] = tri.map(|v| verts[v]);
             let det = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p2[0] - p0[0]) * (p1[1] - p0[1]);
             if det.abs() < 1e-12 {
@@ -412,6 +434,9 @@ fn triangles_in(
             let by1 = (p0[1].max(p1[1]).max(p2[1]) + 0.5).ceil().min(f64::from(t.y1)) as i32;
             let eps = -1e-9;
             for y in by0..by1 {
+                if ctl.cancelled() {
+                    return None;
+                }
                 let py = f64::from(y) + 0.5;
                 for x in bx0..bx1 {
                     let px = f64::from(x) + 0.5;

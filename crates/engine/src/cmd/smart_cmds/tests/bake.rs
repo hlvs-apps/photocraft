@@ -631,3 +631,82 @@ fn a_nested_bake_stops_when_interrupted() {
         assert!(matches!(out, Err(BakeError::Cancelled)), "stopping at check {stop} of {total}");
     }
 }
+
+#[test]
+fn mesh_placement_obeys_the_solver_budget_without_a_filter() {
+    let mut s = filtered(8);
+    let doc = s.active().unwrap().doc.clone();
+    let source = source_box(&doc, &active_smart(&s)).unwrap();
+    edit_smart(&mut s, |sm| sm.warp = Some(Warp::preset(WarpStyle::Arc, 35.0, source)));
+    let opts = BakeOptions { max_work: 1, ..options(&decode) };
+    let out = bake_below_filter(&s.active().unwrap().doc, &active_smart(&s), 0, &opts, &photocraft_raster::Interrupt::NONE);
+    assert!(matches!(out, Err(BakeError::Limit(m)) if m.contains("warp")), "placement must use the controlled kernel");
+}
+
+#[test]
+fn regenerated_caches_share_one_retained_budget() {
+    let mut doc = Document::new("shapes", Size::new(256, 256), ColorMode::Rgb, SampleType::U8);
+    for i in 0..8 {
+        doc.layers.push(Layer::new(
+            format!("shape {i}"),
+            LayerContent::Shape(photocraft_doc::ShapeLayer {
+                path: photocraft_vector::shapes::rect(0.0, 0.0, 256.0, 256.0),
+                fill: Some(photocraft_doc::Fill::Solid(photocraft_color::Color::BLACK)),
+                ..Default::default()
+            }),
+        ));
+    }
+    let (page, sm) = page_with_contents(&doc);
+    let opts = BakeOptions { max_stack_bytes: 4 * 256 * 256 * 4, ..options(&decode) };
+    let out = bake_below_filter(&page, &sm, 0, &opts, &photocraft_raster::Interrupt::NONE);
+    assert!(matches!(out, Err(BakeError::Limit(m)) if m.contains("retained surface")));
+    assert!(bake_below_filter(&page, &sm, 0, &options(&decode), &photocraft_raster::Interrupt::NONE).is_ok());
+}
+
+#[test]
+fn invisible_contents_do_not_need_fonts_or_linked_sources() {
+    let mut doc = layered_contents(Cached::Missing, SampleType::U8);
+    let (base, sm) = page_with_contents(&doc);
+    let expected = bake(&base, &sm, 0).unwrap();
+    let mut hidden = Layer::group("hidden", vec![Layer::new("missing font", LayerContent::Text(title("Not Installed", "Hello")))]);
+    hidden.visible = false;
+    doc.layers.push(hidden);
+    let (page, sm) = page_with_contents(&doc);
+    assert_same(&bake(&page, &sm, 0).unwrap().original, &expected.original, "hidden group");
+}
+
+#[test]
+fn nested_text_cap_is_one_short_layout_unit() {
+    let mut doc = Document::new("text", Size::new(64, 64), ColorMode::Rgb, SampleType::U8);
+    doc.layers.push(Layer::new("essay", LayerContent::Text(title("Inter", &"x".repeat(16_385)))));
+    let (page, sm) = page_with_contents(&doc);
+    let out = bake(&page, &sm, 0);
+    assert!(matches!(out, Err(BakeError::Limit(m)) if m.contains("characters")));
+}
+
+#[test]
+fn text_metadata_cannot_bypass_the_character_cap() {
+    let mut text = title("Inter", "x");
+    text.runs = vec![photocraft_doc::text::TextRun { len: 0, style: Default::default() }; 16_385];
+    let mut doc = Document::new("text", Size::new(64, 64), ColorMode::Rgb, SampleType::U8);
+    doc.layers.push(Layer::new("runs", LayerContent::Text(text)));
+    let (page, sm) = page_with_contents(&doc);
+    let out = bake(&page, &sm, 0);
+    assert!(matches!(out, Err(BakeError::Limit(m)) if m.contains("style runs")));
+}
+
+#[test]
+fn plane_count_is_refused_before_parsing_the_planes() {
+    let mut s = filtered(8);
+    edit_smart(&mut s, |sm| {
+        sm.smart_filters = vec![SmartFilter {
+            command: crate::distort_cmds::PERSPECTIVE_SMART.into(),
+            params: json!({"planes": vec![Value::Null; crate::distort_cmds::MAX_CONTROLLED_PLANES + 1]}),
+            blend: BlendMode::Normal,
+            opacity: 1.0,
+            visible: true,
+        }];
+    });
+    let out = bake(&s.active().unwrap().doc, &active_smart(&s), 1);
+    assert!(matches!(out, Err(BakeError::Limit(m)) if m.contains("planes")));
+}

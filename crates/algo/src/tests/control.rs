@@ -259,8 +259,12 @@ fn a_tile_reading_past_its_share_is_refused_not_left_empty() {
     let budget = Budget { max_pixels: 1 << 24, max_bytes: 17 << 20, max_work: 1 << 30 };
     let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
     pool.install(|| {
-        refused("source window", || {
+        refused("bookkeeping", || {
             crate::warp::warp_mesh_surface_controlled(&src, Rect::new(0, 0, 1024, 1024), &shrink, Interp::Bilinear, &budget, &Interrupt::NONE)
+        });
+        let window = Budget { max_bytes: 48 << 20, ..budget };
+        refused("source window", || {
+            crate::warp::warp_mesh_surface_controlled(&src, Rect::new(0, 0, 1024, 1024), &shrink, Interp::Bilinear, &window, &Interrupt::NONE)
         });
     });
     // With room for the window it draws.
@@ -290,4 +294,22 @@ fn a_wide_angle_scaled_far_or_overconstrained_is_refused() {
     refused_after_work("pixels", || crate::wideangle::apply_controlled(&src, R, &big, Interp::Bilinear, &budget, &Interrupt::NONE));
     let many = WideAngle { constraints: vec![Constraint { a: [4.0, 5.0], b: [36.0, 9.0], orientation: Orientation::Free }; 100_000], ..wide() };
     refused("constraints", || crate::wideangle::apply_controlled(&src, R, &many, Interp::Bilinear, &SMALL, &Interrupt::NONE));
+}
+
+#[test]
+fn geometry_refuses_memory_before_building_its_grid_or_solver() {
+    let src = blob(SampleType::U8);
+    let bounds = Rect::new(0, 0, 80, 80);
+    let budget = Budget { max_bytes: 1024, ..Budget::UNLIMITED };
+    let calls = AtomicUsize::new(0);
+    let map = |x, y| {
+        calls.fetch_add(1, Ordering::Relaxed);
+        (x, y)
+    };
+    let out = crate::warp::warp_mesh_surface_controlled(&src, bounds, &map, Interp::Bicubic, &budget, &Interrupt::NONE);
+    assert!(matches!(out, Err(Refused::Limit(m)) if m.contains("warp grid")));
+    // The fixed map-length probes are allowed, but no allocated grid is mapped.
+    assert!(calls.load(Ordering::Relaxed) < 1000);
+    let out = crate::wideangle::apply_controlled(&src, bounds, &wide(), Interp::Bicubic, &budget, &Interrupt::NONE);
+    assert!(matches!(out, Err(Refused::Limit(m)) if m.contains("wide-angle solver")));
 }

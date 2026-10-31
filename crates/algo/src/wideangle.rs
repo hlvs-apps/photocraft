@@ -263,6 +263,8 @@ fn solve_in(p: &WideAngle, frame: Rect, ctl: &Interrupt, budget: Option<&Budget>
     if let Some(b) = budget {
         // Each constraint adds 24 rows of 16 entries, read twice per iteration.
         b.work("the wide-angle constraints", (p.constraints.len() as u64).saturating_mul(24 * 16 * 2).saturating_mul(SOLVE_ITERATIONS))?;
+        let rows = (nx * ny * 24 + 2 * nv) as u64 + (p.constraints.len() as u64).saturating_mul(24);
+        b.bytes("the wide-angle solver", rows.saturating_mul(16 * size_of::<(usize, f64)>() as u64 + 64).saturating_add((nv as u64).saturating_mul(256)))?;
     }
     let mut curves: Vec<Vec<[f64; 2]>> = Vec::with_capacity(p.constraints.len());
     for c in &p.constraints {
