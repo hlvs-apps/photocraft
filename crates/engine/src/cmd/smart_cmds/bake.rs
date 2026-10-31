@@ -89,7 +89,7 @@ pub struct BakeOptions<'a> {
 
 /// Longest text (in characters) a text layer of the contents may have: its layout is one step no
 /// interrupt splits.
-pub const MAX_TEXT_CHARS: usize = 1 << 16;
+pub const MAX_TEXT_CHARS: usize = 1 << 14;
 
 /// What [`bake_below_filter`] made, in document pixels at the document's pixel format.
 #[derive(Clone, Debug)]
@@ -237,29 +237,6 @@ fn apply(f: &SmartFilter, cur: &Surface, bounds: Rect, extent: Rect, opts: &Bake
     if working > max_bytes {
         return Err(BakeError::Limit(format!("the smart filter {} needs an estimated {working} bytes; the limit is {max_bytes}", f.command)));
     }
-    // Stored records bypass command dispatch. Its tolerant replay drops malformed special
-    // filters, which is not a successful bake.
-    match f.command.as_str() {
-        crate::distort_cmds::LIQUIFY => {
-            crate::distort_cmds::liquify_params(&f.command, &f.params, extent)?;
-        }
-        crate::distort_cmds::PUPPET | crate::distort_cmds::PUPPET_SMART => {
-            crate::distort_cmds::puppet_params(&f.command, &f.params)?;
-        }
-        crate::distort_cmds::PERSPECTIVE | crate::distort_cmds::PERSPECTIVE_SMART => {
-            crate::distort_cmds::perspective_params(&f.command, &f.params)?;
-        }
-        crate::lens_cmds::LENS => {
-            crate::lens_cmds::lens_params(&f.command, &f.params, extent, None)?;
-        }
-        crate::lens_cmds::WIDE => {
-            crate::lens_cmds::wide_params(&f.command, &f.params, None)?;
-        }
-        crate::lens_cmds::RAW => {
-            crate::lens_cmds::raw_params(&f.command, &f.params)?;
-        }
-        _ => {}
-    }
     // The special kernels hold their own buffers on top of what the estimate above reserves for
     // the bake's surfaces; they get what it leaves.
     let budget = photocraft_algo::control::Budget { max_pixels: opts.max_pixels, max_bytes: max_bytes - working, max_work: opts.max_work };
@@ -292,13 +269,34 @@ impl Nesting {
     }
 }
 
+fn surface_bytes(s: &Surface) -> u64 {
+    (s.tile_count() as u64)
+        .saturating_mul(photocraft_geom::TILE_SIZE as u64 * photocraft_geom::TILE_SIZE as u64)
+        .saturating_mul(s.format().bytes_per_pixel() as u64)
+}
+
+impl Nesting {
+    fn check_surface(&self, rect: Rect, fmt: PixelFormat, opts: &BakeOptions<'_>) -> Result<(), BakeError> {
+        let ts = photocraft_geom::TILE_SIZE as u64;
+        let tiles = if rect.is_empty() {
+            0
+        } else {
+            let ts = photocraft_geom::TILE_SIZE;
+            let cols = i64::from((rect.x1 - 1).div_euclid(ts)) - i64::from(rect.x0.div_euclid(ts)) + 1;
+            let rows = i64::from((rect.y1 - 1).div_euclid(ts)) - i64::from(rect.y0.div_euclid(ts)) + 1;
+            (cols as u64).saturating_mul(rows as u64)
+        };
+        let bytes = tiles.saturating_mul(ts * ts).saturating_mul(fmt.bytes_per_pixel() as u64);
+        if self.held.get().saturating_add(bytes) > opts.max_stack_bytes {
+            return Err(BakeError::Limit("the redrawn contents exceed the retained surface budget".into()));
+        }
+        Ok(())
+    }
+}
+
 /// Bytes the layers of `doc` store (their own surfaces and caches, masks included).
 fn stored_bytes(layers: &[Layer]) -> u64 {
-    let surface = |s: &Surface| {
-        (s.tile_count() as u64)
-            .saturating_mul(photocraft_geom::TILE_SIZE as u64 * photocraft_geom::TILE_SIZE as u64)
-            .saturating_mul(s.format().bytes_per_pixel() as u64)
-    };
+    let surface = surface_bytes;
     layers.iter().fold(0u64, |acc, l| {
         let own = l.surface().map_or(0, surface).saturating_add(l.mask.as_ref().map_or(0, |m| surface(&m.surface)));
         acc.saturating_add(own).saturating_add(l.children().map_or(0, stored_bytes))
@@ -330,16 +328,24 @@ fn contents(
             opts.max_stack_bytes
         )));
     }
+    let previous_held = nest.held.get();
     nest.depth.set(depth);
-    nest.held.set(nest.held.get() + held);
-    let out = redraw(&mut doc, opts, nest, ctl).and_then(|()| composite(&doc, fmt, sm, opts, ctl));
+    nest.held.set(previous_held + held);
+    let out = redraw(&mut doc, opts, nest, ctl).and_then(|()| composite(&doc, fmt, sm, opts, nest, ctl));
     nest.depth.set(depth - 1);
-    nest.held.set(nest.held.get() - held);
+    nest.held.set(previous_held);
     out
 }
 
 /// [`contents`] once its layers are drawn again.
-fn composite(doc: &Document, fmt: PixelFormat, sm: &SmartObject, opts: &BakeOptions<'_>, ctl: &Interrupt<'_>) -> Result<(Surface, Rect), BakeError> {
+fn composite(
+    doc: &Document,
+    fmt: PixelFormat,
+    sm: &SmartObject,
+    opts: &BakeOptions<'_>,
+    nest: &Nesting,
+    ctl: &Interrupt<'_>,
+) -> Result<(Surface, Rect), BakeError> {
     let bounds = doc.bounds();
     let buf = match sm.stack_mode {
         None => photocraft_compose::flatten_with(doc, &opts.render, ctl).map_err(render_error("compositing the smart object's contents"))?,
@@ -354,7 +360,7 @@ fn composite(doc: &Document, fmt: PixelFormat, sm: &SmartObject, opts: &BakeOpti
                 return Err(BakeError::Engine(EngineError::Other("the smart object's contents have no visible layers".into())));
             }
             let held = (visible.len() as u64).saturating_mul(area(bounds)).saturating_mul(16);
-            if held > opts.max_stack_bytes {
+            if held.saturating_add(nest.held.get()) > opts.max_stack_bytes {
                 return Err(BakeError::Limit(format!("the stack mode would hold {held} bytes of frames; the limit is {}", opts.max_stack_bytes)));
             }
             let mut frames = Vec::with_capacity(visible.len());
@@ -391,6 +397,10 @@ fn redraw(doc: &mut Document, opts: &BakeOptions<'_>, nest: &Nesting, ctl: &Inte
 fn redraw_layers(layers: &mut [Layer], doc: &Document, path: &str, opts: &BakeOptions<'_>, nest: &Nesting, ctl: &Interrupt<'_>) -> Result<(), BakeError> {
     for l in layers {
         check(ctl)?;
+        if !l.visible {
+            continue;
+        }
+        let before = l.surface().map_or(0, surface_bytes);
         let name = if path.is_empty() { format!("\"{}\"", l.name) } else { format!("{path} › \"{}\"", l.name) };
         let named = |e: BakeError| match e {
             BakeError::Limit(m) => BakeError::Limit(format!("the layer {name} of the smart object's contents: {m}")),
@@ -401,12 +411,18 @@ fn redraw_layers(layers: &mut [Layer], doc: &Document, path: &str, opts: &BakeOp
         match &mut l.content {
             LayerContent::Group(g) => redraw_layers(&mut g.children, doc, &name, opts, nest, ctl)?,
             LayerContent::Text(t) => redraw_text(t, doc, opts, nest, ctl).map_err(named)?,
-            LayerContent::Shape(sh) => redraw_shape(sh, doc).map_err(named)?,
+            LayerContent::Shape(sh) => redraw_shape(sh, doc, opts, nest, ctl).map_err(named)?,
             LayerContent::Smart(sm) => {
                 let drawn = redraw_smart(doc, sm, opts, nest, ctl).map_err(named)?;
                 sm.cache = Some(drawn);
             }
             _ => {}
+        }
+        if !l.is_group() {
+            nest.held.set(nest.held.get().saturating_sub(before).saturating_add(l.surface().map_or(0, surface_bytes)));
+            if nest.held.get() > opts.max_stack_bytes {
+                return Err(named(BakeError::Limit("the redrawn contents exceed the retained surface budget".into())));
+            }
         }
     }
     Ok(())
@@ -418,6 +434,22 @@ fn redraw_text(t: &mut TextLayer, doc: &Document, opts: &BakeOptions<'_>, nest: 
     let chars = t.text.chars().count();
     if chars > MAX_TEXT_CHARS {
         return Err(BakeError::Limit(format!("its text has {chars} characters; the most a bake draws is {MAX_TEXT_CHARS}")));
+    }
+    // Layout clones the run metadata; rasterization scans glyphs once per colour.
+    if t.runs.len().max(t.paragraphs.len()) > MAX_TEXT_CHARS || chars.saturating_mul(t.runs.len().max(1)) > 1 << 20 {
+        return Err(BakeError::Limit("its text style runs exceed the layout work budget".into()));
+    }
+    let path_error = |e| BakeError::Limit(format!("its text path: {e}"));
+    match &t.shape {
+        photocraft_doc::text::TextShape::Area { path } => photocraft_vector::flatten::validate_shape(path, None).map_err(path_error)?,
+        photocraft_doc::text::TextShape::Path { path, .. } => {
+            if path.knots.len() > 4096 {
+                return Err(path_error("more than 4096 knots"));
+            }
+            let path = photocraft_doc::Path { subpaths: vec![path.clone()], ..Default::default() };
+            photocraft_vector::flatten::validate_shape(&path, None).map_err(path_error)?;
+        }
+        _ => {}
     }
     let mut engine = nest.text(opts).lock().unwrap_or_else(PoisonError::into_inner);
     let layout = engine.layout(t, doc.resolution_dpi);
@@ -465,6 +497,12 @@ fn redraw_text(t: &mut TextLayer, doc: &Document, opts: &BakeOptions<'_>, nest: 
     }
     check(ctl)?;
     let warp = photocraft_text::render::layout_deform(&layout, t);
+    let ink = photocraft_text::render::ink_rect_warped(&layout, &t.transform, warp.as_ref());
+    if area(ink) > opts.max_pixels || area(ink).saturating_mul(64) > opts.max_filter_bytes {
+        return Err(BakeError::Limit("the text raster exceeds the pixel or working memory budget".into()));
+    }
+    nest.check_surface(ink, doc.pixel_format(), opts)?;
+    check(ctl)?;
     let drawn = photocraft_text::render::rasterize_warped(&layout, &t.transform, doc.pixel_format(), t.antialias, warp.as_ref());
     t.cache = Some(drawn.surface);
     Ok(())
@@ -472,9 +510,20 @@ fn redraw_text(t: &mut TextLayer, doc: &Document, opts: &BakeOptions<'_>, nest: 
 
 /// A shape layer drawn from its path, fill and stroke over the canvas, as the editor does after
 /// an edit, once its path passes the editor's own checks for one.
-fn redraw_shape(sh: &mut ShapeLayer, doc: &Document) -> Result<(), BakeError> {
+fn redraw_shape(sh: &mut ShapeLayer, doc: &Document, opts: &BakeOptions<'_>, nest: &Nesting, ctl: &Interrupt<'_>) -> Result<(), BakeError> {
     photocraft_vector::flatten::validate_shape(&sh.path, sh.stroke.as_ref()).map_err(|e| BakeError::Limit(format!("its path: {e}")))?;
-    sh.cache = Some(photocraft_vector::render_shape(sh, doc.pixel_format(), doc.bounds()));
+    nest.check_surface(doc.bounds(), doc.pixel_format(), opts)?;
+    if area(doc.bounds()).saturating_mul(64) > opts.max_filter_bytes {
+        return Err(BakeError::Limit("the shape raster exceeds the working memory budget".into()));
+    }
+    let compiled = photocraft_vector::CompiledShape::new(sh, photocraft_vector::DEFAULT_TOLERANCE, doc.bounds());
+    let mut drawn = Surface::new(doc.pixel_format());
+    for tile in compiled.bounds().unwrap_or(Rect::EMPTY).intersect(&doc.bounds()).tiles() {
+        check(ctl)?;
+        let part = compiled.render(doc.pixel_format(), tile.rect().intersect(&doc.bounds()));
+        drawn.put_tiles(part.tiles().map(|(tc, px)| (*tc, px.clone())));
+    }
+    sh.cache = Some(drawn);
     Ok(())
 }
 
@@ -550,14 +599,14 @@ fn place(
                 Map::Affine(Affine { m: [a / k, b / k, c / k, d / k, e, f] })
             }
         };
-        return place_through(&src, buf.rect, &map, None, opts, ctl);
+        return place_through(&src, buf.rect, &map, None, opts, nest, ctl);
     }
     let (src, rect) = contents(name, bytes, fmt, sm, opts, nest, ctl)?;
     let map = match &sm.perspective {
         Some(p) => Map::Projective(Homography(*p)),
         None => Map::Affine(sm.transform),
     };
-    place_through(&src, rect, &map, sm.warp.as_ref().filter(|w| !w.is_identity()), opts, ctl)
+    place_through(&src, rect, &map, sm.warp.as_ref().filter(|w| !w.is_identity()), opts, nest, ctl)
 }
 
 enum Map {
@@ -590,6 +639,7 @@ fn place_through(
     map: &Map,
     warp: Option<&photocraft_geom::warp::Warp>,
     opts: &BakeOptions<'_>,
+    nest: &Nesting,
     ctl: &Interrupt<'_>,
 ) -> Result<Surface, BakeError> {
     if rect.is_empty() {
@@ -619,6 +669,16 @@ fn place_through(
     if !(w.is_finite() && h.is_finite()) || w * h > opts.max_pixels as f64 || bbox.iter().any(|v| v.abs() > f64::from(i32::MAX / 2)) {
         return Err(BakeError::Limit(format!("the placed contents would cover {w:.0} × {h:.0} pixels; the limit is {} pixels", opts.max_pixels)));
     }
+    nest.check_surface(
+        Rect::new(bbox[0].floor() as i32 - 1, bbox[1].floor() as i32 - 1, bbox[2].ceil() as i32 + 1, bbox[3].ceil() as i32 + 1),
+        src.format(),
+        opts,
+    )?;
+    let budget = photocraft_algo::control::Budget { max_pixels: opts.max_pixels, max_bytes: opts.max_filter_bytes, max_work: opts.max_work };
+    let refused = |e| match e {
+        photocraft_algo::control::Refused::Cancelled => BakeError::Cancelled,
+        photocraft_algo::control::Refused::Limit(m) => BakeError::Limit(m),
+    };
     check(ctl)?;
     let placed = match (map, warp) {
         (Map::Affine(t), Some(w)) => {
@@ -627,14 +687,14 @@ fn place_through(
                 let (u, v) = w.map(x, y);
                 (a * u + c * v + e, b * u + d * v + f)
             };
-            photocraft_algo::warp::warp_mesh_surface_with(src, rect, &f, Interp::Bicubic, ctl)
+            Some(photocraft_algo::warp::warp_mesh_surface_controlled(src, rect, &f, Interp::Bicubic, &budget, ctl).map_err(refused)?)
         }
         (Map::Projective(hm), Some(w)) => {
             let f = |x: f64, y: f64| {
                 let (u, v) = w.map(x, y);
                 hm.apply(u, v)
             };
-            photocraft_algo::warp::warp_mesh_surface_with(src, rect, &f, Interp::Bicubic, ctl)
+            Some(photocraft_algo::warp::warp_mesh_surface_controlled(src, rect, &f, Interp::Bicubic, &budget, ctl).map_err(refused)?)
         }
         (Map::Affine(t), None) => {
             let [a, b, c, d, e, f] = t.m;

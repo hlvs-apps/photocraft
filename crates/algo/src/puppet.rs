@@ -1329,7 +1329,7 @@ impl PuppetSolver {
                 .tris
                 .iter()
                 .map(|t| {
-                    if rotated.is_empty() {
+                    if rotated.is_empty() || ctl.cancelled() {
                         return [1.0, 0.0, 0.0, 1.0];
                     }
                     let c = t.iter().fold([0.0, 0.0], |a, &i| [a[0] + self.mesh.verts[i][0] / 3.0, a[1] + self.mesh.verts[i][1] / 3.0]);
@@ -1366,18 +1366,28 @@ impl PuppetSolver {
 
     /// Triangle draw order (back to front) for pins with depths.
     pub fn draw_order(&self, depths: &[i32], pin_src: &[[f64; 2]]) -> Vec<usize> {
+        self.draw_order_with(depths, pin_src, &Interrupt::NONE).unwrap_or_default()
+    }
+
+    fn draw_order_with(&self, depths: &[i32], pin_src: &[[f64; 2]], ctl: &Interrupt) -> Option<Vec<usize>> {
         let mut order: Vec<usize> = (0..self.mesh.tris.len()).collect();
         if depths.iter().all(|d| *d == 0) || pin_src.is_empty() {
-            return order;
+            return Some(order);
         }
         let depth_of = |t: usize| {
             let c = self.mesh.tris[t].iter().fold([0.0, 0.0], |a, &i| [a[0] + self.mesh.verts[i][0] / 3.0, a[1] + self.mesh.verts[i][1] / 3.0]);
             let k = (0..pin_src.len()).min_by(|&a, &b| dist2(pin_src[a], c).total_cmp(&dist2(pin_src[b], c))).unwrap_or(0);
             depths.get(k).copied().unwrap_or(0)
         };
-        let d: Vec<i32> = order.iter().map(|&t| depth_of(t)).collect();
+        let mut d = Vec::with_capacity(order.len());
+        for &t in &order {
+            if ctl.cancelled() {
+                return None;
+            }
+            d.push(depth_of(t));
+        }
         order.sort_by_key(|&t| d[t]);
-        order
+        Some(order)
     }
 }
 
@@ -1462,7 +1472,7 @@ pub fn puppet_warp_controlled(src: &Surface, bounds: Rect, w: &PuppetWarp, inter
     let rot: Vec<Option<f64>> = w.pins.iter().map(|p| p.rotate).collect();
     let (v, _) = solver.solve_in(&dst, &rot, w.mode, ITERATIONS, None, ctl).ok_or(Refused::Cancelled)?;
     let depths: Vec<i32> = w.pins.iter().map(|p| p.depth).collect();
-    let order = solver.draw_order(&depths, &pin_src);
+    let order = solver.draw_order_with(&depths, &pin_src, ctl).ok_or(Refused::Cancelled)?;
     check(ctl)?;
     let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for p in &v {
@@ -1755,6 +1765,10 @@ mod tests {
         let pins = [[28.0, 14.0], [64.0, 62.0]];
         let solver = PuppetSolver::new(mesh, &pins, &[false; 2]);
         let order = solver.draw_order(&[1, 0], &pins);
+        // Interrupt is Sync, so use an atomic even on this serial path.
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2;
+        assert!(solver.draw_order_with(&[1, 0], &pins, &Interrupt::cancel_only(&stop)).is_none());
         let near0 = |t: usize| {
             let c = solver.mesh.tris[t].iter().fold([0.0, 0.0], |a, &i| [a[0] + solver.mesh.verts[i][0] / 3.0, a[1] + solver.mesh.verts[i][1] / 3.0]);
             dist2(c, pins[0]) < dist2(c, pins[1])
