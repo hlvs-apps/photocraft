@@ -64,8 +64,9 @@ A typical host:
 - Writes go only to the host's document. Save As under another name, Export As and Quick Export
   fail with a message; nothing is downloaded.
 - File › Open, Place and drag and drop still read files from the user's computer.
-- Fonts: when the host serves a font manifest (`fonts/manifest.txt` next to the page, see
-  `packaging/web/README.md`, Fonts), the font menus offer only its families. The bundled fonts
+- Fonts: the font menus offer only families from the host manifest (`fonts/manifest.txt`
+  next to the page, see `packaging/web/README.md`, Fonts). While it is loading, or if it is
+  missing or empty, no other families are offered. The bundled fonts
   stay installed: the interface and text already set in them still draw.
 - The host's `fonts` in `open` are registered before the document opens, so its text lays out in
   them and the open names none of them missing.

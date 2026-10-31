@@ -91,7 +91,8 @@ pub fn start() {
                     // Embed mode (`?embed`, see `embed.rs`): a host page on this origin owns the
                     // document, its fonts and leaving the page.
                     let embed = crate::embed::Embed::start(&q, &cc.egui_ctx);
-                    load_font_manifest(served.clone(), cc.egui_ctx.clone(), embed.is_some());
+                    served_fonts::set_only_served(embed.is_some());
+                    load_font_manifest(served.clone(), cc.egui_ctx.clone());
                     let (session, warnings) = crate::preset_bridge::session(presets.clone());
                     preset_warnings.extend(warnings);
                     let drag = listen_drag(&pen_target);
@@ -243,7 +244,7 @@ fn set_language(app: &mut PhotocraftApp, tag: &str) {
 
 /// Reads the served font manifest, if the host has one, and lists its families in the font menus.
 /// An embedding host's manifest is the whole list: the font menus offer only its families.
-fn load_font_manifest(served: Served, ctx: egui::Context, embedded: bool) {
+fn load_font_manifest(served: Served, ctx: egui::Context) {
     wasm_bindgen_futures::spawn_local(async move {
         // Most hosts serve no fonts: a missing manifest is the normal case, not an error.
         let Ok(bytes) = fetch_bytes(FONTS_MANIFEST, None).await else { return };
@@ -264,9 +265,6 @@ fn load_font_manifest(served: Served, ctx: egui::Context, embedded: bool) {
         served.lock().unwrap_or_else(PoisonError::into_inner).files = files;
         // The families for the font menus, and the script fallbacks (the manifest's `scripts`).
         served_fonts::add_fonts(&fonts);
-        if embedded && !fonts.is_empty() {
-            served_fonts::set_only_served(true);
-        }
         // Fetch now the fallbacks of the scripts the browser's languages use (an Arabic reader gets
         // the Arabic font before typing); the rest is fetched when text or a font menu needs it.
         served_fonts::request_for_languages(browser_languages().iter().map(String::as_str));
