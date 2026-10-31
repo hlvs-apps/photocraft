@@ -299,7 +299,12 @@ fn stored_bytes(layers: &[Layer]) -> u64 {
     let surface = surface_bytes;
     layers.iter().fold(0u64, |acc, l| {
         let own = l.surface().map_or(0, surface).saturating_add(l.mask.as_ref().map_or(0, |m| surface(&m.surface)));
-        acc.saturating_add(own).saturating_add(l.children().map_or(0, stored_bytes))
+        let fills = l.fill_cache.as_ref().map_or(0, |c| surface(&c.surface));
+        let filters = match &l.content {
+            LayerContent::Smart(sm) => sm.filter_mask.as_ref().map_or(0, |m| surface(&m.surface)),
+            _ => 0,
+        };
+        acc.saturating_add(own).saturating_add(fills).saturating_add(filters).saturating_add(l.children().map_or(0, stored_bytes))
     })
 }
 
@@ -456,8 +461,31 @@ impl Renderings {
 /// rendering it has, and is named in the returned list with the reason. A budget, the interrupt or
 /// an engine failure ends the whole refresh with that error, the layer named.
 pub fn refresh_renderings(doc: &mut Document, which: Renderings, opts: &BakeOptions<'_>, ctl: &Interrupt<'_>) -> Result<Vec<String>, BakeError> {
+    check(ctl)?;
+    // Check every layer, including hidden groups, before recursive inventory or redraw.
+    let mut stack = vec![(doc.layers.iter(), 0usize)];
+    let mut count = 0usize;
+    while let Some((layers, depth)) = stack.last_mut() {
+        check(ctl)?;
+        let Some(layer) = layers.next() else {
+            stack.pop();
+            continue;
+        };
+        count = count.saturating_add(1);
+        if count > opts.render.max_layers || *depth > photocraft_doc::MAX_GROUP_DEPTH {
+            return Err(BakeError::Limit("the refresh exceeds the layer count or group depth budget".into()));
+        }
+        if let Some(children) = layer.children() {
+            let depth = *depth + 1;
+            stack.push((children.iter(), depth));
+        }
+    }
+    if area(doc.bounds()) > opts.max_pixels.min(opts.render.max_pixels) {
+        return Err(BakeError::Limit("the refresh canvas exceeds the pixel budget".into()));
+    }
+    let _authority = crate::jobs::render_authorization_scope(Some(deny_external_inputs));
     let nest = Nesting::default();
-    let held = stored_bytes(&doc.layers);
+    let held = stored_bytes(&doc.layers).saturating_add(doc.patterns.iter().map(|p| surface_bytes(&p.surface)).fold(0u64, u64::saturating_add));
     if held > opts.max_stack_bytes {
         return Err(BakeError::Limit(format!("the document holds {held} bytes of pixels; the limit is {}", opts.max_stack_bytes)));
     }
@@ -530,6 +558,32 @@ fn draw_fill(l: &Layer, f: &photocraft_doc::Fill, doc: &Document, opts: &BakeOpt
     let tile_floats = (photocraft_geom::TILE_SIZE as u64).pow(2).saturating_mul(16);
     if area(canvas) > opts.max_pixels || tile_floats > opts.max_filter_bytes {
         return Err(BakeError::Limit("the fill exceeds the pixel or working memory budget".into()));
+    }
+    let pixels = area(canvas);
+    let (extra_bytes, work) = match f {
+        photocraft_doc::Fill::Pattern { id, name, .. } => {
+            let p = photocraft_doc::pattern::find(&doc.patterns, id, name)
+                .filter(|p| p.is_paintable())
+                .ok_or_else(|| BakeError::Refused("the fill's pattern is missing or cannot be painted".into()))?;
+            let bytes = p.pixel_count().saturating_mul(16);
+            // Above the compositor's uncached conversion cap it would silently paint nothing.
+            if bytes > 256 << 20 {
+                return Err(BakeError::Limit("the fill's pattern exceeds the conversion limit".into()));
+            }
+            // Conservatively include expansion for each tile (large patterns are not cached).
+            let ts = photocraft_geom::TILE_SIZE as u64;
+            let tiles = u64::from(canvas.width()).div_ceil(ts).saturating_mul(u64::from(canvas.height()).div_ceil(ts));
+            (bytes, p.pixel_count().saturating_mul(tiles).saturating_add(pixels))
+        }
+        photocraft_doc::Fill::Gradient { stops, opacity_stops, midpoints, .. } => {
+            let entries = (stops.len() as u64).saturating_add(opacity_stops.len() as u64).saturating_add(midpoints.len() as u64);
+            // Sampling scans stops for each pixel; preparation also clones and sorts the ramp.
+            (entries.saturating_mul(64), pixels.max(1).saturating_mul(entries.max(1)).saturating_mul(2))
+        }
+        _ => (0, pixels),
+    };
+    if tile_floats.saturating_add(extra_bytes) > opts.max_filter_bytes || work > opts.max_work {
+        return Err(BakeError::Limit("the fill exceeds the pattern/gradient working memory or work budget".into()));
     }
     let render = photocraft_compose::fill_content_renderer(l, f, canvas, &doc.patterns, doc.depth);
     let mut drawn = Surface::new(fmt);

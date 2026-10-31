@@ -824,3 +824,53 @@ fn budgets_and_the_interrupt_end_a_refresh() {
         Err(BakeError::Cancelled)
     ));
 }
+
+#[test]
+fn refresh_checks_structure_before_recursive_work() {
+    let mut doc = Document::new("limits", Size::new(1, 1), ColorMode::Rgb, SampleType::U8);
+    doc.layers = vec![Layer::group("outer", vec![Layer::group("inner", vec![])])];
+    let tight = BakeOptions { render: photocraft_compose::RenderOptions { max_layers: 1, ..options(&decode).render }, ..options(&decode) };
+    assert!(matches!(refresh_renderings(&mut doc, Renderings::ALL, &tight, &photocraft_raster::Interrupt::NONE), Err(BakeError::Limit(_))));
+    for _ in 0..=photocraft_doc::MAX_GROUP_DEPTH {
+        doc.layers = vec![Layer::group("nested", std::mem::take(&mut doc.layers))];
+    }
+    assert!(matches!(refresh(&mut doc, Renderings::ALL), Err(BakeError::Limit(_))));
+}
+
+#[test]
+fn refresh_counts_existing_fill_caches_even_when_not_redrawing_them() {
+    let mut doc = Document::new("cache", Size::new(1, 1), ColorMode::Rgb, SampleType::U8);
+    let fill = photocraft_doc::Fill::Solid(photocraft_color::Color::rgb(1.0, 0.0, 0.0));
+    let mut layer = Layer::new("fill", LayerContent::Fill(fill.clone()));
+    layer.fill_cache = Some(photocraft_doc::FillCache { fill, surface: red_block(doc.pixel_format()) });
+    doc.layers.push(layer);
+    let tight = BakeOptions { max_stack_bytes: 1, ..options(&decode) };
+    assert!(matches!(refresh_renderings(&mut doc, Renderings::default(), &tight, &photocraft_raster::Interrupt::NONE), Err(BakeError::Limit(_))));
+}
+
+#[test]
+fn refresh_budgets_pattern_expansion_and_gradient_stop_work() {
+    let mut doc = Document::new("fill budgets", Size::new(16, 16), ColorMode::Rgb, SampleType::U8);
+    doc.patterns.push(photocraft_doc::Pattern {
+        id: "large".into(),
+        name: "large".into(),
+        width: 2048,
+        height: 2048,
+        surface: Surface::new(doc.pixel_format()),
+    });
+    doc.layers.push(Layer::new(
+        "pattern",
+        LayerContent::Fill(photocraft_doc::Fill::Pattern { id: "large".into(), name: "large".into(), scale: 1.0, angle: 0.0, link: true, phase: (0.0, 0.0) }),
+    ));
+    let tight = BakeOptions { max_filter_bytes: 2 << 20, ..options(&decode) };
+    assert!(matches!(refresh_renderings(&mut doc, Renderings::ALL, &tight, &photocraft_raster::Interrupt::NONE), Err(BakeError::Limit(_))));
+    doc.layers[0].content = LayerContent::Fill(photocraft_doc::Fill::gradient(
+        vec![(0.0, photocraft_color::Color::rgb(1.0, 0.0, 0.0)); 100],
+        0.0,
+        1.0,
+        photocraft_doc::GradientStyle::Linear,
+        false,
+    ));
+    let tight = BakeOptions { max_work: 100, ..options(&decode) };
+    assert!(matches!(refresh_renderings(&mut doc, Renderings::ALL, &tight, &photocraft_raster::Interrupt::NONE), Err(BakeError::Limit(_))));
+}
