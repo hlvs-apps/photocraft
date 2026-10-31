@@ -75,6 +75,9 @@ pub fn start() {
             }
         };
         let pen_target = canvas.clone();
+        let lang = crate::embed::query_value(&q, "lang").and_then(crate::embed::lang_tag).map(str::to_string);
+        // The runner takes `q`; a failed start still tells an embedding host.
+        let search = q.clone();
         let result = eframe::WebRunner::new()
             .start(
                 canvas,
@@ -85,11 +88,27 @@ pub fn start() {
                     let inbox: Inbox = Arc::default();
                     let place_inbox: Inbox = Arc::default();
                     let served: Served = Arc::default();
+                    // Embed mode (`?embed`, see `embed.rs`): a host page on this origin owns the
+                    // document, its fonts and leaving the page.
+                    let embed = crate::embed::Embed::start(&q, &cc.egui_ctx);
+                    served_fonts::set_only_served(embed.is_some());
                     load_font_manifest(served.clone(), cc.egui_ctx.clone());
                     let (session, warnings) = crate::preset_bridge::session(presets.clone());
                     preset_warnings.extend(warnings);
                     let drag = listen_drag(&pen_target);
-                    let mut app = PhotocraftApp::new(session, services(inbox.clone(), place_inbox.clone(), drag_pos_service(pen_target.clone(), drag)));
+                    let write: photocraft_ui_egui::WriteFn = match &embed {
+                        Some((_, name, written)) => Box::new(crate::embed::writer(name.clone(), written.clone())),
+                        None => Box::new(|path: &str, bytes: &[u8]| download(path, bytes)),
+                    };
+                    let mut app = PhotocraftApp::new(session, services(inbox.clone(), place_inbox.clone(), drag_pos_service(pen_target.clone(), drag), write));
+                    if let Some(tag) = &lang {
+                        set_language(&mut app, tag);
+                    }
+                    // The host's writer stores what it is given: a save records the revision it
+                    // wrote, and embed mode holds it unsaved until the host confirms (`embed.rs`).
+                    if embed.is_some() {
+                        app.services.write_unconfirmed = false;
+                    }
                     if !preset_warnings.is_empty() {
                         photocraft_ui_egui::notices::post(&mut app, i18n::t("Some brush presets could not be loaded"), preset_warnings, true, None);
                     }
@@ -102,15 +121,26 @@ pub fn start() {
                         app.set_wgpu(rs);
                     }
                     let unsaved = Arc::new(AtomicBool::new(false));
-                    guard_unload(unsaved.clone());
-                    Ok(Box::new(WebShell { app, inbox, place_inbox, unsaved, served, database, presets }))
+                    // An embedding host asks before its page is left (it has `dirty`); a second
+                    // "Leave site?" from the frame would ask twice.
+                    if embed.is_none() {
+                        guard_unload(unsaved.clone());
+                    }
+                    let embed = embed.map(|(embed, _, _)| {
+                        embed.ready();
+                        embed
+                    });
+                    Ok(Box::new(WebShell { app, inbox, place_inbox, unsaved, served, database, presets, embed }))
                 }),
             )
             .await;
         if let Some(el) = document.get_element_by_id("photocraft_loading") {
             match result {
                 Ok(()) => el.remove(),
-                Err(e) => el.set_inner_html(&format!("<p>PhotoCraft failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>")),
+                Err(e) => {
+                    el.set_inner_html(&format!("<p>PhotoCraft failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>"));
+                    crate::embed::start_failed(&search, &format!("{e:?}"));
+                }
             }
         }
     });
@@ -200,7 +230,20 @@ fn query() -> String {
     web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
 }
 
+/// `?lang=<tag>`: the interface language, as if chosen in Preferences (an embedding host passes
+/// its page's language). A tag PhotoCraft has no catalog for keeps the preference.
+fn set_language(app: &mut PhotocraftApp, tag: &str) {
+    let Some(lang) = i18n::lang_from_tag(tag) else {
+        log::warn!("photocraft-web: ?lang={tag}: no such interface language");
+        return;
+    };
+    if let Err(e) = app.run("prefs.set", serde_json::json!({"values": {"interface.language": lang.code()}})) {
+        log::warn!("photocraft-web: ?lang={tag}: {e}");
+    }
+}
+
 /// Reads the served font manifest, if the host has one, and lists its families in the font menus.
+/// An embedding host's manifest is the whole list: the font menus offer only its families.
 fn load_font_manifest(served: Served, ctx: egui::Context) {
     wasm_bindgen_futures::spawn_local(async move {
         // Most hosts serve no fonts: a missing manifest is the normal case, not an error.
@@ -270,6 +313,8 @@ struct WebShell {
     served: Served,
     database: Option<web_sys::IdbDatabase>,
     presets: crate::preset_bridge::Bridge,
+    /// Embed mode's state (`?embed`), `None` for the standalone web app.
+    embed: Option<crate::embed::Embed>,
 }
 
 impl WebShell {
@@ -361,7 +406,13 @@ impl eframe::App for WebShell {
             });
         }
         self.serve_fonts(ctx);
+        if let Some(embed) = &mut self.embed {
+            embed.before_frame(&mut self.app, ctx);
+        }
         self.app.logic_frame(ctx, frame);
+        if let Some(embed) = &mut self.embed {
+            embed.after_frame(&mut self.app);
+        }
         self.save_presets(ctx);
         self.app.finish_type_reset_logic(ctx);
     }
@@ -391,12 +442,17 @@ impl eframe::App for WebShell {
             });
         }
         self.app.ui_frame(ui, frame);
+        // File › Save from a menu runs in this pass.
+        if let Some(embed) = &mut self.embed {
+            embed.after_frame(&mut self.app);
+        }
         self.save_presets(ui.ctx());
         self.app.finish_type_reset_pass(ui.ctx());
     }
 }
 
-fn services(inbox: Inbox, place_inbox: Inbox, cursor_pos: photocraft_ui_egui::CursorPosFn) -> Services {
+/// The web build's services. `write` is a browser download, or the host's in embed mode.
+fn services(inbox: Inbox, place_inbox: Inbox, cursor_pos: photocraft_ui_egui::CursorPosFn, write: photocraft_ui_egui::WriteFn) -> Services {
     Services {
         screen_pick: screen_color_service(),
         import: Some(Box::new(|name: &str, bytes: &[u8], opts: &photocraft_io::ImportOptions| {
@@ -441,8 +497,9 @@ fn services(inbox: Inbox, place_inbox: Inbox, cursor_pos: photocraft_ui_egui::Cu
                 reply.send(Some(FileDialogAnswer::SaveTo(name)));
             }
         })),
-        write: Some(Box::new(|path: &str, bytes: &[u8]| download(path, bytes))),
-        // A download may be cancelled and never reports back: it doesn't save the document.
+        write: Some(write),
+        // A download may be cancelled and never reports back: it doesn't save the document. An
+        // embedding host confirms with `saved` once it stored the document.
         write_unconfirmed: true,
         encode_png: Some(Box::new(|w, h, rgba| {
             let img = Image::from_u8(w, h, ChannelLayout::Rgba, rgba.to_vec()).map_err(|e| e.to_string())?;

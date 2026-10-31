@@ -2,7 +2,8 @@ use super::defaults::apply;
 use super::{Arc, HashMap, PhotocraftApp, PoisonError, json};
 
 /// Font families: bundled, system, and those the host serves (`photocraft_text::served`, fetched
-/// when picked). Cached until the shared engine registers fonts or the served catalog changes.
+/// when picked), or only the served ones when the host says so (`served::set_only_served`).
+/// Cached until the shared engine registers fonts or the served catalog changes.
 pub fn families() -> Arc<Vec<String>> {
     type Cached = Option<((u64, u64), Arc<Vec<String>>)>;
     static FAMILIES: std::sync::Mutex<Cached> = std::sync::Mutex::new(None);
@@ -13,16 +14,22 @@ pub fn families() -> Arc<Vec<String>> {
     {
         return v.clone();
     }
-    let mut v = photocraft_text::shared().lock().map(|mut e| e.fonts.families()).unwrap_or_default();
-    for f in photocraft_text::served::families() {
-        if !v.contains(&f) {
-            v.push(f);
-        }
-    }
-    v.sort_by_key(|s| s.to_lowercase());
-    let v = Arc::new(v);
+    let installed =
+        if photocraft_text::served::only_served() { Vec::new() } else { photocraft_text::shared().lock().map(|mut e| e.fonts.families()).unwrap_or_default() };
+    let v = Arc::new(menu_families(installed, photocraft_text::served::families()));
     *cached = Some((key, v.clone()));
     v
+}
+
+/// The font menus' families: the installed ones and the served ones, each once, alphabetically.
+fn menu_families(mut installed: Vec<String>, served: Vec<String>) -> Vec<String> {
+    for f in served {
+        if !installed.contains(&f) {
+            installed.push(f);
+        }
+    }
+    installed.sort_by_key(|s| s.to_lowercase());
+    installed
 }
 
 /// Where [`sync_font_names`] leaves the font menus' localized labels for this frame.
@@ -817,4 +824,18 @@ pub(super) fn wheel_family_index(index: usize, len: usize, notches: f32) -> Opti
     }
     let last = len - 1;
     Some(if notches < 0.0 { index.saturating_add(steps).min(last) } else { index.saturating_sub(steps) })
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::menu_families;
+
+    #[test]
+    fn the_menus_list_each_family_once_alphabetically() {
+        let installed = vec!["Inter".to_string(), "JetBrains Mono".to_string()];
+        let served = vec!["Lobster".to_string(), "inter".to_string(), "Inter".to_string(), "Abel".to_string()];
+        assert_eq!(menu_families(installed, served), ["Abel", "Inter", "inter", "JetBrains Mono", "Lobster"]);
+        // A host that offers only its own fonts: the served families alone.
+        assert_eq!(menu_families(Vec::new(), vec!["Lobster".to_string(), "Abel".to_string()]), ["Abel", "Lobster"]);
+    }
 }
