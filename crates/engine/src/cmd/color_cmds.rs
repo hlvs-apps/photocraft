@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, Weak};
 use photocraft_cms::{Builtin, ColorSpace, GamutCheck, Intent, Lut3d, Profile, SampleKind, Transform};
 use photocraft_color::{Color, ColorMode, PixelFormat, SampleType};
 use photocraft_doc::{DocId, Document, Duotone, Effect, Fill, FxPaint, Layer, LayerContent};
-use photocraft_raster::Surface;
+use photocraft_raster::{Interrupt, Surface};
 use serde_json::{Value, json};
 
 use crate::commands::CommandSpec;
@@ -770,18 +770,34 @@ fn paint_colors(p: &mut FxPaint, cc: &mut dyn FnMut(&mut Color)) {
 /// converted. A Duotone document going to a colour space starts from its ink colours
 /// ([`ink_duotone`]). The document is tagged with `dst`.
 pub fn convert_document(doc: &mut Document, dst: &Profile, intent: Intent, bpc: bool) -> Result<()> {
+    convert_document_with(doc, dst, intent, bpc, &Interrupt::NONE)
+}
+
+/// [`convert_document`] for a caller that may need to stop it: `ctl` is checked before each
+/// surface is converted, so one surface is the longest unit it waits for. A cancelled conversion
+/// returns [`EngineError::Cancelled`] and leaves `doc` partly converted: discard it.
+pub fn convert_document_with(doc: &mut Document, dst: &Profile, intent: Intent, bpc: bool, ctl: &Interrupt<'_>) -> Result<()> {
     let to_mode = space_mode(dst.color_space).ok_or_else(|| EngineError::Other(format!("cannot convert to a {:?} profile", dst.color_space)))?;
     if to_mode != ColorMode::Grayscale {
-        ink_duotone(doc);
+        ink_duotone(doc, ctl);
+    }
+    if ctl.cancelled() {
+        return Err(EngineError::Cancelled);
     }
     let src = document_profile(doc);
     let from_mode = doc.pixel_format().mode;
     let t = Transform::new(&src, dst, intent, bpc).map_err(cms_err)?;
     let fmt = PixelFormat::new(to_mode, doc.depth, true);
     crate::image_cmds::for_each_surface(&mut doc.layers, false, &mut |surf, _| {
+        if ctl.cancelled() {
+            return;
+        }
         let f = PixelFormat { alpha: surf.format().alpha, ..fmt };
         *surf = convert_surface(surf, from_mode, f, &t);
     });
+    if ctl.cancelled() {
+        return Err(EngineError::Cancelled);
+    }
     for l in &mut doc.layers {
         convert_layer_colors(l, &mut |c| convert_color(c, from_mode, to_mode, &t));
         // Preserved PSD blocks describing colours in the old mode no longer apply.
@@ -798,12 +814,16 @@ pub fn convert_document(doc: &mut Document, dst: &Profile, intent: Intent, bpc: 
 /// value becomes its printed ink colour ([`Duotone::render`], sRGB like the inks), so converting
 /// to a colour mode keeps the inks' look, as Photoshop converts them to their equivalents.
 /// Other documents (and Duotone without inks) are left alone.
-fn ink_duotone(doc: &mut Document) {
+fn ink_duotone(doc: &mut Document, ctl: &Interrupt<'_>) {
     if doc.mode != ColorMode::Duotone {
         return;
     }
     let Some(d) = doc.duotone.take_if(|d| !d.inks.is_empty()) else { return };
-    crate::image_cmds::for_each_surface(&mut doc.layers, false, &mut |surf, _| *surf = ink_surface(surf, &d));
+    crate::image_cmds::for_each_surface(&mut doc.layers, false, &mut |surf, _| {
+        if !ctl.cancelled() {
+            *surf = ink_surface(surf, &d);
+        }
+    });
     for l in &mut doc.layers {
         convert_layer_colors(l, &mut |c| {
             if matches!(c.mode, ColorMode::Grayscale | ColorMode::Duotone) {
@@ -1266,6 +1286,52 @@ mod tests {
 
     fn doc(s: &Session) -> &Document {
         &s.active().unwrap().doc
+    }
+
+    /// The interruptible conversions a host calls directly (no session, no history) give exactly
+    /// what Image › Mode gives, and a set interrupt stops them with `Cancelled`.
+    #[test]
+    fn interruptible_conversions_match_the_commands_and_stop_when_cancelled() {
+        let stop = || true;
+        let cancelled = Interrupt::cancel_only(&stop);
+        for (mode, depth) in [("cmyk", 8), ("lab", 16), ("grayscale", 8), ("rgb", 32)] {
+            let mut s = session(mode, depth);
+            s.execute("layer.new.layer", json!({})).unwrap();
+            s.edit("paint", |doc, active| {
+                let l = doc.layer_mut(active.unwrap()).unwrap();
+                let fmt = l.surface().unwrap().format();
+                let px: Vec<f32> = (0..fmt.channels()).map(|i| 0.2 + 0.1 * i as f32).collect();
+                l.surface_mut().unwrap().fill_rect(Rect::new(4, 4, 40, 20), &px);
+                Ok(())
+            })
+            .unwrap();
+            let source = doc(&s).clone();
+
+            let srgb = Builtin::Srgb.profile();
+            let mut by_command = session(mode, depth);
+            by_command.add_document(source.clone(), None);
+            by_command.execute("image.mode.rgb", json!({"profile": "srgb", "intent": "relative", "bpc": true})).unwrap();
+            if depth == 32 {
+                by_command.execute("image.mode.bits16", json!({})).unwrap();
+            }
+            let mut direct = source.clone();
+            convert_document_with(&mut direct, srgb, Intent::RelativeColorimetric, true, &Interrupt::NONE).unwrap();
+            if depth == 32 {
+                crate::image_cmds::change_depth_with(&mut direct, SampleType::U16, &Interrupt::NONE).unwrap();
+            }
+            let want = doc(&by_command);
+            assert_eq!((direct.mode, direct.depth), (want.mode, want.depth), "{mode} {depth}");
+            assert_eq!(direct.icc_profile, want.icc_profile, "{mode} {depth}");
+            for (a, b) in direct.layers.iter().zip(&want.layers) {
+                assert_eq!(a.surface().unwrap().pixel(10, 10), b.surface().unwrap().pixel(10, 10), "{mode} {depth}");
+            }
+
+            let mut stopped = source.clone();
+            assert!(matches!(convert_document_with(&mut stopped, srgb, Intent::RelativeColorimetric, true, &cancelled), Err(EngineError::Cancelled)));
+            let mut stopped = source.clone();
+            let to = if depth == 32 { SampleType::U16 } else { SampleType::F32 };
+            assert!(matches!(crate::image_cmds::change_depth_with(&mut stopped, to, &cancelled), Err(EngineError::Cancelled)));
+        }
     }
 
     #[test]

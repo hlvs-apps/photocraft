@@ -7,7 +7,7 @@ use photocraft_algo::resample::{Resample, crop_surface, resize_surface_in_canvas
 use photocraft_color::{ColorMode, SampleType};
 use photocraft_doc::{Document, Effect, Effects, FxPaint, Layer, LayerContent, LayerId, Size};
 use photocraft_geom::Rect;
-use photocraft_raster::Surface;
+use photocraft_raster::{Interrupt, Surface};
 use serde_json::{Value, json};
 
 use crate::commands::CommandSpec;
@@ -899,7 +899,16 @@ fn convert_depth(s: &mut Session, depth: SampleType) -> Result<Value> {
     Ok(Value::Null)
 }
 
-pub(crate) fn change_depth(doc: &mut Document, depth: SampleType) {
+pub fn change_depth(doc: &mut Document, depth: SampleType) {
+    // Interrupt::NONE never cancels, so this cannot fail.
+    let _ = change_depth_with(doc, depth, &Interrupt::NONE);
+}
+
+/// Image › Mode › 8/16/32 Bits/Channel on `doc` ([`change_depth`]) for a caller that may need to
+/// stop it: `ctl` is checked before each surface is converted, so one surface is the longest unit
+/// it waits for. A cancelled change returns [`EngineError::Cancelled`] and leaves `doc` partly
+/// converted: discard it.
+pub fn change_depth_with(doc: &mut Document, depth: SampleType, ctl: &Interrupt<'_>) -> Result<()> {
     let current = doc.depth;
     // 32-bit documents hold linear light (as Photoshop's do: grey 128 becomes 0.2159, measured
     // in Photoshop 27.11), so the colour samples cross the document's tone curve when the
@@ -908,18 +917,37 @@ pub(crate) fn change_depth(doc: &mut Document, depth: SampleType) {
     let crosses = (current == SampleType::F32) != (depth == SampleType::F32) && matches!(doc.mode, ColorMode::Rgb | ColorMode::Grayscale);
     let to_linear = depth == SampleType::F32;
     let transfer = photocraft_compose::adjust::Transfer::for_document(doc.mode, if to_linear { current } else { depth });
+    let cancelled = || if ctl.cancelled() { Err(EngineError::Cancelled) } else { Ok(()) };
     if crosses && !to_linear {
-        for_each_surface(&mut doc.layers, false, &mut |surf, _| surf.map_color(|v| transfer.encode(v).clamp(0.0, 1.0)));
+        for_each_surface(&mut doc.layers, false, &mut |surf, _| {
+            if !ctl.cancelled() {
+                surf.map_color(|v| transfer.encode(v).clamp(0.0, 1.0));
+            }
+        });
+        cancelled()?;
     }
-    convert_layers_depth(&mut doc.layers, depth);
+    for_each_surface(&mut doc.layers, true, &mut |surf, _| {
+        if !ctl.cancelled() {
+            let f = surf.format().with_sample(depth);
+            *surf = surf.convert(f);
+        }
+    });
+    cancelled()?;
     if crosses && to_linear {
-        for_each_surface(&mut doc.layers, false, &mut |surf, _| surf.map_color(|v| transfer.decode(v)));
+        for_each_surface(&mut doc.layers, false, &mut |surf, _| {
+            if !ctl.cancelled() {
+                surf.map_color(|v| transfer.decode(v));
+            }
+        });
+        cancelled()?;
     }
     for ch in doc.channels.iter_mut().chain(doc.quick_mask.as_mut()) {
+        cancelled()?;
         let f = ch.surface.format().with_sample(depth);
         ch.surface = ch.surface.convert(f);
     }
     doc.depth = depth;
+    Ok(())
 }
 
 /// Image → Duplicate.
