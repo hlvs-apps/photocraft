@@ -37,7 +37,9 @@ use photocraft_doc::DocId;
 use photocraft_ui_egui::{PhotocraftApp, i18n};
 
 /// The message key and protocol version every message carries.
+#[cfg(target_arch = "wasm32")]
 pub const PROTOCOL_KEY: &str = "photocraftEmbed";
+#[cfg(target_arch = "wasm32")]
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The longest `?lang=` value read (a BCP 47 tag such as `zh-Hant-TW`).
@@ -94,6 +96,7 @@ pub type Written = Rc<RefCell<Option<Vec<u8>>>>;
 pub type DocumentName = Rc<RefCell<Option<String>>>;
 
 /// A command from the host page.
+#[cfg(target_arch = "wasm32")]
 #[derive(Debug)]
 pub enum Command {
     Open { name: String, document: Vec<u8>, fonts: Vec<(String, Vec<u8>)> },
