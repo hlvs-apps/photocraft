@@ -25,7 +25,8 @@
 //!
 //! In embed mode the host also owns leaving: the app's own "Leave site?" guard is off (the host
 //! has `dirty`), and writes to anything but the host's document fail, so no export or download
-//! leaves through the browser.
+//! leaves through the browser. A save records the revision it wrote (the writer is not
+//! `write_unconfirmed` here); the document goes back to unsaved until the host's `saved`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -135,9 +136,8 @@ pub struct Embed {
     warnings: Vec<String>,
     /// The `dirty` last posted.
     dirty: Option<bool>,
-    /// The document's revision when this frame started: a save File › Save makes during the frame
-    /// holds at least this revision, so marking it saved at this one never covers later edits.
-    frame_revision: u64,
+    /// The document's saved revision before this frame's own File › Save, if it makes one.
+    frame_saved: u64,
 }
 
 /// The parent window and the origin both sides share.
@@ -179,7 +179,7 @@ impl Embed {
             doc: None,
             warnings: Vec::new(),
             dirty: None,
-            frame_revision: 0,
+            frame_saved: 0,
         };
         Some((embed, name, written))
     }
@@ -195,7 +195,6 @@ impl Embed {
 
     /// Runs the host's commands; called at the start of every frame.
     pub fn before_frame(&mut self, app: &mut PhotocraftApp, ctx: &egui::Context) {
-        self.frame_revision = self.state(app).map_or(0, |st| st.revision);
         let commands = std::mem::take(&mut *self.commands.borrow_mut());
         for command in commands {
             match command {
@@ -204,6 +203,7 @@ impl Embed {
                 Command::Saved { revision } => self.saved(app, revision),
             }
         }
+        self.frame_saved = self.state(app).map_or(0, |st| st.saved_revision);
     }
 
     /// Reports what the frame changed: the document now open, a save, the unsaved state.
@@ -219,7 +219,8 @@ impl Embed {
         }
         // The user's own File › Save (a menu or Ctrl+S) during this frame.
         if self.written.borrow().is_some() {
-            self.post_document(self.frame_revision);
+            let revision = self.unconfirm(app, self.frame_saved);
+            self.post_document(revision);
         }
         let dirty = self.state(app).map(|st| st.is_dirty());
         if let Some(dirty) = dirty
@@ -268,16 +269,19 @@ impl Embed {
             let index = app.session.documents().iter().position(|st| st.doc.id == doc).ok_or("the document was closed")?;
             let active = app.session.active_index();
             app.session.set_active(index);
-            let revision = app.session.documents().get(index).map_or(0, |st| st.revision);
+            let before = app.session.documents().get(index).map_or(0, |st| st.saved_revision);
             let saved = photocraft_ui_egui::menus::invoke(app, ctx, "file.save", serde_json::json!({}));
             if let Some(active) = active {
                 app.session.set_active(active);
             }
             saved?;
-            Ok::<u64, String>(revision)
+            Ok::<u64, String>(before)
         })();
         match result {
-            Ok(revision) if self.written.borrow().is_some() => self.post_document(revision),
+            Ok(before) if self.written.borrow().is_some() => {
+                let revision = self.unconfirm(app, before);
+                self.post_document(revision);
+            }
             Ok(_) => self.save_failed("the document was not written (a prompt may be waiting in PhotoCraft)".into()),
             Err(e) => self.save_failed(e),
         }
@@ -293,18 +297,30 @@ impl Embed {
     /// The host stored the document of `revision`: it is saved at that revision (still unsaved
     /// when it was edited since).
     fn saved(&mut self, app: &mut PhotocraftApp, revision: u64) {
-        let Some(doc) = self.doc else { return };
-        let Some(index) = app.session.documents().iter().position(|st| st.doc.id == doc) else { return };
+        self.with_doc(app, |st| {
+            if revision <= st.revision {
+                st.saved_revision = revision;
+            }
+        });
+    }
+
+    /// The revision a save just wrote, which File › Save recorded as the saved one; the document
+    /// goes back to `before` (unsaved) until the host has stored it.
+    fn unconfirm(&self, app: &mut PhotocraftApp, before: u64) -> u64 {
+        self.with_doc(app, |st| std::mem::replace(&mut st.saved_revision, before)).unwrap_or(before)
+    }
+
+    /// Runs `f` on the host's document, whichever tab is active.
+    fn with_doc<R>(&self, app: &mut PhotocraftApp, f: impl FnOnce(&mut photocraft_engine::DocState) -> R) -> Option<R> {
+        let doc = self.doc?;
+        let index = app.session.documents().iter().position(|st| st.doc.id == doc)?;
         let active = app.session.active_index();
         app.session.set_active(index);
-        if let Some(st) = app.session.active_mut()
-            && revision <= st.revision
-        {
-            st.saved_revision = revision;
-        }
+        let r = app.session.active_mut().map(f);
         if let Some(active) = active {
             app.session.set_active(active);
         }
+        r
     }
 
     fn post_document(&self, revision: u64) {

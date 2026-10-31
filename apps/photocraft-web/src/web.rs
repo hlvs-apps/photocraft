@@ -103,6 +103,11 @@ pub fn start() {
                     if let Some(tag) = &lang {
                         set_language(&mut app, tag);
                     }
+                    // The host's writer stores what it is given: a save records the revision it
+                    // wrote, and embed mode holds it unsaved until the host confirms (`embed.rs`).
+                    if embed.is_some() {
+                        app.services.write_unconfirmed = false;
+                    }
                     if !preset_warnings.is_empty() {
                         photocraft_ui_egui::notices::post(&mut app, i18n::t("Some brush presets could not be loaded"), preset_warnings, true, None);
                     }
