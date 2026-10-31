@@ -710,3 +710,167 @@ fn plane_count_is_refused_before_parsing_the_planes() {
     let out = bake(&s.active().unwrap().doc, &active_smart(&s), 1);
     assert!(matches!(out, Err(BakeError::Limit(m)) if m.contains("planes")));
 }
+
+fn refresh(doc: &mut Document, which: Renderings) -> std::result::Result<Vec<String>, BakeError> {
+    refresh_renderings(doc, which, &options(&decode), &photocraft_raster::Interrupt::NONE)
+}
+
+/// The rendering a layer stores: its cache, or its fill cache.
+fn rendering(l: &Layer) -> Option<&Surface> {
+    match &l.content {
+        LayerContent::Fill(_) => l.fill_cache.as_ref().map(|c| &c.surface),
+        _ => l.surface(),
+    }
+}
+
+#[test]
+fn a_refresh_draws_every_rendering_again_hidden_layers_included() {
+    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+        let fresh = layered_contents(Cached::Fresh, depth);
+        for cached in [Cached::Fresh, Cached::Stale, Cached::Missing] {
+            let mut doc = layered_contents(cached, depth);
+            // A hidden layer is drawn too: the editor shows it once it is turned on.
+            doc.layers[1].visible = false;
+            let kept = refresh(&mut doc, Renderings::ALL).unwrap();
+            assert!(kept.is_empty(), "{kept:?}");
+            for (got, want) in doc.layers.iter().zip(&fresh.layers) {
+                let what = format!("{depth:?}, layer {}", got.name);
+                match (&got.content, rendering(want)) {
+                    // The solid backdrop is drawn from its colour, so it keeps no rendering at all.
+                    (LayerContent::Fill(_), _) => assert!(got.fill_cache.is_none(), "{what}"),
+                    (_, Some(want)) => assert_same(rendering(got).expect("drawn"), want, &what),
+                    (_, None) => panic!("{what}: the fresh document has no rendering"),
+                }
+            }
+            // The document draws as the editor draws it.
+            let mut editor = fresh.clone();
+            editor.layers[1].visible = false;
+            let (a, b) = (photocraft_compose::flatten(&doc), photocraft_compose::flatten(&editor));
+            assert!(a.px == b.px, "{depth:?}: the refreshed document draws differently");
+        }
+    }
+}
+
+#[test]
+fn a_refresh_draws_only_the_kinds_asked_for() {
+    let mut doc = layered_contents(Cached::Stale, SampleType::U8);
+    refresh(&mut doc, Renderings { shapes: true, fills: true, ..Renderings::default() }).unwrap();
+    let red = red_block(doc.pixel_format());
+    let fresh = layered_contents(Cached::Fresh, SampleType::U8);
+    // Text and the smart object keep the stale renderings; the shape is drawn again.
+    assert_same(rendering(&doc.layers[1]).unwrap(), &red, "text");
+    assert_same(rendering(&doc.layers[3]).unwrap(), &red, "smart object");
+    assert_same(rendering(&doc.layers[2]).unwrap(), rendering(&fresh.layers[2]).unwrap(), "shape");
+}
+
+#[test]
+fn a_layer_the_refresh_cannot_draw_keeps_its_rendering_and_is_named() {
+    let mut doc = layered_contents(Cached::Stale, SampleType::U8);
+    let fmt = doc.pixel_format();
+    let mut headline = title("No Such Sans", "Hello");
+    headline.cache = Some(red_block(fmt));
+    doc.layers.push(Layer::group("Header", vec![Layer::new("Headline", LayerContent::Text(headline))]));
+    let lost = SmartObject::new(SmartSource::Linked { path: "/elsewhere/photo.psd".into() }, Affine::IDENTITY, Some(red_block(fmt)));
+    doc.layers.push(Layer::new("Lost", LayerContent::Smart(lost)));
+    let kept = refresh(&mut doc, Renderings::ALL).unwrap();
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert!(kept[0].contains("\"Header\" › \"Headline\"") && kept[0].contains("No Such Sans"), "{}", kept[0]);
+    assert!(kept[1].contains("\"Lost\"") && kept[1].contains("not in the contents"), "{}", kept[1]);
+    let red = red_block(fmt);
+    assert_same(rendering(&doc.layers[4].children().unwrap()[0]).unwrap(), &red, "the headline keeps its rendering");
+    assert_same(rendering(&doc.layers[5]).unwrap(), &red, "the lost smart object keeps its rendering");
+    // The rest was drawn again.
+    let fresh = layered_contents(Cached::Fresh, SampleType::U8);
+    assert_same(rendering(&doc.layers[1]).unwrap(), rendering(&fresh.layers[1]).unwrap(), "text");
+}
+
+#[test]
+fn a_gradient_fill_gets_the_pixels_the_compositor_draws_for_it() {
+    for depth in [SampleType::U8, SampleType::U16] {
+        let mut doc = Document::new("fills", Size::new(600, 300), ColorMode::Rgb, depth);
+        let gradient = photocraft_doc::Fill::gradient(
+            vec![(0.0, photocraft_color::Color::rgb(0.9, 0.1, 0.1)), (1.0, photocraft_color::Color::rgb(0.1, 0.1, 0.9))],
+            30.0,
+            1.0,
+            photocraft_doc::GradientStyle::Linear,
+            false,
+        );
+        doc.layers.push(Layer::new("Wash", LayerContent::Fill(gradient.clone())));
+        let live = photocraft_compose::flatten(&doc);
+        refresh(&mut doc, Renderings { fills: true, ..Renderings::default() }).unwrap();
+        let cache = doc.layers[0].fill_cache.as_ref().expect("a fill cache");
+        assert_eq!(cache.fill, gradient);
+        assert_eq!(cache.surface.content_bounds(), doc.bounds(), "{depth:?}");
+        // The cache is pixels of the document's depth; the live gradient is float.
+        let level = if depth == SampleType::U8 { 1.0 / 255.0 } else { 1.0 / 65535.0 };
+        let got = photocraft_compose::flatten(&doc);
+        let worst = got.px.iter().zip(&live.px).flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs())).fold(0f32, f32::max);
+        assert!(worst <= level, "{depth:?}: the cached fill is {worst} away from the live one");
+    }
+}
+
+#[test]
+fn budgets_and_the_interrupt_end_a_refresh() {
+    let mut doc = layered_contents(Cached::Missing, SampleType::U8);
+    let tight = BakeOptions { max_stack_bytes: 1, ..options(&decode) };
+    match refresh_renderings(&mut doc, Renderings::ALL, &tight, &photocraft_raster::Interrupt::NONE) {
+        Err(BakeError::Limit(m)) => assert!(m.contains("limit") || m.contains("budget"), "{m}"),
+        other => panic!("not refused: {other:?}"),
+    }
+    let mut doc = layered_contents(Cached::Missing, SampleType::U8);
+    let stop = || true;
+    assert!(matches!(
+        refresh_renderings(&mut doc, Renderings::ALL, &options(&decode), &photocraft_raster::Interrupt::cancel_only(&stop)),
+        Err(BakeError::Cancelled)
+    ));
+}
+
+#[test]
+fn refresh_checks_structure_before_recursive_work() {
+    let mut doc = Document::new("limits", Size::new(1, 1), ColorMode::Rgb, SampleType::U8);
+    doc.layers = vec![Layer::group("outer", vec![Layer::group("inner", vec![])])];
+    let tight = BakeOptions { render: photocraft_compose::RenderOptions { max_layers: 1, ..options(&decode).render }, ..options(&decode) };
+    assert!(matches!(refresh_renderings(&mut doc, Renderings::ALL, &tight, &photocraft_raster::Interrupt::NONE), Err(BakeError::Limit(_))));
+    for _ in 0..=photocraft_doc::MAX_GROUP_DEPTH {
+        doc.layers = vec![Layer::group("nested", std::mem::take(&mut doc.layers))];
+    }
+    assert!(matches!(refresh(&mut doc, Renderings::ALL), Err(BakeError::Limit(_))));
+}
+
+#[test]
+fn refresh_counts_existing_fill_caches_even_when_not_redrawing_them() {
+    let mut doc = Document::new("cache", Size::new(1, 1), ColorMode::Rgb, SampleType::U8);
+    let fill = photocraft_doc::Fill::Solid(photocraft_color::Color::rgb(1.0, 0.0, 0.0));
+    let mut layer = Layer::new("fill", LayerContent::Fill(fill.clone()));
+    layer.fill_cache = Some(photocraft_doc::FillCache { fill, surface: red_block(doc.pixel_format()) });
+    doc.layers.push(layer);
+    let tight = BakeOptions { max_stack_bytes: 1, ..options(&decode) };
+    assert!(matches!(refresh_renderings(&mut doc, Renderings::default(), &tight, &photocraft_raster::Interrupt::NONE), Err(BakeError::Limit(_))));
+}
+
+#[test]
+fn refresh_budgets_pattern_expansion_and_gradient_stop_work() {
+    let mut doc = Document::new("fill budgets", Size::new(16, 16), ColorMode::Rgb, SampleType::U8);
+    doc.patterns.push(photocraft_doc::Pattern {
+        id: "large".into(),
+        name: "large".into(),
+        width: 2048,
+        height: 2048,
+        surface: Surface::new(doc.pixel_format()),
+    });
+    doc.layers.push(Layer::new(
+        "pattern",
+        LayerContent::Fill(photocraft_doc::Fill::Pattern { id: "large".into(), name: "large".into(), scale: 1.0, angle: 0.0, link: true, phase: (0.0, 0.0) }),
+    ));
+    let tight = BakeOptions { max_filter_bytes: 2 << 20, ..options(&decode) };
+    assert!(matches!(refresh_renderings(&mut doc, Renderings::ALL, &tight, &photocraft_raster::Interrupt::NONE), Err(BakeError::Limit(_))));
+    doc.layers[0].content = LayerContent::Fill(photocraft_doc::Fill::gradient(
+        vec![(0.0, photocraft_color::Color::rgb(1.0, 0.0, 0.0)); 100],
+        0.0,
+        1.0,
+        photocraft_doc::GradientStyle::Linear,
+        false,
+    ));
+    let tight = BakeOptions { max_work: 100, ..options(&decode) };
+    assert!(matches!(refresh_renderings(&mut doc, Renderings::ALL, &tight, &photocraft_raster::Interrupt::NONE), Err(BakeError::Limit(_))));
+}
