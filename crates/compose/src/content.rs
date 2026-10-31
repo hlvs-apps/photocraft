@@ -174,6 +174,23 @@ pub fn render_fill_content(layer: &Layer, f: &Fill, canvas: Rect, patterns: &[Pa
     render_fill(f, canvas, fill_frame(layer, canvas), &prepared, None)
 }
 
+/// A fill layer's content as the compositor draws it into a document of `depth` (a dithered
+/// gradient rounded to its levels), before the masks, one region at a time: the frame and the
+/// patterns are prepared once, and each call draws `rect` of the content, so a caller can stop
+/// between regions and hold one region's buffer at a time.
+pub fn fill_content_renderer<'a>(
+    layer: &Layer,
+    f: &'a Fill,
+    canvas: Rect,
+    patterns: &'a [Pattern],
+    depth: photocraft_color::SampleType,
+) -> impl Fn(Rect) -> Buffer + 'a {
+    let prepared = pattern::PreparedPatterns::new(patterns, pattern::PREPARED_PATTERN_BYTES);
+    let frame = fill_frame(layer, canvas);
+    let quantum = adjustment_quantum(depth);
+    move |rect| render_fill(f, rect, frame, &prepared, quantum)
+}
+
 /// `quantum`: the document depth's levels, which a dithered gradient is rounded to
 /// ([`gradient_fill::render_quantized`]); `None` keeps it in float.
 pub(crate) fn render_fill(f: &Fill, rect: Rect, canvas: Rect, patterns: &pattern::PreparedPatterns<'_>, quantum: Option<f32>) -> Buffer {

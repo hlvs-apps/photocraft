@@ -428,6 +428,120 @@ fn redraw_layers(layers: &mut [Layer], doc: &Document, path: &str, opts: &BakeOp
     Ok(())
 }
 
+/// The stored renderings [`refresh_renderings`] draws again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Renderings {
+    pub text: bool,
+    pub shapes: bool,
+    /// Gradient and pattern fills (the compositor draws a solid fill from its colour).
+    pub fills: bool,
+    pub smart_objects: bool,
+}
+
+impl Renderings {
+    pub const ALL: Self = Self { text: true, shapes: true, fills: true, smart_objects: true };
+}
+
+/// Draws the stored renderings of `doc` again, as a bake draws its contents' ([`redraw`]), for a
+/// host that builds a document from another model (it has no renderings) or receives one from an
+/// editor (its renderings are whatever the file says): text from its text and the fonts of
+/// [`BakeOptions::text`], shapes from their paths, smart objects from their contents and filters,
+/// and gradient and pattern fills into a [`photocraft_doc::FillCache`] of the pixels the
+/// compositor would draw (a solid fill's is dropped: the compositor draws its colour). `which`
+/// says which kinds. Hidden layers are drawn too: an editor shows
+/// a layer as soon as it is turned on.
+///
+/// A layer that cannot be drawn here ([`BakeError::Refused`]: a font the text engine lacks, a
+/// linked file the document does not hold, a filter photocraft does not implement) keeps the
+/// rendering it has, and is named in the returned list with the reason. A budget, the interrupt or
+/// an engine failure ends the whole refresh with that error, the layer named.
+pub fn refresh_renderings(doc: &mut Document, which: Renderings, opts: &BakeOptions<'_>, ctl: &Interrupt<'_>) -> Result<Vec<String>, BakeError> {
+    let nest = Nesting::default();
+    let held = stored_bytes(&doc.layers);
+    if held > opts.max_stack_bytes {
+        return Err(BakeError::Limit(format!("the document holds {held} bytes of pixels; the limit is {}", opts.max_stack_bytes)));
+    }
+    nest.held.set(held);
+    let mut layers = std::mem::take(&mut doc.layers);
+    let mut kept = Vec::new();
+    let out = refresh_layers(&mut layers, doc, "", which, opts, &nest, ctl, &mut kept);
+    doc.layers = layers;
+    out.map(|()| kept)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_layers(
+    layers: &mut [Layer],
+    doc: &Document,
+    path: &str,
+    which: Renderings,
+    opts: &BakeOptions<'_>,
+    nest: &Nesting,
+    ctl: &Interrupt<'_>,
+    kept: &mut Vec<String>,
+) -> Result<(), BakeError> {
+    for l in layers {
+        check(ctl)?;
+        let name = if path.is_empty() { format!("\"{}\"", l.name) } else { format!("{path} › \"{}\"", l.name) };
+        let held = |l: &Layer| l.surface().map_or(0, surface_bytes).saturating_add(l.fill_cache.as_ref().map_or(0, |c| surface_bytes(&c.surface)));
+        let before = held(l);
+        let drawn = match &mut l.content {
+            LayerContent::Group(g) => {
+                refresh_layers(&mut g.children, doc, &name, which, opts, nest, ctl, kept)?;
+                continue;
+            }
+            LayerContent::Text(t) if which.text => redraw_text(t, doc, opts, nest, ctl),
+            LayerContent::Shape(sh) if which.shapes => redraw_shape(sh, doc, opts, nest, ctl),
+            LayerContent::Smart(sm) if which.smart_objects => redraw_smart(doc, sm, opts, nest, ctl).map(|drawn| sm.cache = Some(drawn)),
+            // A solid fill is drawn from its colour; another application's pixels for it may be
+            // anything.
+            LayerContent::Fill(photocraft_doc::Fill::Solid(_)) if which.fills => {
+                l.fill_cache = None;
+                Ok(())
+            }
+            LayerContent::Fill(f) if which.fills => {
+                let f = f.clone();
+                draw_fill(l, &f, doc, opts, nest, ctl).map(|surface| l.fill_cache = Some(photocraft_doc::FillCache { fill: f, surface }))
+            }
+            _ => continue,
+        };
+        match drawn {
+            Ok(()) => {}
+            Err(BakeError::Refused(m)) => {
+                kept.push(format!("the layer {name}: {m}"));
+                continue;
+            }
+            Err(BakeError::Limit(m)) => return Err(BakeError::Limit(format!("the layer {name}: {m}"))),
+            Err(e) => return Err(e),
+        }
+        nest.held.set(nest.held.get().saturating_sub(before).saturating_add(held(l)));
+        if nest.held.get() > opts.max_stack_bytes {
+            return Err(BakeError::Limit(format!("the layer {name}: the redrawn document exceeds the retained surface budget")));
+        }
+    }
+    Ok(())
+}
+
+/// A gradient or pattern fill's pixels over the canvas, before its masks (what a
+/// [`photocraft_doc::FillCache`] holds), drawn tile by tile.
+fn draw_fill(l: &Layer, f: &photocraft_doc::Fill, doc: &Document, opts: &BakeOptions<'_>, nest: &Nesting, ctl: &Interrupt<'_>) -> Result<Surface, BakeError> {
+    let (fmt, canvas) = (doc.pixel_format(), doc.bounds());
+    nest.check_surface(canvas, fmt, opts)?;
+    let tile_floats = (photocraft_geom::TILE_SIZE as u64).pow(2).saturating_mul(16);
+    if area(canvas) > opts.max_pixels || tile_floats > opts.max_filter_bytes {
+        return Err(BakeError::Limit("the fill exceeds the pixel or working memory budget".into()));
+    }
+    let render = photocraft_compose::fill_content_renderer(l, f, canvas, &doc.patterns, doc.depth);
+    let mut drawn = Surface::new(fmt);
+    for tile in canvas.tiles() {
+        check(ctl)?;
+        let part = buffer_to_surface(&render(tile.rect().intersect(&canvas)), fmt);
+        drawn.put_tiles(part.tiles().map(|(tc, px)| (*tc, px.clone())));
+    }
+    drawn.prune();
+    Ok(drawn)
+}
+
 /// A text layer drawn by the bake's text engine, with the fonts it has: a family it lacks, or a
 /// character none of its fonts has, is refused (a substitute font is not the layer's text).
 fn redraw_text(t: &mut TextLayer, doc: &Document, opts: &BakeOptions<'_>, nest: &Nesting, ctl: &Interrupt<'_>) -> Result<(), BakeError> {
