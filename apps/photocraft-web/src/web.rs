@@ -76,6 +76,8 @@ pub fn start() {
         };
         let pen_target = canvas.clone();
         let lang = crate::embed::query_value(&q, "lang").and_then(crate::embed::lang_tag).map(str::to_string);
+        // The runner takes `q`; a failed start still tells an embedding host.
+        let search = q.clone();
         let result = eframe::WebRunner::new()
             .start(
                 canvas,
@@ -129,7 +131,10 @@ pub fn start() {
         if let Some(el) = document.get_element_by_id("photocraft_loading") {
             match result {
                 Ok(()) => el.remove(),
-                Err(e) => el.set_inner_html(&format!("<p>PhotoCraft failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>")),
+                Err(e) => {
+                    el.set_inner_html(&format!("<p>PhotoCraft failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>"));
+                    crate::embed::start_failed(&search, &format!("{e:?}"));
+                }
             }
         }
     });
@@ -399,7 +404,7 @@ impl eframe::App for WebShell {
         }
         self.serve_fonts(ctx);
         if let Some(embed) = &mut self.embed {
-            embed.before_frame(&mut self.app);
+            embed.before_frame(&mut self.app, ctx);
         }
         self.app.logic_frame(ctx, frame);
         if let Some(embed) = &mut self.embed {

@@ -17,6 +17,7 @@
 //! - `document {name, revision, document}`: File › Save wrote it (asked for by `save`, or the
 //!   user's own File › Save); the `ArrayBuffer` is transferred.
 //! - `save-failed {error}`.
+//! - `start-failed {error}`: the app could not start (no WebGPU or WebGL2); nothing else follows.
 //!
 //! Every message is a plain object with `photocraftEmbed: 1` and a `type`. Only messages from the
 //! parent window on this page's own origin are read, and only the parent is posted to, on that
@@ -193,13 +194,13 @@ impl Embed {
     }
 
     /// Runs the host's commands; called at the start of every frame.
-    pub fn before_frame(&mut self, app: &mut PhotocraftApp) {
+    pub fn before_frame(&mut self, app: &mut PhotocraftApp, ctx: &egui::Context) {
         self.frame_revision = self.state(app).map_or(0, |st| st.revision);
         let commands = std::mem::take(&mut *self.commands.borrow_mut());
         for command in commands {
             match command {
                 Command::Open { name, document, fonts } => self.open(app, &name, &document, fonts),
-                Command::Save => self.save(app),
+                Command::Save => self.save(app, ctx),
                 Command::Saved { revision } => self.saved(app, revision),
             }
         }
@@ -261,14 +262,14 @@ impl Embed {
     }
 
     /// File › Save on the host's document, whichever tab is active, then back to that tab.
-    fn save(&mut self, app: &mut PhotocraftApp) {
+    fn save(&mut self, app: &mut PhotocraftApp, ctx: &egui::Context) {
         let result = (|| {
             let doc = self.doc.ok_or("no document is open")?;
             let index = app.session.documents().iter().position(|st| st.doc.id == doc).ok_or("the document was closed")?;
             let active = app.session.active_index();
             app.session.set_active(index);
             let revision = app.session.documents().get(index).map_or(0, |st| st.revision);
-            let saved = app.run("file.save", serde_json::json!({}));
+            let saved = photocraft_ui_egui::menus::invoke(app, ctx, "file.save", serde_json::json!({}));
             if let Some(active) = active {
                 app.session.set_active(active);
             }
@@ -316,6 +317,24 @@ impl Embed {
         set(&msg, "document", &buffer);
         self.host.post(&msg, Some(&js_sys::Array::of1(&buffer)));
     }
+}
+
+/// Tells an embedding host that the app could not start (`start-failed`): without it the host
+/// would wait for `ready` forever. Nothing happens outside embed mode.
+#[cfg(target_arch = "wasm32")]
+pub fn start_failed(search: &str, error: &str) {
+    if !query_has(search, "embed") {
+        return;
+    }
+    let Some(window) = web_sys::window() else { return };
+    let Some(parent) = window.parent().ok().flatten() else { return };
+    let Ok(origin) = window.location().origin() else { return };
+    if js_sys::Object::is(&parent, &window) || parent.location().origin().ok().as_deref() != Some(origin.as_str()) {
+        return;
+    }
+    let msg = message("start-failed");
+    set(&msg, "error", &error.into());
+    Host { parent, origin }.post(&msg, None);
 }
 
 #[cfg(target_arch = "wasm32")]

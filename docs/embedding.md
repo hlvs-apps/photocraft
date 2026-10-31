@@ -41,6 +41,7 @@ PhotoCraft → host:
 | `dirty` | `dirty` (boolean) | Whenever the document's unsaved state changes, and once after `opened`. |
 | `document` | `name`, `revision`, `document` (an `ArrayBuffer`, transferred) | File › Save wrote the document: asked for by `save`, or the user's own File › Save. |
 | `save-failed` | `error` | `save` could not write the document. |
+| `start-failed` | `error` | The app could not start (the browser has neither WebGPU nor WebGL2). Nothing follows. |
 
 Host → PhotoCraft (post to `iframe.contentWindow` with `location.origin` as the target origin):
 
