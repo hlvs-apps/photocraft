@@ -191,11 +191,13 @@ struct State {
     fallbacks: Vec<(String, String)>,
     /// Families to fetch, not yet taken by [`take_requests`].
     requested: Vec<String>,
-    /// Bumped when `families` changes, so font menus refresh.
+    /// Font menus list only `families` (see [`set_only_served`]).
+    only_served: bool,
+    /// Bumped when `families` or `only_served` changes, so font menus refresh.
     generation: u64,
 }
 
-static STATE: Mutex<State> = Mutex::new(State { families: Vec::new(), fallbacks: Vec::new(), requested: Vec::new(), generation: 0 });
+static STATE: Mutex<State> = Mutex::new(State { families: Vec::new(), fallbacks: Vec::new(), requested: Vec::new(), only_served: false, generation: 0 });
 
 fn state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(PoisonError::into_inner)
@@ -291,9 +293,26 @@ pub fn families() -> Vec<String> {
     state().families.clone()
 }
 
-/// Changes whenever [`families`] does.
+/// Changes whenever [`families`] or [`only_served`] does.
 pub fn generation() -> u64 {
     state().generation
+}
+
+/// Font menus offer only the families the host serves, not the bundled ones: for a host that
+/// decides which fonts its documents may use (the web build embedded in such a page, see
+/// `apps/photocraft-web`). The bundled fonts stay installed, so text already set in them, and
+/// the interface, still draw.
+pub fn set_only_served(only: bool) {
+    let mut s = state();
+    if s.only_served != only {
+        s.only_served = only;
+        s.generation = s.generation.wrapping_add(1);
+    }
+}
+
+/// Whether font menus offer only the served families ([`set_only_served`]).
+pub fn only_served() -> bool {
+    state().only_served
 }
 
 /// Asks for a family to be fetched: picked in a font menu, or needed by a layout that doesn't
@@ -429,6 +448,20 @@ mod tests {
         let t = photocraft_doc::TextLayer { text: "שלום".into(), size_pt: 12.0, ..Default::default() };
         let _ = crate::TextEngine::new().layout(&t, 72.0);
         assert!(take_requests().iter().any(|f| f == hebrew), "layout asks for the script fallback");
+    }
+
+    #[test]
+    fn offering_only_the_served_families_refreshes_the_font_menus() {
+        assert!(!only_served(), "font menus offer every family unless a host says otherwise");
+        let g = generation();
+        set_only_served(true);
+        assert!(only_served());
+        assert_ne!(generation(), g, "the menus rebuild");
+        let g = generation();
+        set_only_served(true);
+        assert_eq!(generation(), g, "nothing changed");
+        set_only_served(false);
+        assert!(!only_served());
     }
 
     #[test]

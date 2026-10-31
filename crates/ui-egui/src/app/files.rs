@@ -56,8 +56,9 @@ impl PhotocraftApp {
     }
 
     /// [`Self::open_bytes`] for a file read from `path` (File › Save writes back there; it goes
-    /// to Open Recent), when known.
-    pub(crate) fn open_bytes_from(&mut self, name: &str, bytes: &[u8], path: Option<&str>) -> Result<Vec<String>, String> {
+    /// to Open Recent), when known. A shell whose files are not on disk (the web build embedded
+    /// in a host page) names the document's file this way, so Save writes it in its own format.
+    pub fn open_bytes_from(&mut self, name: &str, bytes: &[u8], path: Option<&str>) -> Result<Vec<String>, String> {
         if let Some(r) = preset_files_ui::open(self, name, bytes) {
             return r.map(|()| Vec::new());
         }
