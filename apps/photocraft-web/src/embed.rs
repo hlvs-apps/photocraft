@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn the_hosts_document_is_a_plain_pcraft_name() {
-        assert_eq!(document_name("Hochzeit Sommer.pcraft"), Ok("Hochzeit Sommer.pcraft"));
+        assert_eq!(document_name("Summer poster.pcraft"), Ok("Summer poster.pcraft"));
         assert_eq!(document_name("CAPS.PCRAFT"), Ok("CAPS.PCRAFT"));
         for bad in ["", "design.psd", "design", "../design.pcraft", "a/b.pcraft", "a\\b.pcraft", "a\nb.pcraft"] {
             assert!(document_name(bad).is_err(), "{bad:?}");
