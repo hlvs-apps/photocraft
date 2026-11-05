@@ -201,7 +201,7 @@ impl Embed {
         let commands = std::mem::take(&mut *self.commands.borrow_mut());
         for command in commands {
             match command {
-                Command::Open { name, document, fonts } => self.open(app, &name, &document, fonts),
+                Command::Open { name, document, fonts } => self.open(app, ctx, &name, &document, fonts),
                 Command::Save => self.save(app, ctx),
                 Command::Saved { revision } => self.saved(app, revision),
             }
@@ -241,7 +241,7 @@ impl Embed {
         app.session.documents().iter().find(|st| st.doc.id == doc)
     }
 
-    fn open(&mut self, app: &mut PhotocraftApp, name: &str, document: &[u8], fonts: Vec<(String, Vec<u8>)>) {
+    fn open(&mut self, app: &mut PhotocraftApp, ctx: &egui::Context, name: &str, document: &[u8], fonts: Vec<(String, Vec<u8>)>) {
         let result = (|| {
             if self.name.borrow().is_some() {
                 return Err("this PhotoCraft already holds the host's document".to_string());
@@ -249,7 +249,7 @@ impl Embed {
             let name = document_name(name)?;
             // The document's fonts first: text then lays out in them, and the open names none
             // missing.
-            photocraft_ui_egui::served_fonts::install(app, fonts);
+            photocraft_ui_egui::served_fonts::install(app, ctx, fonts);
             let warnings = app.open_bytes_from(name, document, Some(name))?;
             *self.name.borrow_mut() = Some(name.to_string());
             Ok(warnings)
