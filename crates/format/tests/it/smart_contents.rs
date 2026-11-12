@@ -70,6 +70,32 @@ fn smart_contents_roundtrip_preserves_shared_instances_and_independent_equal_blo
     assert_eq!(load_from_bytes(&bytes).unwrap(), doc);
 }
 
+/// A host may mint contents ids as hashes, far past this process's id counter (a server that
+/// maps its own documents into PhotoCraft and keys its layers by their ids): loading keeps the
+/// layer ids and the contents ids, and the counter is not moved to the hashes.
+#[test]
+fn hashed_contents_ids_keep_the_layer_ids() {
+    let mut doc = sample();
+    fn hash_contents(layers: &mut [Layer]) {
+        for l in layers {
+            match &mut l.content {
+                LayerContent::Smart(s) => s.contents_id = SmartContentsId(s.contents_id.0 ^ (1 << 61)),
+                LayerContent::Group(g) => hash_contents(&mut g.children),
+                _ => {}
+            }
+        }
+    }
+    hash_contents(&mut doc.layers);
+    let ids = contents_ids(&doc);
+    assert_eq!(ids[0], ids[1]);
+    assert!(ids.iter().all(|id| id.0 > 1 << 61));
+    let bytes = save_to_bytes(&doc, &SaveOptions::default()).unwrap();
+    let back = load_from_bytes(&bytes).unwrap();
+    assert_eq!(back, doc, "layer ids, document id and contents ids as saved");
+    let next = LayerId::fresh().0;
+    assert!(next < 1 << 61, "the counter stays near its ids: {next}");
+}
+
 #[test]
 fn smart_contents_remapping_preserves_groups() {
     let doc = sample();
@@ -135,8 +161,9 @@ fn extreme_smart_contents_ids_remap_without_poisoning_allocator() {
     let ids = contents_ids(&back);
     assert_eq!(ids[0], ids[1]);
     assert_ne!(ids[0], ids[2]);
-    assert_ne!(back.id, doc.id);
-    assert_ne!(back.layers[0].id, doc.layers[0].id);
+    // Only the contents ids are remapped: the document and its layers keep theirs.
+    assert_eq!(back.id, doc.id);
+    assert_eq!(back.layers[0].id, doc.layers[0].id);
     assert!(ids.iter().all(|id| id.0 < u64::MAX / 2));
     assert!(SmartContentsId::fresh().0 < u64::MAX / 2);
     assert!(LayerId::fresh().0 < u64::MAX / 2);
