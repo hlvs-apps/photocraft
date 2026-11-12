@@ -8,6 +8,10 @@ pub(super) fn navigator(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     };
     let ctx = ui.ctx().clone();
     let size = app.session.documents()[idx].doc.size;
+    // A page view's Navigator shows its page and moves within it (`page_tabs`).
+    let page = app.ui.views.get(idx).and_then(|v| v.page.zip(crate::page_tabs::page_rect(v, &app.session.documents()[idx].doc)));
+    let bounds = page.map_or(photocraft_geom::Rect::new(0, 0, size.width as i32, size.height as i32), |(_, b)| b);
+    let (bx, by) = (bounds.x0 as f32, bounds.y0 as f32);
     let avail = ui.available_width();
     // The preview fills the group's height above the zoom controls (their height as measured
     // last frame), so it grows when the group is made taller, as in Photoshop (#2726).
@@ -16,19 +20,25 @@ pub(super) fn navigator(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let box_h = if left.is_finite() { left.max(40.0) } else { 150.0 };
     let (frame, resp) = ui.allocate_exact_size(vec2(avail, box_h), Sense::click_and_drag());
     ui.painter().rect_filled(frame, t.radius_sm, t.canvas);
-    let rect = navigator_fit(frame, size.width, size.height);
+    let rect = navigator_fit(frame, bounds.width().max(1), bounds.height().max(1));
     ui.data_mut(|d| d.insert_temp(navigator_preview_id(), rect));
     // On the GPU canvas, its own texture at this size (#4518); otherwise the CPU thumbnail.
-    if let Some(params) = crate::canvas::navigator_gpu_view(app, idx, rect, &ctx) {
+    if let Some(params) = crate::canvas::navigator_gpu_view(app, idx, rect, bounds, &ctx) {
         crate::gpu_canvas::GpuCanvas::paint(ui.painter(), rect, params);
     } else if crate::canvas::navigator_waits_for_gpu(app, idx, &ctx) {
         widgets::checker(ui.painter(), rect, 6.0);
     } else {
-        let Some(tex) = crate::canvas::navigator_texture(app, &ctx, idx) else { return };
+        // A page view's thumbnail is its page's composite alone, cut to the page.
+        let outer = std::mem::replace(&mut app.page_render, page.map(|(p, _)| (idx, p)));
+        let tex = crate::canvas::navigator_texture(app, &ctx, idx);
+        app.page_render = outer;
+        let Some(tex) = tex else { return };
         widgets::checker(ui.painter(), rect, 6.0);
-        ui.painter().image(tex, rect, Rect::from_min_max(egui::Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+        let (w, h) = (size.width.max(1) as f32, size.height.max(1) as f32);
+        let uv = Rect::from_min_max(pos2(bx / w, by / h), pos2(bounds.x1 as f32 / w, bounds.y1 as f32 / h));
+        ui.painter().image(tex, rect, uv, Color32::WHITE);
     }
-    let s = rect.width() / size.width.max(1) as f32;
+    let s = rect.width() / bounds.width().max(1) as f32;
     // ⌘/Ctrl-drag over the preview draws a rectangle the view then zooms to, as in Photoshop
     // (#6872); a plain click or drag moves the view.
     let command = crate::workspace_ui::sticky_mods(app, ctx.input(|i| i.modifiers)).command;
@@ -47,7 +57,7 @@ pub(super) fn navigator(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             let r = Rect::from_two_pos(from, to).intersect(rect);
             crate::tool_feedback::draw_ants(ui.painter(), &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()], true);
             if resp.drag_stopped() {
-                let doc_rect = Rect::from_min_max(((r.min - rect.min) / s).to_pos2(), ((r.max - rect.min) / s).to_pos2());
+                let doc_rect = Rect::from_min_max(((r.min - rect.min) / s).to_pos2(), ((r.max - rect.min) / s).to_pos2()).translate(vec2(bx, by));
                 let (canvas, ppp, aspect) = (app.last_canvas_rect, app.canvas_ppp(), app.ui.view.display_aspect());
                 navigator_zoom_to(&mut app.ui.views[idx], doc_rect, [size.width, size.height], canvas.size(), ppp, aspect);
             }
@@ -59,7 +69,7 @@ pub(super) fn navigator(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
         && let Some(pp) = resp.interact_pointer_pos()
     {
         let d = (pp - rect.min) / s;
-        app.ui.views[idx].center = [d.x.clamp(0.0, size.width as f32), d.y.clamp(0.0, size.height as f32)];
+        app.ui.views[idx].center = [(bx + d.x).clamp(bx, bounds.x1 as f32), (by + d.y).clamp(by, bounds.y1 as f32)];
         app.ui.views[idx].zoom_animating = false;
         app.ui.views[idx].zoom_anchor = None;
         app.ui.views[idx].fit_pending = false;
@@ -100,7 +110,7 @@ pub(super) fn navigator(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     // Pixel aspect correction shows fewer document columns across the same canvas width.
     let vw = canvas.width() / point_zoom / app.ui.view.display_aspect() * s;
     let vh = canvas.height() / point_zoom * s;
-    let c = pos2(rect.min.x + center[0] * s, rect.min.y + center[1] * s);
+    let c = pos2(rect.min.x + (center[0] - bx) * s, rect.min.y + (center[1] - by) * s);
     let vr = Rect::from_center_size(c, vec2(vw, vh)).intersect(frame.shrink(1.0));
     ui.painter().rect_stroke(vr, 2.0, Stroke::new(1.5, Color32::from_rgb(255, 84, 84)), StrokeKind::Middle);
     // Photoshop's one row under the preview (#4840): the zoom, typed in percent, then Zoom Out,

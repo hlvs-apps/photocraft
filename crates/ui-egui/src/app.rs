@@ -41,6 +41,8 @@ impl PhotocraftApp {
             canvases: HashMap::new(),
             navigator_textures: HashMap::new(),
             display_memo: HashMap::new(),
+            page_render: None,
+            page_docs: HashMap::new(),
             navigator_gpu: HashMap::new(),
             navigator_plain: std::collections::HashSet::new(),
             info_samplers: None,

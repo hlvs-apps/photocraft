@@ -324,6 +324,16 @@ fn paint_selection_outline(app: &mut PhotocraftApp, input: SelectionPaintInput<'
 }
 
 fn paint_canvas(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXform, input: &CanvasPaintInput<'_>) -> (bool, egui::layers::ShapeIdx, Rect) {
+    // A page view composites its page alone (`page_tabs::page_document`), under textures of its
+    // own, while it paints.
+    let painting_page = crate::page_tabs::page_rect(view, input.doc).and(view.page).map(|p| (input.idx, p));
+    let outer = std::mem::replace(&mut app.page_render, painting_page);
+    let painted = paint_document(app, ui, view, xf, input);
+    app.page_render = outer;
+    painted
+}
+
+fn paint_document(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXform, input: &CanvasPaintInput<'_>) -> (bool, egui::layers::ShapeIdx, Rect) {
     let ctx = input.ctx;
     let rect = input.rect;
     let painter = input.painter;
@@ -368,6 +378,12 @@ fn paint_canvas(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXfo
     // A flipped or pixel-aspect-corrected view draws through the CPU path (the GPU canvas shader
     // has no mirroring or non-square pixels). Rotation stays on the GPU: it is a view uniform.
     let gpu_ok = crate::gpu_canvas::gpu_view_ok(flip, view.rotation, aspect);
+    // A page view's texture key; its page alone has no reduced or filter preview of its own on
+    // the GPU, so it composites them at full size, and a filter dialog's preview (a whole
+    // document's texture) is drawn by the CPU canvas from the filtered page.
+    let render = crate::page_tabs::render_id(app, idx, doc.id);
+    let filtering = page.is_some() && (ensure_filter_preview(app, idx, ctx).is_some() || app.filter_preview.as_ref().is_some_and(|f| f.key.doc == doc.id));
+    let gpu_ok = gpu_ok && !filtering;
     if app.gpu.is_some() {
         if gpu_ok {
             crate::render_path::view_ok(app, doc.id.0);
@@ -377,6 +393,7 @@ fn paint_canvas(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXfo
     }
     if app.gpu.is_some()
         && gpu_ok
+        && page.is_none()
         && let Some((k, key, preview_size)) =
             ensure_adjust_proxy(app, idx, render_zoom).or_else(|| ensure_filter_preview(app, idx, ctx)).or_else(|| ensure_proxy_preview(app, idx, render_zoom))
     {
@@ -412,7 +429,7 @@ fn paint_canvas(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXfo
         app.perf.gpu = true;
         // Shadow, checkerboard, document and pixel grid in one custom shader (gpu_canvas.rs).
         let params = crate::gpu_canvas::ViewParams {
-            doc: doc.id.0,
+            doc: render.0,
             doc_size: [doc.size.width, doc.size.height],
             zoom: point_zoom,
             center: xf.center,
@@ -423,7 +440,7 @@ fn paint_canvas(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXfo
             },
             pixel_grid,
             view_key: egui::Id::unique(("pc-canvas", ctx.viewport_id(), idx, view.page)).value(),
-            display: sync_display_lut(app, doc, doc.id.0, output),
+            display: sync_display_lut(app, doc, render.0, output),
             output: output.unwrap_or(0),
             hdr: hdr_preview(app, doc),
             offset: [0.0, 0.0],
@@ -459,7 +476,7 @@ fn paint_canvas(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXfo
         let checkerboard = app.session.prefs().transparency_and_gamut.square().map(|square| (checker(app, ctx), square));
         // Repeated-quad coverage is not proven identical on all Pattern Preview adapters.
         // Retain its legacy checker submissions, including the central document's.
-        let opaque = !app.ui.view.pattern_preview && app.canvases.get(&cache_key(doc.id, output)).is_some_and(|c| c.texture_opaque) && tex.is_some();
+        let opaque = !app.ui.view.pattern_preview && app.canvases.get(&cache_key(render, output)).is_some_and(|c| c.texture_opaque) && tex.is_some();
         paint_cpu_document(painter, &xf, area, rotated, checkerboard, tex, opaque);
         if let Some((detail, area)) = textures.and_then(|t| t.detail) {
             paint_cpu_detail(painter, &xf, doc.bounds(), rotated, checkerboard, detail, area);
@@ -1709,8 +1726,14 @@ fn finish_canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, view: &mut Vie
     // Scrollbars (scrollbars.rs): drawn over the canvas edges, they take the pointer there.
     let t0 = crate::gpu_canvas::now_ms();
     let before = view.center;
+    // A page view's scrollbars run over its page.
+    let overscroll = app.session.prefs().tools.overscroll;
+    let bars_key = egui::Id::unique(("pc-canvas", idx, view.page));
     let over_bars = app.ui.view.shows_scrollbars()
-        && crate::scrollbars::show(ui, rect, view, flip, aspect, app.session.prefs().tools.overscroll, egui::Id::unique(("pc-canvas", idx)));
+        && match crate::page_tabs::page_rect(view, doc) {
+            Some(b) => crate::page_tabs::in_page(view, b, |v| crate::scrollbars::show(ui, rect, v, flip, aspect, false, bars_key)),
+            None => crate::scrollbars::show(ui, rect, view, flip, aspect, overscroll, bars_key),
+        };
     ctx.data_mut(|d| d.insert_temp(bars_id, over_bars));
     if view.center != before {
         ctx.request_repaint();
@@ -1803,8 +1826,13 @@ fn sync_view_to_document(app: &PhotocraftApp, ctx: &egui::Context, view: &mut Vi
             None => fill_view(view, doc, rect.size(), ppp, aspect),
         }
     }
-    // Preferences › Tools › Overscroll off: clamp before anything is drawn (scrollbars.rs).
-    if !app.session.prefs().tools.overscroll && crate::scrollbars::clamp_view_with_aspect(view, rect.size(), ppp, aspect) {
+    // Preferences › Tools › Overscroll off: clamp before anything is drawn (scrollbars.rs). A page
+    // view stays on its page whatever the preference says.
+    let clamped = match page {
+        Some(b) => crate::page_tabs::clamp_to_page(view, b, rect.size(), ppp, aspect),
+        None => !app.session.prefs().tools.overscroll && crate::scrollbars::clamp_view_with_aspect(view, rect.size(), ppp, aspect),
+    };
+    if clamped {
         view.zoom_anchor = None;
         ctx.request_repaint();
     }
@@ -2010,8 +2038,13 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
             view.center[0] -= d.x;
             view.center[1] -= d.y;
         }
-        // Overscroll off: the glide stops at the pan limit, as the scrollbars do.
-        if !app.session.prefs().tools.overscroll && crate::scrollbars::clamp_view_with_aspect(&mut view, rect.size(), ppp, aspect) {
+        // Overscroll off: the glide stops at the pan limit, as the scrollbars do; a page view's at
+        // its page.
+        let stopped = match crate::page_tabs::page_rect(&view, &doc) {
+            Some(b) => crate::page_tabs::clamp_to_page(&mut view, b, rect.size(), ppp, aspect),
+            None => !app.session.prefs().tools.overscroll && crate::scrollbars::clamp_view_with_aspect(&mut view, rect.size(), ppp, aspect),
+        };
+        if stopped {
             ctx.data_mut(|m| m.get_temp_mut_or_default::<crate::flick_pan::Flick>(flick_id).stop());
         }
     }

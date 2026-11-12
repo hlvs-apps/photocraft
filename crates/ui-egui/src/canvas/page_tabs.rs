@@ -302,6 +302,109 @@ pub fn page_rect(view: &View, doc: &photocraft_doc::Document) -> Option<photocra
     (!board.is_empty()).then_some(board)
 }
 
+/// A page document built for a page view: the displayed document it came from (while it lives),
+/// that one's preview key, and the page document (`PhotocraftApp::page_docs`).
+pub(crate) type PageDoc = (std::sync::Weak<photocraft_doc::Document>, u64, std::sync::Arc<photocraft_doc::Document>);
+
+/// The canvas caches' and GPU canvas's key for page `page` of document `doc`: a page view
+/// composites a document of its own (`page_document`), so its textures never mix with the whole
+/// canvas's or another page's. The top bit keeps it clear of document ids and their preview keys.
+pub fn render_key(doc: photocraft_doc::DocId, page: u64) -> u64 {
+    (doc.0 ^ page.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23)) | (1 << 63)
+}
+
+/// What a page view composites of `doc`: page `page`'s artboard and everything in it, nothing
+/// else (no other artboard, no layer outside the artboards, wherever they overlap the page). Same
+/// document id and size, so colour management, proofing and coordinates are the document's.
+/// `None` when `page` is no top-level artboard of `doc`.
+pub(crate) fn page_document(doc: &photocraft_doc::Document, page: u64) -> Option<photocraft_doc::Document> {
+    let board = doc.layers.iter().find(|l| l.id.0 == page && l.artboard().is_some())?.clone();
+    let mut shown = doc.clone();
+    shown.layers = vec![board];
+    Some(shown)
+}
+
+/// The page document index `idx` paints now, when a page view of it is being painted.
+pub(crate) fn rendered_page(app: &PhotocraftApp, idx: usize) -> Option<u64> {
+    app.page_render.filter(|(i, _)| *i == idx).map(|(_, p)| p)
+}
+
+/// The cache and GPU key document `idx` renders under now: its page view's while one is painted,
+/// else the document's own id.
+pub(crate) fn render_id(app: &PhotocraftApp, idx: usize, doc: photocraft_doc::DocId) -> photocraft_doc::DocId {
+    rendered_page(app, idx).map_or(doc, |p| photocraft_doc::DocId(render_key(doc, p)))
+}
+
+/// `shown` (the document as `display_doc` shows it, key `key`) reduced to page `page`: built
+/// once per snapshot and key. The document itself when the page is gone.
+pub(crate) fn page_of_shown(
+    app: &mut PhotocraftApp,
+    shown: std::sync::Arc<photocraft_doc::Document>,
+    key: u64,
+    page: u64,
+) -> std::sync::Arc<photocraft_doc::Document> {
+    let id = (shown.id, page);
+    if let Some((src, k, doc)) = app.page_docs.get(&id)
+        && *k == key
+        && src.ptr_eq(&std::sync::Arc::downgrade(&shown))
+    {
+        return doc.clone();
+    }
+    let Some(doc) = page_document(&shown, page).map(std::sync::Arc::new) else { return shown };
+    app.page_docs.retain(|_, (src, _, _)| src.strong_count() > 0);
+    app.page_docs.insert(id, (std::sync::Arc::downgrade(&shown), key, doc.clone()));
+    doc
+}
+
+/// The render keys of the page views that can be drawn now: each paged document's active page,
+/// every tile of Window › Arrange, and pages floated in windows. Their textures stay; a page
+/// not shown gives its textures back, as a closed document does.
+pub(crate) fn live_render_keys(app: &PhotocraftApp) -> Vec<u64> {
+    let docs = app.session.documents();
+    let mut keys = Vec::new();
+    for (i, st) in docs.iter().enumerate() {
+        if let Some(p) = app.ui.views.get(i).and_then(|v| v.page) {
+            keys.push(render_key(st.doc.id, p));
+        }
+    }
+    if crate::view_cmds::LAYOUTS.contains(&app.ui.view.arrange.as_str()) {
+        for tab in strip(app) {
+            if let (Some(p), Some(st)) = (tab.page, docs.get(tab.doc)) {
+                keys.push(render_key(st.doc.id, p));
+            }
+        }
+    }
+    for w in &app.ui.windows {
+        if let (Some(p), Some(st)) = (w.view.page, docs.get(w.document)) {
+            keys.push(render_key(st.doc.id, p));
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// Runs `f` on `view` in its page's frame: the camera as if the document were the page alone
+/// (its top-left at 0,0, its size the page's), for what measures a view against its document
+/// (scrollbars, the pan clamp); then back in the document's frame.
+pub(crate) fn in_page<R>(view: &mut View, board: photocraft_geom::Rect, f: impl FnOnce(&mut View) -> R) -> R {
+    let (dx, dy) = (board.x0 as f32, board.y0 as f32);
+    let doc_size = view.doc_size;
+    view.center = [view.center[0] - dx, view.center[1] - dy];
+    view.doc_size = [board.width().max(1), board.height().max(1)];
+    let r = f(view);
+    view.center = [view.center[0] + dx, view.center[1] + dy];
+    view.doc_size = doc_size;
+    r
+}
+
+/// Keep a page view on its page, whatever Preferences › Tools › Overscroll says: a page larger
+/// than the view cannot leave its edges, a smaller one stays inside the view (scrollbars.rs's
+/// Overscroll-off rule, applied to the page). True when the camera moved.
+pub(crate) fn clamp_to_page(view: &mut View, board: photocraft_geom::Rect, size: egui::Vec2, ppp: f32, aspect: f32) -> bool {
+    in_page(view, board, |v| crate::scrollbars::clamp_view_with_aspect(v, size, ppp, aspect))
+}
+
 /// Keep every document's page tabs in step with the document (once a frame and after every
 /// command, from `sync_views`): pages that are gone drop out, a new artboard opens and activates
 /// its tab, the active page's camera is the document's view, and the engine knows the page.

@@ -176,7 +176,7 @@ const PIXEL_ASPECTS: [&str; 8] = ["square", "d1DvNtsc", "d1DvPal", "d1DvNtscWide
 const FONT_PREVIEW: [&str; 5] = ["small", "medium", "large", "extraLarge", "huge"];
 const LANGUAGE: [&str; 3] = ["defaultFeatures", "eastAsianFeatures", "middleEasternFeatures"];
 /// Window › Arrange layouts drawn by [`cells`].
-const LAYOUTS: [&str; 10] = [
+pub(crate) const LAYOUTS: [&str; 10] = [
     "tileAllVertically",
     "tileAllHorizontally",
     "twoUpVertical",

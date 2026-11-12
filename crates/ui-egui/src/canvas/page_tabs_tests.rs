@@ -478,3 +478,149 @@ fn page_tab_pixels(gpu: bool) {
     assert!(count(left, green) > 0 && count(left, yellow) == 0 && count(left, magenta) == 0, "gpu {gpu}: the left tile is page 2");
     assert!(count(right, yellow) > 0 && count(right, green) == 0 && count(right, magenta) == 0, "gpu {gpu}: the right tile is page 3");
 }
+
+/// [`design`] with two things over page 2's rectangle, above it in the stack: a loose cyan layer
+/// (outside every artboard) and a fourth artboard, "Over", whose orange layer covers page 2's
+/// right part. The whole canvas shows both over page 2.
+fn overlapping_design() -> Vec<u8> {
+    let mut s = photocraft_engine::Session::new();
+    s.add_document(photocraft_format::load_from_bytes(&design()).unwrap(), None);
+    s.execute("select.deselectLayers", json!({})).unwrap();
+    s.execute("layer.new.layer", json!({"name": "Loose"})).unwrap();
+    s.execute("select.rect", json!({"x": 205, "y": 5, "width": 40, "height": 40})).unwrap();
+    s.execute("edit.fill", json!({"color": "#00ffff"})).unwrap();
+    s.execute("select.deselect", json!({})).unwrap();
+    s.execute("layer.new.artboard", json!({"rect": [260, 0, 80, 50], "name": "Over", "background": "white"})).unwrap();
+    s.execute("layer.new.layer", json!({"name": "Orange"})).unwrap();
+    s.execute("select.rect", json!({"x": 262, "y": 2, "width": 76, "height": 46})).unwrap();
+    s.execute("edit.fill", json!({"color": "#ff8000"})).unwrap();
+    s.execute("select.deselect", json!({})).unwrap();
+    let doc = &s.active().unwrap().doc;
+    assert!(doc.layers.iter().any(|l| l.name == "Loose" && l.artboard().is_none()), "the cyan layer is loose");
+    photocraft_format::save_to_bytes(doc, &Default::default()).unwrap()
+}
+
+/// A page tab composites its page alone: neither a loose layer nor another artboard drawn over
+/// the page's rectangle shows in it (they do on the whole canvas, from the same camera), and the
+/// page's own square shows whole. On the GPU canvas and on the CPU one.
+#[test]
+fn a_page_tab_composites_only_its_page() {
+    page_overlap_pixels(true);
+    page_overlap_pixels(false);
+}
+
+fn page_overlap_pixels(gpu: bool) {
+    let bytes = overlapping_design();
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 700.0)).with_pixels_per_point(1.0).with_max_steps(64).wgpu().build_eframe(move |cc| {
+            PhotocraftApp::setup_context(&cc.egui_ctx, crate::theme::ThemeKind::Pro);
+            let (mut app, _) = app(true);
+            if let Some(rs) = cc.wgpu_render_state.as_ref().filter(|_| gpu) {
+                app.set_wgpu(rs.clone());
+            }
+            app.open_bytes_from("Design.pcraft", &bytes, Some("Design.pcraft")).unwrap();
+            app
+        })
+    }));
+    let Ok(mut h) = built else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+    let (green, cyan, orange) = ([0, 255, 0], [0, 255, 255], [255, 128, 0]);
+    let page2 = layer(h.state(), "Page 2").0;
+    activate(h.state_mut(), Tab { doc: 0, page: Some(page2) });
+    h.run_steps(8);
+    let img = h.render().expect("render");
+    let area = h.state().last_canvas_rect;
+    let count = |rgb: [u8; 3]| count_in(img.as_raw(), img.width(), img.height(), area, rgb);
+    assert_eq!(h.state().gpu.is_some(), gpu);
+    assert!(count(green) >= 80 * 30 * 9 / 10, "gpu {gpu}: page 2's square shows whole: {}", count(green));
+    assert_eq!((count(cyan), count(orange)), (0, 0), "gpu {gpu}: nothing over page 2 that is not on it");
+    // A filter dialog's live preview of page 2's layer: still page 2 alone.
+    let green_layer = layer(h.state(), "Green");
+    h.state_mut().run("layer.select", json!({"layer": green_layer.0})).unwrap();
+    let ctx = h.ctx.clone();
+    menus::invoke(h.state_mut(), &ctx, "filter.blur.gaussianBlur", json!({})).unwrap();
+    for _ in 0..40 {
+        h.run_steps(2);
+        if h.state().filter_preview.as_ref().is_some_and(|p| p.result.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(h.state().filter_preview.as_ref().is_some_and(|p| p.result.is_some()), "gpu {gpu}: the dialog previews");
+    h.run_steps(4);
+    let img = h.render().expect("render");
+    let count = |rgb: [u8; 3]| count_in(img.as_raw(), img.width(), img.height(), area, rgb);
+    assert!(count(green) > 0, "gpu {gpu}: the previewed page shows");
+    assert_eq!((count(cyan), count(orange)), (0, 0), "gpu {gpu}: the filter's previews (canvas and dialog) of the page show nothing else");
+    h.state_mut().ui.dialogs.clear();
+    h.state_mut().filter_preview = None;
+    h.run_steps(4);
+    // The same camera on the whole canvas: both cover page 2.
+    let (zoom, center) = (h.state().ui.views[0].zoom, h.state().ui.views[0].center);
+    set_paged(h.state_mut(), 0, false).unwrap();
+    let v = &mut h.state_mut().ui.views[0];
+    (v.zoom, v.center, v.fit_pending) = (zoom, center, false);
+    h.run_steps(8);
+    let img = h.render().expect("render");
+    let count = |rgb: [u8; 3]| count_in(img.as_raw(), img.width(), img.height(), area, rgb);
+    assert!(count(cyan) > 0 && count(orange) > 0, "gpu {gpu}: the whole canvas draws them over page 2");
+    assert!(count(green) < 80 * 30 / 2, "gpu {gpu}: and they hide most of its square: {}", count(green));
+}
+
+/// A page view stays on its page however far it is panned, Overscroll on or off; the whole
+/// canvas keeps the Overscroll rule.
+#[test]
+fn panning_a_page_view_stops_at_its_page() {
+    let (mut app, _) = opened(true);
+    let b = boards(&app);
+    activate(&mut app, Tab { doc: 0, page: Some(b[1]) });
+    let doc = app.session.active().unwrap().doc.clone();
+    let board = page_rect(&app.ui.views[0], &doc).unwrap();
+    assert!(app.session.prefs().tools.overscroll, "Overscroll is on by default");
+    for (center, zoom) in [([-5000.0, 25.0], 1.0), ([9000.0, -400.0], 1.0), ([-5000.0, 25.0], 8.0), ([300.0, 50.0], 8.0)] {
+        let mut v = View { zoom, center, page: Some(b[1]), fit_pending: false, doc_size: [doc.size.width, doc.size.height], ..View::default() };
+        clamp_to_page(&mut v, board, egui::vec2(400.0, 300.0), 1.0, 1.0);
+        let (half_w, half_h) = (200.0 / zoom, 150.0 / zoom);
+        let (bx, by) = ((board.x0 + board.x1) as f32 / 2.0, (board.y0 + board.y1) as f32 / 2.0);
+        if (board.width() as f32) < 2.0 * half_w {
+            // Smaller than the view: the whole page stays in view.
+            assert!(v.center[0] - half_w <= board.x0 as f32 + 0.01 && v.center[0] + half_w >= board.x1 as f32 - 0.01, "{center:?} → {:?}", v.center);
+        } else {
+            // Larger: the view stays on the page.
+            assert!(v.center[0] - half_w >= board.x0 as f32 - 0.01 && v.center[0] + half_w <= board.x1 as f32 + 0.01, "{center:?} → {:?}", v.center);
+        }
+        assert!((v.center[1] - by).abs() <= (half_h - board.height() as f32 / 2.0).abs() + 0.01, "{center:?} → {:?}", v.center);
+        let _ = bx;
+    }
+}
+
+/// The running app keeps a panned page view on its page (the canvas clamps it before drawing).
+#[test]
+fn the_canvas_brings_a_page_view_back_to_its_page() {
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 700.0)).with_max_steps(64).build_eframe(|cc| {
+        PhotocraftApp::setup_context(&cc.egui_ctx, crate::theme::ThemeKind::Pro);
+        let (mut app, _) = app(true);
+        app.open_bytes_from("Design.pcraft", &design(), Some("Design.pcraft")).unwrap();
+        app
+    });
+    h.run_steps(4);
+    let b = boards(h.state());
+    activate(h.state_mut(), Tab { doc: 0, page: Some(b[1]) });
+    h.run_steps(4);
+    let v = &mut h.state_mut().ui.views[0];
+    (v.zoom, v.center, v.fit_pending) = (1.0, [-5000.0, 25.0], false);
+    h.run_steps(4);
+    let center = h.state().ui.views[0].center;
+    // At 100% the view is wider than the 100 px page: the whole page (x 200..300) stays in it.
+    let half = h.state().last_canvas_rect.width() / 2.0;
+    assert!(center[0] - half <= 200.5 && center[0] + half >= 299.5, "the page is in view: {center:?}, half width {half}");
+    // The whole canvas with Overscroll on may leave its document where it was put.
+    set_paged(h.state_mut(), 0, false).unwrap();
+    h.run_steps(4);
+    let v = &mut h.state_mut().ui.views[0];
+    (v.zoom, v.center, v.fit_pending) = (1.0, [-5000.0, 25.0], false);
+    h.run_steps(4);
+    assert_eq!(h.state().ui.views[0].center[0], -5000.0);
+}
