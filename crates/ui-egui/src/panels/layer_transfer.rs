@@ -138,7 +138,7 @@ fn target_at(app: &PhotocraftApp, p: egui::Pos2) -> Option<(usize, Option<[f64; 
         return None;
     }
     match crate::canvas::arranged_cells(app, app.last_canvas_rect) {
-        Some(cells) => cells.into_iter().find(|(_, r)| r.contains(p)).map(|(d, _)| (d, None)),
+        Some(cells) => cells.into_iter().find(|(_, _, r)| r.contains(p)).map(|(_, tab, _)| (tab.doc, None)),
         None => Some((app.session.active_index()?, crate::canvas::ViewXform::active(app).map(|xf| xf.to_doc(p)))),
     }
 }

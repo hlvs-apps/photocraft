@@ -68,6 +68,9 @@ fn invoke_early_commands(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str,
     if id == "ui.symmetryTransform" {
         return Some(crate::symmetry_ui::begin(app).map(|_| Value::Null));
     }
+    if let Some(r) = crate::page_tabs::invoke(app, id, params) {
+        return Some(r);
+    }
     if let Some(r) = crate::tool_reset::invoke(app, id, params) {
         return Some(r);
     }
@@ -416,6 +419,9 @@ pub(crate) fn invoke_unguarded(app: &mut PhotocraftApp, ctx: &egui::Context, id:
             app.import_os_clipboard()?;
             app.clip_read_for_paste = true;
             let external = app.clip_external;
+            // A page tab shows only its page: the copied area counts as visible on the page only,
+            // and otherwise the paste centres on the page (the engine's default there).
+            let page = app.session.active().and_then(|st| st.page_rect());
             let visible = !external
                 && app.session.active_index().zip(app.session.clipboard.as_ref()).is_some_and(|(i, clip)| {
                     let v = &app.ui.views[i];
@@ -423,10 +429,14 @@ pub(crate) fn invoke_unguarded(app: &mut PhotocraftApp, ctx: &egui::Context, id:
                     let (hw, hh) = (app.last_canvas_rect.width() / 2.0 / pz / app.ui.view.display_aspect(), app.last_canvas_rect.height() / 2.0 / pz);
                     let r =
                         photocraft_geom::Rect::new((v.center[0] - hw) as i32, (v.center[1] - hh) as i32, (v.center[0] + hw) as i32, (v.center[1] + hh) as i32);
+                    let r = page.map_or(r, |b| r.intersect(&b));
                     !clip.bounds.intersect(&r).is_empty()
                 });
-            let p = match app.session.active_index() {
-                Some(i) if !visible => json!({"center": app.ui.views[i].center}),
+            let p = match (app.session.active_index(), page) {
+                (Some(_), Some(b)) if !visible => {
+                    json!({"center": [(f64::from(b.x0) + f64::from(b.x1)) / 2.0, (f64::from(b.y0) + f64::from(b.y1)) / 2.0]})
+                }
+                (Some(i), None) if !visible => json!({"center": app.ui.views[i].center}),
                 _ => json!({}),
             };
             app.run("edit.paste", p)
@@ -671,13 +681,19 @@ fn invoke_window_command(app: &mut PhotocraftApp, ctx: &egui::Context, id: &str)
             }
         }
         "window.togglePanels" => Some(toggle_panels(app)),
+        // Every tab of the strip in turn, page tabs included.
         "window.nextDocument" | "window.previousDocument" => Some((|| {
-            let count = app.session.documents().len();
-            let active = app.session.active_index().ok_or("no document open")?;
-            let next = if id == "window.nextDocument" { (active + 1) % count } else { (active + count - 1) % count };
-            app.session.set_active(next);
-            app.jobs.focus = None;
-            Ok(json!({"document": next}))
+            let tabs = crate::page_tabs::strip(app);
+            let count = tabs.len();
+            let active = crate::page_tabs::active(app).ok_or("no document open")?;
+            let at = tabs.iter().position(|t| *t == active).unwrap_or(0);
+            let next = if id == "window.nextDocument" { (at + 1) % count } else { (at + count - 1) % count };
+            let tab = *tabs.get(next).ok_or("no document open")?;
+            crate::page_tabs::activate(app, tab);
+            Ok(match tab.page {
+                Some(page) => json!({"document": tab.doc, "page": page}),
+                None => json!({"document": tab.doc}),
+            })
         })()),
         _ if id.starts_with(DOCUMENT_ITEM) => Some((|| {
             let count = app.session.documents().len();

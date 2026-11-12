@@ -282,7 +282,9 @@ impl PhotocraftApp {
         }
         self.canvases.retain(|(doc, _), _| ids.contains(doc));
         self.navigator_textures.retain(|doc, _| ids.contains(doc));
+        let opened: Vec<DocId> = ids.iter().filter(|id| !self.view_docs.contains(id)).copied().collect();
         self.view_docs = ids;
+        crate::page_tabs::sync(self, &opened);
         self.prune_thumbs();
         self.sync_mask_targets();
         // Channel-view textures outlive a hidden view (cheap re-show), not their document.

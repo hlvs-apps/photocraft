@@ -74,6 +74,48 @@ pub fn insert_new(doc: &mut Document, anchor: Option<LayerId>, mut layer: Layer,
     id
 }
 
+/// A page tab's rule ([`crate::DocState::page`]): no edit made while an artboard is shown as a
+/// page leaves a layer loose on the canvas. Every layer the edit put at the top level that was
+/// not there before (a new layer, a paste, a place, a layer dragged out of its group to the
+/// Layers panel's root) goes into the artboard `page` instead: the ones above the board on top
+/// of its contents, the ones below it under them, each run in its order. Artboards stay at the
+/// top level, and so does a Background. Nothing changes when `page` is no artboard of `doc` (it
+/// was deleted or ungrouped by this edit), or when nothing became top-level. A move that would
+/// nest deeper than [`MAX_GROUP_DEPTH`] fails the edit.
+pub fn keep_on_page(before: &Document, doc: &mut Document, page: LayerId, what: &str) -> crate::Result<()> {
+    let Some(board_at) = doc.layers.iter().position(|l| l.id == page && l.artboard().is_some()) else { return Ok(()) };
+    let background = crate::background_cmds::background_id(doc);
+    let loose = |l: &Layer| l.artboard().is_none() && Some(l.id) != background && !before.layers.iter().any(|b| b.id == l.id);
+    if !doc.layers.iter().any(loose) {
+        return Ok(());
+    }
+    let (mut below, mut above, mut rest) = (Vec::new(), Vec::new(), Vec::with_capacity(doc.layers.len()));
+    for (i, l) in std::mem::take(&mut doc.layers).into_iter().enumerate() {
+        match (loose(&l), i < board_at) {
+            (true, true) => below.push(l),
+            (true, false) => above.push(l),
+            (false, _) => rest.push(l),
+        }
+    }
+    doc.layers = rest;
+    let Some(children) = doc.layers.iter_mut().find(|l| l.id == page).and_then(Layer::children_mut) else {
+        return Err(crate::EngineError::Other(format!("{what}: the page's artboard is not a group")));
+    };
+    // The bottom layer of a run has nothing of its own below it to clip to.
+    if let Some(first) = below.first_mut() {
+        first.clipped = false;
+    }
+    if children.is_empty()
+        && below.is_empty()
+        && let Some(first) = above.first_mut()
+    {
+        first.clipped = false;
+    }
+    children.splice(0..0, below);
+    children.extend(above);
+    crate::cmd::layer_multi_cmds::check_group_depth(doc, what)
+}
+
 /// Does the group `target` at depth `depth` (its path length) take a new `layer` as its top
 /// child? An open group or an artboard does, locked or not (Photoshop puts a new layer inside a
 /// group locked with Lock All), unless nesting would pass [`MAX_GROUP_DEPTH`]. An artboard
@@ -111,3 +153,7 @@ fn subtree_depth(layer: &Layer) -> usize {
 #[cfg(test)]
 #[path = "layer_place_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "layer_place_page_tests.rs"]
+mod page_tests;

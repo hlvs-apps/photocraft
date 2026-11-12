@@ -81,6 +81,7 @@ pub use canvas::guide_select;
 pub use canvas::layer_pick_ui;
 pub use canvas::move_ui;
 pub use canvas::outline;
+pub use canvas::page_tabs;
 pub use canvas::paint_mouse;
 pub use canvas::patch_preview;
 pub use canvas::pattern_preview;
@@ -436,6 +437,10 @@ pub struct PhotocraftApp {
     /// Window › Arrange: the first document of the shown run of tiles, when there are more
     /// documents than tiles (`canvas::arranged_cells`).
     pub(crate) arrange_start: usize,
+    /// Open documents with artboards as page tabs (`page_tabs`): one tab per artboard instead of
+    /// one for the whole canvas. The web embed sets it; elsewhere Window › Pages › Artboards as
+    /// Tabs turns page tabs on per document.
+    pub artboards_as_tabs: bool,
     /// Physical pixels per egui point of the canvas last frame (`ctx.pixels_per_point`, which
     /// folds in both the display scale and Interface › UI Scale). The canvas maps document pixels
     /// to physical pixels, so point-space geometry divides the view zoom by this (see

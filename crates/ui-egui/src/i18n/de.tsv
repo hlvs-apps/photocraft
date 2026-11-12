@@ -3510,3 +3510,19 @@ curves	Smooth	Glätten
 	Font size presets	Schriftgrößen-Vorgaben
 	Leading presets	Zeilenabstand-Vorgaben
 	Tracking presets	Laufweiten-Vorgaben
+
+# Page tabs (Window › Pages): one tab per artboard of a document, each a view of that document
+	Pages	Seiten
+	Artboards as Tabs	Zeichenbereiche als Registerkarten
+	Next Page	Nächste Seite
+	Previous Page	Vorherige Seite
+	Move Page Left	Seite nach links verschieben
+	Move Page Right	Seite nach rechts verschieben
+	Close Page Tab	Seiten-Registerkarte schließen
+	Close Other Page Tabs	Andere Seiten-Registerkarten schließen
+	Show Page	Seite anzeigen
+	Close Document	Dokument schließen
+	The document has no artboards to show as page tabs.	Das Dokument hat keine Zeichenbereiche, die als Seiten-Registerkarten angezeigt werden können.
+	The last page tab stays open. File › Close closes the document.	Die letzte Seiten-Registerkarte bleibt geöffnet. Datei › Schließen schließt das Dokument.
+	The page is already the first.	Die Seite ist bereits die erste.
+	The page is already the last.	Die Seite ist bereits die letzte.

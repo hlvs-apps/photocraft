@@ -108,6 +108,9 @@ pub fn start() {
                     // wrote, and embed mode holds it unsaved until the host confirms (`embed.rs`).
                     if embed.is_some() {
                         app.services.write_unconfirmed = false;
+                        // The host's document is a design whose pages are artboards: one page
+                        // tab per page (`page_tabs`), still one document and one save.
+                        app.artboards_as_tabs = true;
                     }
                     if !preset_warnings.is_empty() {
                         photocraft_ui_egui::notices::post(&mut app, i18n::t("Some brush presets could not be loaded"), preset_warnings, true, None);

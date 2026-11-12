@@ -150,13 +150,17 @@ pub(super) fn open_as(s: &mut Session, p: &Value) -> Result<Value> {
 pub const PLACE_EMBEDDED: &str = "Place Embedded";
 
 /// Place a file's bytes as a smart object layer, centred, and (with Preferences ▸ General ▸
-/// Resize Image During Place, on by default) scaled down to fit when larger than the canvas.
+/// Resize Image During Place, on by default) scaled down to fit when larger than the canvas (a
+/// page tab's artboard, [`crate::DocState::page`], instead of the canvas).
 /// `linked` makes it a linked smart object that refers to that path instead of embedding the bytes.
 /// With Preferences ▸ General ▸ Always Create Smart Objects When Placing off, an embedded place
 /// lands as a plain pixel layer instead (an explicit `"smartObject": false` asks for one).
 pub fn place_bytes(s: &mut Session, name: &str, bytes: Vec<u8>, linked: Option<String>, p: &Value) -> Result<Value> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
-    let (cw, ch) = (d.doc.size.width as f64, d.doc.size.height as f64);
+    // The area the place fits into and centres on: a page tab's artboard, else the canvas.
+    let area = d.placement_area();
+    let (ax, ay) = (f64::from(area.x0), f64::from(area.y0));
+    let (cw, ch) = (f64::from(area.width()), f64::from(area.height()));
     let fmt = d.doc.pixel_format();
     let vector = photocraft_io::svg::is_svg(&bytes);
     let opts = crate::jobs::import_options(s.prefs());
@@ -175,9 +179,10 @@ pub fn place_bytes(s: &mut Session, name: &str, bytes: Vec<u8>, linked: Option<S
         None if fit && (w > cw || h > ch) => (cw / w).min(ch / h),
         None => 1.0,
     };
+    let (mx, my) = (ax + cw / 2.0, ay + ch / 2.0);
     let center = match p.get("center").and_then(Value::as_array) {
-        Some(c) if c.len() == 2 => (c[0].as_f64().unwrap_or(cw / 2.0), c[1].as_f64().unwrap_or(ch / 2.0)),
-        _ => (cw / 2.0, ch / 2.0),
+        Some(c) if c.len() == 2 => (c[0].as_f64().unwrap_or(mx), c[1].as_f64().unwrap_or(my)),
+        _ => (mx, my),
     };
     let (dx, dy) = ((center.0 - w * scale / 2.0).round(), (center.1 - h * scale / 2.0).round());
     let mut px = flattened_checked(&src, fmt, "file.place")?;

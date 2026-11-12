@@ -702,15 +702,15 @@ fn arranged_documents_keep_their_tiles() {
     for active in 0..3 {
         app.session.set_active(active);
         let shown = crate::canvas::arranged_cells(&app, rect).unwrap();
-        let order: Vec<usize> = shown.iter().map(|(d, _)| *d).collect();
+        let order: Vec<usize> = shown.iter().map(|(_, t, _)| t.doc).collect();
         assert_eq!(order, vec![0, 1, 2], "active {active}");
-        assert!(shown.windows(2).all(|w| w[0].1.left() < w[1].1.left()), "document 0 on the left");
+        assert!(shown.windows(2).all(|w| w[0].2.left() < w[1].2.left()), "document 0 on the left");
     }
     app.ui.view.arrange = "twoUpVertical".into();
     // As `documents` draws them: the shown run is kept from frame to frame.
     let docs = |app: &mut PhotocraftApp, active: usize| {
         app.session.set_active(active);
-        let shown: Vec<usize> = crate::canvas::arranged_cells(app, rect).unwrap().iter().map(|(d, _)| *d).collect();
+        let shown: Vec<usize> = crate::canvas::arranged_cells(app, rect).unwrap().iter().map(|(_, t, _)| t.doc).collect();
         app.arrange_start = shown[0];
         shown
     };

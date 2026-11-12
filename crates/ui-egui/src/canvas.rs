@@ -31,6 +31,7 @@ pub mod layer_pick_ui;
 pub mod move_ui;
 mod navigator;
 pub mod outline;
+pub mod page_tabs;
 mod paint;
 pub mod paint_mouse;
 pub mod patch_preview;
@@ -343,8 +344,10 @@ fn paint_canvas(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXfo
     let drop_shadow = border == photocraft_engine::prefs::CanvasBorder::DropShadow;
     // Drop shadow, checkerboard, document image.
     let img_rect = xf.doc_rect(doc.bounds());
+    // A page tab (`View::page`) shows its artboard alone: its edge is the board's.
+    let page = crate::page_tabs::page_rect(view, doc);
     // The canvas edge the Line border outlines: a size-changing preview's own (CPU canvas).
-    let mut edge_rect = img_rect;
+    let mut edge_rect = page.map_or(img_rect, |b| xf.doc_rect(b));
     // The document area the image is drawn over: a size-changing preview's own on the CPU
     // canvas (Image › Rotation). Overlays drawn from the same preview follow it.
     let mut shown_area = doc.bounds();
@@ -393,10 +396,11 @@ fn paint_canvas(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXfo
             rotation: if view.rotation.is_finite() { view.rotation.to_radians() } else { 0.0 },
             shadow: {
                 let t = crate::theme::Tokens::get(ctx);
-                !t.bevel && !t.pro && drop_shadow
+                !t.bevel && !t.pro && drop_shadow && page.is_none()
             },
             pixel_grid: false,
-            view_key: egui::Id::unique(("pc-canvas-proxy", ctx.viewport_id(), idx)).value(),
+            // Per view, so two page tabs of one document tiled side by side keep their cameras.
+            view_key: egui::Id::unique(("pc-canvas-proxy", ctx.viewport_id(), idx, view.page)).value(),
             display: sync_display_lut(app, &shown, key, output),
             output: output.unwrap_or(0),
             hdr: hdr_preview(app, doc),
@@ -415,10 +419,10 @@ fn paint_canvas(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXfo
             rotation: if view.rotation.is_finite() { view.rotation.to_radians() } else { 0.0 },
             shadow: {
                 let t = crate::theme::Tokens::get(ctx);
-                !t.bevel && !t.pro && drop_shadow
+                !t.bevel && !t.pro && drop_shadow && page.is_none()
             },
             pixel_grid,
-            view_key: egui::Id::unique(("pc-canvas", ctx.viewport_id(), idx)).value(),
+            view_key: egui::Id::unique(("pc-canvas", ctx.viewport_id(), idx, view.page)).value(),
             display: sync_display_lut(app, doc, doc.id.0, output),
             output: output.unwrap_or(0),
             hdr: hdr_preview(app, doc),
@@ -434,14 +438,17 @@ fn paint_canvas(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXfo
         app.navigator_gpu.remove(&doc.id);
         // A document too large for one full-resolution texture also gets the part in view at
         // the screen's resolution, drawn over the reduced whole (#7568).
-        let in_view =
-            InView { visible: visible_doc_rect(&xf), zoom: view.zoom, key: egui::Id::unique(("pc-canvas-detail", ctx.viewport_id(), idx, primary)).value() };
+        let in_view = InView {
+            visible: visible_doc_rect(&xf),
+            zoom: view.zoom,
+            key: egui::Id::unique(("pc-canvas-detail", ctx.viewport_id(), idx, primary, view.page)).value(),
+        };
         let textures = ensure_texture_in_view(app, ctx, idx, output, Some(in_view));
         let tex = textures.as_ref().map(|t| t.texture);
         // The area the image covers: a size-changing preview's own (Image › Rotation).
         let area = textures.as_ref().map_or(doc.bounds(), |t| t.bounds);
         shown_area = area;
-        if area != doc.bounds() {
+        if area != doc.bounds() && page.is_none() {
             edge_rect = xf.doc_rect(area);
         }
         if !crate::theme::Tokens::get(ctx).bevel && drop_shadow {
@@ -489,8 +496,13 @@ fn paint_canvas(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXfo
         }
     }
     crate::color_range_ui::paint_selection_preview(app, ctx, painter, doc.id, img_rect, flip);
-    // Artboards: pasteboard between the boards, outlines and names (artboard_ui.rs).
-    if doc.has_artboards() {
+    // A page tab: nothing of the document outside its artboard shows (the other boards, loose
+    // layers, the rest of the canvas); its edge is the board's. Overlays drawn later (the
+    // transform box, the Artboard tool's + buttons) stay usable around it.
+    if let Some(board) = page {
+        paint_page_surround(app, ctx, painter, &xf, rect, board);
+    } else if doc.has_artboards() {
+        // Artboards: pasteboard between the boards, outlines and names (artboard_ui.rs).
         let t = crate::theme::Tokens::get(ctx);
         let pasteboard = crate::prefs_ui::pasteboard_color(app);
         let dot_tex = dots(ctx, &t);
@@ -529,6 +541,9 @@ fn paint_canvas(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXfo
         }
     }
 
+    // On a page tab the pixel overlays and the selection's outline stay on the page too.
+    let on_page = page.map(|b| painter.with_clip_rect(xf.doc_rect(b).intersect(rect)));
+    let painter = on_page.as_ref().unwrap_or(painter);
     // Pixel grid at high zoom, over pixels with content only (the GPU path draws its own).
     if !on_gpu && pixel_grid && crate::pixel_grid::shows_at(view.zoom) {
         crate::pixel_grid::paint(app, painter, &xf, idx, output, visible_doc_rect(&xf));
@@ -547,6 +562,49 @@ fn paint_canvas(app: &mut PhotocraftApp, ui: &egui::Ui, view: &View, xf: ViewXfo
     paint_selection_outline(app, SelectionPaintInput { ctx, painter, ui, view, xf, rect, doc, idx });
 
     (beyond, layer_edges, edge_rect)
+}
+
+/// A page tab's surround ([`View::page`]): everything of the canvas around the artboard `board`,
+/// covered with what the canvas shows around a document (Preferences › Interface's pasteboard
+/// colour, else the canvas colour and its dots). Four document-space strips around the board
+/// reach past the view on every side; painted as their screen quads, they cover exactly the
+/// outside of the board in a rotated view too.
+fn paint_page_surround(app: &PhotocraftApp, ctx: &egui::Context, painter: &egui::Painter, xf: &ViewXform, rect: Rect, board: photocraft_geom::Rect) {
+    let t = crate::theme::Tokens::get(ctx);
+    let pasteboard = crate::prefs_ui::pasteboard_color(app);
+    let dot_tex = dots(ctx, &t);
+    let around = visible_doc_rect(xf).union(&board);
+    let (x0, y0, x1, y1) = (around.x0.saturating_sub(2), around.y0.saturating_sub(2), around.x1.saturating_add(2), around.y1.saturating_add(2));
+    let strips = [
+        photocraft_geom::Rect::new(x0, y0, board.x0, y1),
+        photocraft_geom::Rect::new(board.x1, y0, x1, y1),
+        photocraft_geom::Rect::new(board.x0, y0, board.x1, board.y0),
+        photocraft_geom::Rect::new(board.x0, board.y1, board.x1, y1),
+    ];
+    let fill = |q: &[Pos2; 4], tex: Option<egui::TextureId>, color: Color32| {
+        let mut mesh = tex.map_or_else(egui::Mesh::default, egui::Mesh::with_texture);
+        for &p in q {
+            // Same phase as the dots around a document.
+            let uv = if tex.is_some() { ((p - rect.min) / 22.0).to_pos2() } else { egui::epaint::WHITE_UV };
+            mesh.vertices.push(egui::epaint::Vertex { pos: p, uv, color });
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(mesh);
+    };
+    for r in strips.into_iter().filter(|r| !r.is_empty()) {
+        let (a, b, c, d) = (r.x0 as f32, r.y0 as f32, r.x1 as f32, r.y1 as f32);
+        let q = [xf.to_screen(a, b), xf.to_screen(c, b), xf.to_screen(c, d), xf.to_screen(a, d)];
+        match pasteboard {
+            Some(color) => fill(&q, None, color),
+            None => {
+                fill(&q, None, t.canvas);
+                if let Some(id) = dot_tex {
+                    fill(&q, Some(id), Color32::WHITE);
+                }
+            }
+        }
+    }
 }
 
 struct CanvasNavigationInput<'a> {
@@ -1719,20 +1777,31 @@ fn layer_picker_eyedropper(app: &mut PhotocraftApp, ui: &egui::Ui, ctx: &egui::C
 /// and the overscroll clamp. Returns the pixel aspect the view is drawn with.
 fn sync_view_to_document(app: &PhotocraftApp, ctx: &egui::Context, view: &mut View, doc: &Document, rect: Rect, ppp: f32) -> f32 {
     let size = [doc.size.width, doc.size.height];
+    // A page tab fits, fills and re-centres on its artboard, as a document view does on its canvas.
+    let page = crate::page_tabs::page_rect(view, doc);
     if view.doc_size != size {
         // Like Photoshop: keep the zoom level, re-centre the resized document.
         if view.doc_size != [0, 0] {
-            view.center = [size[0] as f32 / 2.0, size[1] as f32 / 2.0];
+            view.center = match page {
+                Some(b) => [((f64::from(b.x0) + f64::from(b.x1)) / 2.0) as f32, ((f64::from(b.y0) + f64::from(b.y1)) / 2.0) as f32],
+                None => [size[0] as f32 / 2.0, size[1] as f32 / 2.0],
+            };
         }
         view.doc_size = size;
     }
     // View › Pixel Aspect Ratio Correction: document pixels are shown this much wider.
     let aspect = app.ui.view.display_aspect();
     if view.fit_pending && rect.width() > 50.0 {
-        fit_view(view, doc, rect.size(), ppp, aspect);
+        match page {
+            Some(b) => view_xform::fit_view_to_board(view, b, size, rect.size(), ppp, aspect),
+            None => fit_view(view, doc, rect.size(), ppp, aspect),
+        }
     }
     if view.fill_pending && rect.width() > 50.0 {
-        fill_view(view, doc, rect.size(), ppp, aspect);
+        match page {
+            Some(b) => view_xform::fill_view_to_board(view, b, size, rect.size(), ppp, aspect),
+            None => fill_view(view, doc, rect.size(), ppp, aspect),
+        }
     }
     // Preferences › Tools › Overscroll off: clamp before anything is drawn (scrollbars.rs).
     if !app.session.prefs().tools.overscroll && crate::scrollbars::clamp_view_with_aspect(view, rect.size(), ppp, aspect) {
@@ -1770,7 +1839,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
     // too, as in Photoshop (#6017).
     let rect = crate::rulers::content_rect(app, rect);
     // Both wheel reads share one owner so snap-zoom input is accumulated only once per frame.
-    let wheel_owner = ui.scope_id().with(("canvas-wheel", idx));
+    let wheel_owner = ui.scope_id().with(("canvas-wheel", idx, view.page));
     // Direct navigation starts from the authoritative camera. This also means a click or drag
     // never maps through a camera that is still moving under the pointer.
     let (pointer_here, hover_here) = ctx.input(|i| {
@@ -1854,7 +1923,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
     if !under_dialog && ctx.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| rect.contains(p))) {
         crate::spring_tools::note_canvas_press(app);
     }
-    let bars_id = egui::Id::unique(("pc-canvas-bars-hover", idx));
+    let bars_id = egui::Id::unique(("pc-canvas-bars-hover", idx, view.page));
     update_canvas_navigation(app, &mut view, CanvasNavigationInput { ctx: &ctx, response: &response, free_hover, wheel_owner, xf, ppp, idx });
 
     // Pen pressure/tilt for this frame's tool events (mouse = 1.0), unless Preferences › Tools ›
@@ -1931,7 +2000,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
     let transform_owns_pointer = primary && app.ui.transform.is_some() && temporary.is_none() && !middle;
     let hand_pan = tool == Tool::Hand && !transform_owns_pointer;
     // Preferences › Tools › Enable Flick Panning: a Hand drag let go while moving glides on.
-    let flick_id = egui::Id::unique(("pc-flick-pan", idx, primary, ctx.viewport_id()));
+    let flick_id = egui::Id::unique(("pc-flick-pan", idx, primary, ctx.viewport_id(), view.page));
     let flick_on = app.session.prefs().tools.enable_flick_panning;
     if let Some(d) = crate::flick_pan::frame(&ctx, flick_id, hand_pan && response.dragged() && !stroke_dismissal, response.drag_delta(), flick_on) {
         let d = xf.unmap_vec(d) / (view.zoom / ppp);

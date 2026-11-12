@@ -88,6 +88,9 @@ pub(crate) use layer_row::thumb_load_badge;
 #[cfg(test)]
 use layer_row::{layer_thumb_fit, paint_clipping_indicator};
 pub(crate) use layers::blend_options;
+/// The Layers panel, for tests outside `panels` (page tabs list only their page).
+#[cfg(test)]
+pub(crate) use layers::layers as layers_panel;
 #[cfg(test)]
 use layers::{layers, opacity_row_layout, simple_lock_toggle};
 #[cfg(test)]

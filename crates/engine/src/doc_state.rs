@@ -32,6 +32,11 @@ pub struct DocState {
     pub channel_view: channel_cmds::ChannelView,
     /// Select › Isolate Layers: the Layers panel lists only these layers (empty = off; view state).
     pub isolated_layers: Vec<LayerId>,
+    /// The artboard the shell shows on its own, as a page tab (view state, not history): a layer
+    /// an edit leaves at the top level goes into this artboard instead
+    /// ([`crate::layer_place::keep_on_page`]), and Paste and Place centre on it rather than on the
+    /// canvas. `None`, or an id that is no artboard: the whole canvas.
+    pub page: Option<LayerId>,
     /// Painting symmetry preset or sampled path (tool state, not document pixels).
     pub symmetry: Option<symmetry_cmds::PaintingSymmetry>,
     /// Layers panel: layers whose effects list is collapsed under their row (the fx triangle;
@@ -98,6 +103,7 @@ impl DocState {
             coalesce: None,
             channel_view: Default::default(),
             isolated_layers: Vec::new(),
+            page: None,
             symmetry: None,
             fx_collapsed: Vec::new(),
             show_only: None,
@@ -136,6 +142,17 @@ impl DocState {
         if keep_clean {
             self.saved_revision = self.revision;
         }
+    }
+    /// The rectangle of the artboard shown as a page ([`Self::page`]), on the canvas; `None` for
+    /// the whole canvas (no page, or the page's artboard is gone or lies off the canvas).
+    pub fn page_rect(&self) -> Option<photocraft_geom::Rect> {
+        let page = self.page?;
+        let board = self.doc.layers.iter().find(|l| l.id == page)?.artboard()?.rect.intersect(&self.doc.bounds());
+        (!board.is_empty()).then_some(board)
+    }
+    /// Where new content is placed and centred: the page's artboard, else the canvas.
+    pub fn placement_area(&self) -> photocraft_geom::Rect {
+        self.page_rect().unwrap_or_else(|| self.doc.bounds())
     }
     /// The targeted layers, as history stores them with each state.
     pub(crate) fn layer_target(&self) -> LayerTarget {

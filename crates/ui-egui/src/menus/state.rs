@@ -46,6 +46,9 @@ pub fn is_enabled(app: &PhotocraftApp, id: &str) -> bool {
     if let Some(e) = crate::crop_ui::is_enabled(app, id) {
         return e;
     }
+    if let Some(e) = crate::page_tabs::enabled(app, id) {
+        return e;
+    }
     match id {
         "window.panel.activate" | "window.panel.layout" | "ui.dock" => true,
         "window.panel.group"
@@ -134,6 +137,9 @@ pub(super) fn checked(app: &PhotocraftApp, id: &str) -> Option<bool> {
         return Some(c);
     }
     if let Some(c) = crate::timeline_ui::checked(app, id) {
+        return Some(c);
+    }
+    if let Some(c) = crate::page_tabs::checked(app, id) {
         return Some(c);
     }
     if let Some(c) = crate::type_panels_ui::checked(app, id) {

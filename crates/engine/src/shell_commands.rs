@@ -72,6 +72,16 @@ pub const SHELL_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     // Photoshop's Ctrl+Tab and Ctrl+Shift+Tab, on macOS too (⌘Tab belongs to the system, #2340).
     ("window.nextDocument", "Next Document", &[], Some("Ctrl+Tab")),
     ("window.previousDocument", "Previous Document", &[], Some("Ctrl+Shift+Tab")),
+    // Window › Pages: a document's artboards as page tabs, one view per page (the shell's
+    // `page_tabs`). Each page also gets a row, `window.page.<artboard id>`.
+    ("window.pages.asTabs", "Artboards as Tabs", &["Window", "Pages"], None),
+    ("window.pages.next", "Next Page", &["Window", "Pages"], None),
+    ("window.pages.previous", "Previous Page", &["Window", "Pages"], None),
+    ("window.pages.moveLeft", "Move Page Left", &["Window", "Pages"], None),
+    ("window.pages.moveRight", "Move Page Right", &["Window", "Pages"], None),
+    ("window.pages.close", "Close Page Tab", &["Window", "Pages"], None),
+    ("window.pages.closeOthers", "Close Other Page Tabs", &["Window", "Pages"], None),
+    ("window.pages.show", "Show Page", &[], None),
     ("window.theme.toggle", "Next Appearance Mode", &["Window"], None),
     ("window.theme.pro", "Pro", &["Window", "Theme", "Dark Theme"], None),
     ("window.theme.proMedium", "Pro Medium Gray", &["Window", "Theme", "Dark Theme"], None),

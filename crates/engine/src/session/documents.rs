@@ -83,6 +83,15 @@ impl Session {
         self.symmetry_map = Some(geometry);
     }
 
+    /// Show document `index` as the page of artboard `page`, or as the whole canvas (`None`): see
+    /// [`DocState::page`]. View state, so neither a history step nor a change to the document.
+    /// False when there is no such document.
+    pub fn set_page(&mut self, index: usize, page: Option<photocraft_doc::LayerId>) -> bool {
+        let Some(st) = self.docs.get_mut(index) else { return false };
+        st.page = page;
+        true
+    }
+
     pub fn sync_tools_mask_target(&mut self) {
         let mask = self.active().is_some_and(|st| st.channel_view.target == crate::channel_cmds::ChannelTarget::LayerMask);
         self.tools.target_mask(mask);

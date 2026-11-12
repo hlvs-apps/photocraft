@@ -131,6 +131,10 @@ pub struct View {
     /// Canvas camera rotation in degrees, wrapped to (−180, 180]. Turns the view, not the pixels.
     #[serde(default)]
     pub rotation: f32,
+    /// The artboard (layer id) this view shows on its own, as a page tab ([`PageTabs`]): it
+    /// fits that board and draws nothing outside it. `None`: the whole canvas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u64>,
     /// Transient presentation state for a discrete zoom command; the target camera above remains
     /// authoritative and this flag is never persisted.
     #[serde(skip)]
@@ -173,6 +177,7 @@ impl Default for View {
             fill_pending: false,
             doc_size: [0, 0],
             rotation: 0.0,
+            page: None,
             zoom_animating: false,
             zoom_anchor: None,
             display_camera: None,
@@ -192,6 +197,32 @@ pub struct DocWindow {
     /// A tab dragged off the tab strip opens its window where it was dropped (#3733).
     #[serde(default)]
     pub position: Option<[f32; 2]>,
+}
+
+/// A document shown as page tabs (Window › Pages): one tab per artboard, in page (artboard)
+/// order, each a view of the one document that shows only its artboard. Tabs are views: closing
+/// one keeps its page, saving saves the document. The active page's camera is the document's
+/// entry in [`UiState::views`] (with [`View::page`] set); the other pages' wait here.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageTabs {
+    /// The document (its `DocId`).
+    pub document: u64,
+    /// The artboard (layer id) of the active page tab.
+    #[serde(default)]
+    pub active: Option<u64>,
+    /// Artboards whose page tab is closed; Window › Pages opens them again.
+    #[serde(default)]
+    pub closed: Vec<u64>,
+    /// The artboards already seen: one that appears (the Artboard tool's +, Layer › New ›
+    /// Artboard, a duplicate) opens and activates its page tab.
+    #[serde(default)]
+    pub seen: Vec<u64>,
+    /// The cameras of the other page tabs, by artboard.
+    #[serde(default)]
+    pub views: Vec<(u64, View)>,
+    /// The layer each page had active, by artboard: back on a page, it is active again.
+    #[serde(default)]
+    pub layers: Vec<(u64, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -379,6 +410,9 @@ pub struct UiState {
     pub views: Vec<View>,
     pub dialogs: Vec<Dialog>,
     pub windows: Vec<DocWindow>,
+    /// Documents shown as page tabs, one entry per document (Window › Pages › Artboards as Tabs).
+    #[serde(default)]
+    pub page_tabs: Vec<PageTabs>,
     pub theme: crate::theme::ThemeKind,
     pub workspace: String,
     pub palette_open: bool,
@@ -550,6 +584,7 @@ impl Default for UiState {
             views: Vec::new(),
             dialogs: Vec::new(),
             windows: Vec::new(),
+            page_tabs: Vec::new(),
             theme: crate::theme::ThemeKind::ProMedium,
             workspace: "Essentials".into(),
             palette_open: false,

@@ -377,6 +377,7 @@ pub(crate) fn clear_area(doc: &mut Document, id: LayerId, area: Rect, sel: Optio
 
 /// Paste as a new layer (or into the targeted mask or channel: [`paste_to_target`]). `in_place` keeps the original position; otherwise the pixels are centred
 /// on `center` (the view centre from the UI) or the canvas, unless they already overlap the canvas.
+/// A page tab ([`crate::DocState::page`]) has its artboard instead of the canvas.
 fn paste(s: &mut Session, p: &Value, in_place: bool) -> Result<Value> {
     crate::allocation::checkpoint("pasting pixels")?;
     let clip = s.clipboard.clone().ok_or(EngineError::Other("the clipboard is empty".into()))?;
@@ -391,9 +392,9 @@ fn paste(s: &mut Session, p: &Value, in_place: bool) -> Result<Value> {
     if let Some(k) = crate::channel_clip::paste_color_target(s, p) {
         return crate::channel_clip::paste(s, p, k, in_place, None, "Paste");
     }
-    let canvas = d.doc.bounds();
     let fmt = d.doc.pixel_format();
-    let (dx, dy) = paste_offset(&clip, d.doc.id, canvas, p, in_place);
+    // A page tab pastes onto its page: centred on the artboard and kept on it.
+    let (dx, dy) = paste_offset(&clip, d.doc.id, d.placement_area(), p, in_place);
     if let Some(layers) = clip.layers.as_deref().filter(|_| crate::layer_copy_cmds::layered(d.doc.mode)) {
         return paste_layers(s, layers, dx, dy);
     }
@@ -506,7 +507,7 @@ pub(crate) fn paste_to_target(s: &mut Session, p: &Value, in_place: bool, limit:
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let canvas = d.doc.bounds();
     let layer = d.active_layer;
-    let (dx, dy) = paste_offset(&clip, d.doc.id, canvas, p, in_place);
+    let (dx, dy) = paste_offset(&clip, d.doc.id, d.placement_area(), p, in_place);
     let src = shifted(&clip.surface, dx, dy);
     let area = src.content_bounds().intersect(&canvas);
     s.edit(label, |doc, _| {

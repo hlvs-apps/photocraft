@@ -23,6 +23,11 @@
 //! parent window on this page's own origin are read, and only the parent is posted to, on that
 //! origin: a page elsewhere can neither drive the app nor receive a document.
 //!
+//! The host's document opens as page tabs (`PhotocraftApp::artboards_as_tabs`): a design whose
+//! pages are artboards gets one tab per page, every one a view of the same document, so `save`,
+//! `document` and `dirty` stay about that one document whichever page tab is active. The last
+//! page tab cannot be closed from the tab strip.
+//!
 //! In embed mode the host also owns leaving: the app's own "Leave site?" guard is off (the host
 //! has `dirty`), and writes to anything but the host's document fail, so no export or download
 //! leaves through the browser. A save records the revision it wrote (the writer is not
