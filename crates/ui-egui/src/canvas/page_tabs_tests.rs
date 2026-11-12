@@ -509,6 +509,109 @@ fn a_page_tab_composites_only_its_page() {
     page_overlap_pixels(false);
 }
 
+/// A design shaped like the one #C was seen on: three pages on an 8600 × 3600 canvas (3600 × 2400,
+/// 3600 × 2400, 1200 × 3600 at x 0, 3700 and 7400), each with a page-sized filled layer and a
+/// smaller square over it.
+fn large_design() -> Vec<u8> {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": 3600, "height": 2400, "artboard": true, "background": "white", "name": "Large"})).unwrap();
+    let first = s.active().unwrap().doc.artboards()[0].0;
+    s.execute("layer.renameLayer", json!({"layer": first.0, "name": "Page 1"})).unwrap();
+    for (rect, name) in [([3700, 0, 3600, 2400], "Page 2"), ([7400, 0, 1200, 3600], "Page 3")] {
+        s.execute("select.deselectLayers", json!({})).unwrap();
+        s.execute("layer.new.artboard", json!({"rect": rect, "name": name, "background": "white"})).unwrap();
+    }
+    let boards: Vec<LayerId> = s.active().unwrap().doc.artboards().iter().map(|b| b.0).collect();
+    for (board, (fill, square)) in boards.iter().zip([("#2040c0", "#e0a020"), ("#c02040", "#20c040"), ("#e0a020", "#2040c0")]) {
+        let r = s.active().unwrap().doc.layer(*board).unwrap().artboard().unwrap().rect;
+        s.execute("layer.select", json!({"layer": board.0})).unwrap();
+        for (color, inset) in [(fill, 0), (square, 400)] {
+            s.execute("layer.new.layer", json!({})).unwrap();
+            s.execute(
+                "select.rect",
+                json!({"x": r.x0 + inset, "y": r.y0 + inset, "width": r.width() as i32 - 2 * inset, "height": r.height() as i32 - 2 * inset}),
+            )
+            .unwrap();
+            s.execute("edit.fill", json!({"color": color})).unwrap();
+            s.execute("select.deselect", json!({})).unwrap();
+        }
+    }
+    let doc = &s.active().unwrap().doc;
+    assert_eq!((doc.size.width, doc.size.height, doc.artboards().len()), (8600, 3600, 3));
+    assert!(doc.layers.iter().all(|l| l.artboard().is_some()), "every layer is on a page");
+    photocraft_format::save_to_bytes(doc, &Default::default()).unwrap()
+}
+
+/// #C: a page tab of a large document draws on the GPU compositor, not on the CPU ("GPU
+/// compositor not used: preview texture"), and what it draws is what the CPU compositor draws of
+/// that page. Skipped without a GPU adapter.
+#[test]
+fn a_page_tab_of_a_large_document_composites_on_the_gpu() {
+    let bytes = large_design();
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 700.0)).with_pixels_per_point(1.0).with_max_steps(64).wgpu().build_eframe(move |cc| {
+            PhotocraftApp::setup_context(&cc.egui_ctx, crate::theme::ThemeKind::Pro);
+            let (mut app, _) = app(true);
+            if let Some(rs) = cc.wgpu_render_state.as_ref() {
+                app.set_wgpu(rs.clone());
+            }
+            app.open_bytes_from("Large.pcraft", &bytes, Some("Large.pcraft")).unwrap();
+            app
+        })
+    }));
+    let Ok(mut h) = built else {
+        eprintln!("skipping: no GPU adapter");
+        return;
+    };
+    if h.state().gpu.is_none() {
+        eprintln!("skipping: no GPU canvas");
+        return;
+    }
+    let page2 = layer(h.state(), "Page 2").0;
+    activate(h.state_mut(), Tab { doc: 0, page: Some(page2) });
+    h.run_steps(8);
+    let st = h.state();
+    let doc = st.session.documents()[0].doc.clone();
+    let key = render_key(doc.id, page2);
+    // The page view's own texture, drawn by the wgpu compositor in full, and no CPU reason.
+    assert_eq!(st.perf.last_refresh, "gpu-full", "the page tab's refresh");
+    // A software adapter (CI, this box) still runs the wgpu compositor; the window then names it
+    // as its reason, but the document has none of its own.
+    let reason = st.render_path.current(doc.id.0);
+    assert!(matches!(reason, None | Some(crate::render_path::CpuReason::SoftwareAdapter)), "the page tab is drawn on the GPU: {reason:?}");
+    let own: Vec<_> = st.render_path.history().filter(|c| c.doc == doc.id.0 && c.reason.is_some()).collect();
+    assert!(own.is_empty(), "never on the CPU: {own:?}");
+    let gpu = st.gpu.clone().unwrap();
+    let t = std::time::Instant::now();
+    let (_, size, shown) = gpu.read_texels(key).expect("the page view's texture");
+    let gpu_ms = st.perf.composite_ms;
+    // The CPU compositor's picture of the same page document, in a texture of its own.
+    let page = page_document(&doc, page2).unwrap();
+    let (display, _) = crate::canvas::canvas_display(h.state_mut(), &page, None);
+    let reference = doc.id.0 ^ (1u64 << 60);
+    let t_cpu = std::time::Instant::now();
+    gpu.upload_composite(reference, &page, display.as_deref());
+    let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1000.0;
+    let (_, _, want) = gpu.read_texels(reference).unwrap();
+    eprintln!(
+        "8600x3600, page 2 (3600x2400): GPU compositor encode+submit {gpu_ms:.1} ms (readback {:.0} ms); CPU compositor {cpu_ms:.0} ms",
+        t.elapsed().as_secs_f64() * 1000.0 - cpu_ms
+    );
+    assert_eq!(size, [8600, 3600]);
+    let mut off = 0usize;
+    for (i, (a, b)) in shown.iter().zip(&want).enumerate() {
+        if (0..4).any(|c| (a[c] - b[c]).abs() > 2.0 / 255.0) {
+            off += 1;
+            assert!(off < 64, "GPU and CPU differ at ({}, {}): {a:?} vs {b:?}", i % size[0] as usize, i / size[0] as usize);
+        }
+    }
+    assert_eq!(off, 0, "the GPU page equals the CPU page");
+    // Only page 2: its colours inside it, nothing of page 1 or 3 anywhere.
+    let at = |x: usize, y: usize| shown[y * size[0] as usize + x];
+    assert!(at(3800, 100)[0] > 0.6 && at(3800, 100)[3] > 0.99, "page 2's fill: {:?}", at(3800, 100));
+    assert!(at(100, 100)[3] < 0.01 && at(8000, 3000)[3] < 0.01, "pages 1 and 3 are not drawn: {:?} {:?}", at(100, 100), at(8000, 3000));
+}
+
 fn page_overlap_pixels(gpu: bool) {
     let bytes = overlapping_design();
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {

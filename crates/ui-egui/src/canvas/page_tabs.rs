@@ -310,7 +310,17 @@ pub(crate) type PageDoc = (std::sync::Weak<photocraft_doc::Document>, u64, std::
 /// composites a document of its own (`page_document`), so its textures never mix with the whole
 /// canvas's or another page's. The top bit keeps it clear of document ids and their preview keys.
 pub fn render_key(doc: photocraft_doc::DocId, page: u64) -> u64 {
-    (doc.0 ^ page.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23)) | (1 << 63)
+    (doc.0 ^ page.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23)) | PAGE_KEY_BIT
+}
+
+/// The bit every [`render_key`] sets: no document id reaches it, and no other preview texture's
+/// key (a filter preview's sets bit 61) carries it.
+const PAGE_KEY_BIT: u64 = 1 << 63;
+
+/// Whether `key` is a page view's ([`render_key`]): a canvas of its own, composited like the
+/// document's (`GpuCanvas::refresh_with`).
+pub(crate) fn is_render_key(key: u64) -> bool {
+    key & PAGE_KEY_BIT != 0
 }
 
 /// What a page view composites of `doc`: page `page`'s artboard and everything in it, nothing

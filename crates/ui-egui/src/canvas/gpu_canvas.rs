@@ -582,6 +582,18 @@ impl GpuCanvas {
         region: photocraft_geom::Rect,
         encode_srgb: bool,
     ) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
+        self.composite_into(doc.id.0, doc, region, encode_srgb)
+    }
+
+    /// [`GpuCanvas::composite`] into display texture `key`: the document's own, or a page view's
+    /// (`page_tabs::render_key`, whose `doc` is the page's document).
+    pub fn composite_into(
+        &self,
+        key: u64,
+        doc: &photocraft_doc::Document,
+        region: photocraft_geom::Rect,
+        encode_srgb: bool,
+    ) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
         let (device, queue) = (&self.rs.device, &self.rs.queue);
         let size = [doc.size.width, doc.size.height];
         if size[0] == 0 || size[1] == 0 {
@@ -620,7 +632,6 @@ impl GpuCanvas {
             comp.set_composite_cache_budget(b);
         }
         comp.set_focus(res.compositor_focus);
-        let key = doc.id.0;
         let format = self.format_for(doc.depth, size);
         let fresh = res.docs.get(&key).is_none_or(|d| d.size != size || d.format != format);
         let region = if fresh { doc.bounds() } else { region.intersect(&doc.bounds()) };
@@ -774,7 +785,13 @@ impl GpuCanvas {
         }
         let region = damage.unwrap_or(bounds);
         let encode_srgb = display.is_some_and(|d| d.encode_srgb);
-        let gpu = if key == doc.id.0 { self.composite(doc, region, encode_srgb) } else { Err(photocraft_gpu::Unsupported("preview texture".into())) };
+        // The document's canvas and a page view's (the page's own document, `page_tabs`) are
+        // composited on the GPU; other preview textures (a filter's) are drawn by the CPU.
+        let gpu = if key == doc.id.0 || crate::page_tabs::is_render_key(key) {
+            self.composite_into(key, doc, region, encode_srgb)
+        } else {
+            Err(photocraft_gpu::Unsupported("preview texture".into()))
+        };
         match gpu {
             Ok(stats) => {
                 out.kind = if damage.is_some() { "gpu-rect" } else { "gpu-full" };
