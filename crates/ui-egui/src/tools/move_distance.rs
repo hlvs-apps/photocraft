@@ -117,7 +117,7 @@ fn boxes(app: &mut PhotocraftApp, at: [f64; 2]) -> Option<([f64; 4], [f64; 4])> 
     let d = &st.doc;
     let a = union(selected.iter().filter(|id| !d.is_background(**id)).filter_map(|id| tree_rect(d, *id)));
     let canvas = [0.0, 0.0, d.size.width as f64, d.size.height as f64];
-    let hovered = photocraft_engine::pick_cmds::auto_select_target(d, at[0], at[1], group).filter(|id| {
+    let hovered = photocraft_engine::pick_cmds::auto_select_target_on(st, at[0], at[1], group).filter(|id| {
         // The selection itself (or a layer in a selected group) isn't another layer.
         !d.is_background(*id) && !selected.iter().any(|s| *s == *id || d.path_of(*id).zip(d.path_of(*s)).is_some_and(|(p, q)| p.starts_with(&q)))
     });

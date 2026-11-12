@@ -185,3 +185,24 @@ fn the_page_is_view_state_and_never_changes_what_is_saved() {
     assert_eq!(s.active().unwrap().is_dirty(), dirty);
     assert_eq!(s.active().unwrap().revision, revision, "not a history step");
 }
+
+#[test]
+fn auto_select_on_a_page_hits_only_the_pages_layers() {
+    let (mut s, boards, layers) = pages();
+    for (i, l) in layers.iter().enumerate() {
+        select(&mut s, *l);
+        s.execute("select.rect", json!({"x": 200 * i + 10, "y": 10, "width": 20, "height": 20})).unwrap();
+        s.execute("edit.fill", json!({"color": "#808080"})).unwrap();
+    }
+    s.execute("select.deselect", json!({})).unwrap();
+    let pick = |s: &mut Session, x: f64| s.execute("layer.pickAt", json!({"x": x, "y": 15.0, "select": false})).unwrap()["layer"].clone();
+    // Page 2 shown: its layer is hit; page 1's, beside it where the tab draws nothing, is not.
+    assert_eq!(pick(&mut s, 215.0), json!(layers[1].0));
+    assert_eq!(pick(&mut s, 15.0), Value::Null);
+    let list = s.execute("layer.pickAt", json!({"x": 15.0, "y": 15.0, "list": true})).unwrap();
+    assert_eq!(list["layers"], json!([]));
+    // The whole canvas hits every page.
+    s.set_page(0, None);
+    assert_eq!(pick(&mut s, 15.0), json!(layers[0].0));
+    assert_eq!(boards.len(), 3);
+}
