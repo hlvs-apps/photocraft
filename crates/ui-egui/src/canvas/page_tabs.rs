@@ -118,11 +118,27 @@ pub fn active(app: &PhotocraftApp) -> Option<Tab> {
 pub fn view_of(app: &PhotocraftApp, tab: Tab) -> View {
     let current = app.ui.views.get(tab.doc).cloned().unwrap_or_default();
     match tab.page {
-        Some(p) if current.page != Some(p) => entry(app, tab.doc)
-            .and_then(|e| e.views.iter().find(|(b, _)| *b == p).map(|(_, v)| v.clone()))
-            .unwrap_or_else(|| View { fit_pending: true, page: Some(p), ..View::default() }),
+        Some(p) if current.page != Some(p) => {
+            entry(app, tab.doc).and_then(|e| e.views.iter().find(|(b, _)| *b == p).map(|(_, v)| v.clone())).unwrap_or_else(|| fresh_view(app, tab.doc, p))
+        }
         _ => current,
     }
+}
+
+/// A page's camera before it was ever shown: fitted to its artboard in the canvas area as last
+/// drawn, so its tab names the zoom it will open at, and fitted again when it is first drawn.
+fn fresh_view(app: &PhotocraftApp, doc: usize, page: u64) -> View {
+    let mut view = View { fit_pending: true, page: Some(page), ..View::default() };
+    let area = app.last_canvas_rect.size();
+    if let Some(st) = app.session.documents().get(doc)
+        && let Some(board) = page_rect(&view, &st.doc)
+        && area.x > 50.0
+    {
+        let size = [st.doc.size.width, st.doc.size.height];
+        super::view_xform::fit_view_to_board(&mut view, board, size, area, app.canvas_ppp(), app.ui.view.display_aspect());
+        view.fit_pending = true;
+    }
+    view
 }
 
 /// Keep `view` as tab `tab`'s camera (see [`view_of`]).
@@ -360,13 +376,22 @@ fn sync_doc(app: &mut PhotocraftApp, doc: usize) {
     let Some(view) = ui.views.get_mut(doc) else { return };
     let switched = view.page != Some(active);
     let left = view.page;
+    let mut first_shown = false;
     if switched {
-        let mut shown = e.views.iter().position(|(b, _)| *b == active).map_or_else(|| View { fit_pending: true, ..View::default() }, |i| e.views.remove(i).1);
+        let stored = e.views.iter().position(|(b, _)| *b == active).map(|i| e.views.remove(i).1);
+        first_shown = stored.is_none();
+        let mut shown = stored.unwrap_or_default();
         shown.page = Some(active);
         let before = std::mem::replace(view, shown);
         if let Some(old) = left.filter(|o| all.contains(o)) {
             e.views.retain(|(b, _)| *b != old);
             e.views.push((old, before));
+        }
+    }
+    if first_shown {
+        let fresh = fresh_view(app, doc, active);
+        if let Some(v) = app.ui.views.get_mut(doc) {
+            *v = fresh;
         }
     }
     let page = LayerId(active);
