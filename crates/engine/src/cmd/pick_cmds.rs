@@ -88,18 +88,32 @@ pub fn auto_select_target(doc: &Document, x: i32, y: i32, group: bool) -> Option
     Some(if group { top_group(doc, hit) } else { hit })
 }
 
+/// [`auto_select_target`] in a document's editing state: on a page tab
+/// ([`crate::DocState::page`]) only the page's layers are hit, so a click beside the page, where
+/// the tab draws nothing, picks none of another page's layers.
+pub fn auto_select_target_on(st: &crate::DocState, x: i32, y: i32, group: bool) -> Option<LayerId> {
+    let page = st.page_rect().and(st.page);
+    let doc = &st.doc;
+    let hit =
+        layers_hit(doc, x, y, true).into_iter().filter(|id| page.is_none_or(|p| doc.artboard_of(*id) == Some(p))).find(|id| !doc.effective_locks(*id).all)?;
+    Some(if group { top_group(doc, hit) } else { hit })
+}
+
 fn pick(s: &mut Session, p: &Value) -> Result<Value> {
     let x = p.get("x").and_then(Value::as_f64).ok_or_else(|| EngineError::BadParams { cmd: "layer.pickAt".into(), msg: "missing `x`".into() })?.floor() as i32;
     let y = p.get("y").and_then(Value::as_f64).ok_or_else(|| EngineError::BadParams { cmd: "layer.pickAt".into(), msg: "missing `y`".into() })?.floor() as i32;
-    let doc = s.active().ok_or(EngineError::NoDocument)?.doc.clone();
+    let st = s.active().ok_or(EngineError::NoDocument)?;
+    let doc = st.doc.clone();
+    // A page tab hits its page's layers only (`auto_select_target_on`).
+    let page = st.page_rect().and(st.page);
     // The right-click list includes type layers between glyphs, like Auto-Select.
     if p.get("list").and_then(Value::as_bool).unwrap_or(false) {
-        let hits = layers_hit(&doc, x, y, true);
-        let names: Vec<Value> = hits.iter().filter_map(|id| doc.layer(*id)).map(|l| json!({"layer": l.id.0, "name": l.name})).collect();
+        let hits = layers_hit(&doc, x, y, true).into_iter().filter(|id| page.is_none_or(|p| doc.artboard_of(*id) == Some(p)));
+        let names: Vec<Value> = hits.filter_map(|id| doc.layer(id)).map(|l| json!({"layer": l.id.0, "name": l.name})).collect();
         return Ok(json!({ "layers": names }));
     }
     let group = p.get("target").and_then(Value::as_str) == Some("group");
-    let Some(target) = auto_select_target(&doc, x, y, group) else { return Ok(json!({ "layer": null })) };
+    let Some(target) = auto_select_target_on(st, x, y, group) else { return Ok(json!({ "layer": null })) };
     if p.get("select").and_then(Value::as_bool).unwrap_or(true) {
         let mode = p.get("mode").and_then(Value::as_str).unwrap_or("replace");
         // Like Photoshop, a plain click on one of several selected layers keeps them all

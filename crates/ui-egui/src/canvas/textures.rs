@@ -124,6 +124,8 @@ pub(crate) fn ensure_texture_in_view(
         let st = app.session.documents().get(idx)?;
         (st.revision, st.last_damage.map(|r| if r.is_empty() { r } else { r.inflate(effect_reach(&st.doc.layers)) }), st.doc.id)
     };
+    // A page view's textures are its own (`page_tabs::render_key`).
+    let id = crate::page_tabs::render_id(app, idx, id);
     let (mut doc, mut preview_key) = display_doc(app, idx);
     // A filter dialog's live preview: the GPU canvas draws it from its own texture, but this CPU
     // canvas (no usable GPU, a flipped or pixel-aspect-corrected view, a GPU fallback) showed the
@@ -137,6 +139,11 @@ pub(crate) fn ensure_texture_in_view(
     if let Some((preview, key)) = filter_channel_preview(app, idx, ctx) {
         let k = app.filter_preview.as_ref().map_or(1, |p| p.key.k.max(1));
         bounds = preview_bounds(committed.size(), preview.size, k);
+        // A page view shows the filter's result on its page alone, as it shows the document.
+        let preview = match crate::page_tabs::rendered_page(app, idx) {
+            Some(page) => crate::page_tabs::page_of_shown(app, preview, key, page),
+            None => preview,
+        };
         (doc, preview_key, reduced) = (preview, key, k > 1);
     }
     // Detail textures and partial redraws work in the document's own pixels.
@@ -149,6 +156,9 @@ pub(crate) fn ensure_texture_in_view(
         && crate::proxy::preview_factor(&st.doc, crate::proxy::reduced_previews(app)) > 1
     {
         (doc, preview_key) = (st.doc.clone(), 0);
+        if let Some(page) = crate::page_tabs::rendered_page(app, idx) {
+            doc = crate::page_tabs::page_of_shown(app, doc, 0, page);
+        }
     }
     let (display, display_key) = canvas_display(app, &doc, output);
     let seen = app.canvases.get(&cache_key(id, output)).map(|c| (c.tex_revision, c.tex_preview_key));
@@ -458,6 +468,11 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
     else {
         return false;
     };
+    // `id` names the document to the previews' bookkeeping; `key` its texture: a page view's
+    // own (`page_tabs::render_key`), which redraws in the frame rather than in the background
+    // (background redraws keep the document's texture).
+    let page = crate::page_tabs::rendered_page(app, idx).is_some();
+    let key = crate::page_tabs::render_id(app, idx, id);
     let (doc, raw_key) = display_doc(app, idx);
     let (display, _) = canvas_display(app, &doc, None);
     // Repeated pattern tiles sample the same texture, including pixels outside the unwrapped
@@ -465,7 +480,7 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
     let blend_visible = if app.ui.view.pattern_preview { doc.bounds() } else { visible };
     // The texture is shared by every display: only what it stores counts, not the monitor.
     let display_key = texture_key(display.as_deref());
-    let seen = app.canvases.get(&(id, GPU_OUTPUT)).map(|c| (c.revision, c.preview_key));
+    let seen = app.canvases.get(&(key, GPU_OUTPUT)).map(|c| (c.revision, c.preview_key));
     let mut damage = seen.and_then(|seen| damage_since(app, idx, seen, (revision, raw_key), display_key, last_damage));
     if let Some(region) = damage {
         damage = Some(crate::blend_preview::clip_damage(app, id, revision, raw_key, region, blend_visible));
@@ -493,8 +508,10 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
     }
     let size = [doc.size.width, doc.size.height];
     // A full CPU redraw running in the background: show the blocks it has finished.
-    crate::background_redraw::poll(app, &gpu, id);
-    let cache = app.canvases.entry((id, GPU_OUTPUT)).or_insert(CanvasCache {
+    if !page {
+        crate::background_redraw::poll(app, &gpu, id);
+    }
+    let cache = app.canvases.entry((key, GPU_OUTPUT)).or_insert(CanvasCache {
         revision: 0,
         texture: None,
         scale: 1.0,
@@ -506,7 +523,7 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
         grid: None,
         detail: Vec::new(),
     });
-    let present = cache.on_gpu && gpu.has(id.0, size);
+    let present = cache.on_gpu && gpu.has(key.0, size);
     let current = cache.revision == revision && cache.preview_key == preview_key;
     // GPU Memory or Memory Usage changed with nothing to redraw: the new budget, and whether the
     // layers fit it, show at once (the status bar's GPU Memory Full).
@@ -524,11 +541,11 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
     if present && current {
         // An adjustment preview composited where the view was: catch up where it moved to.
         if let Some(r) = crate::adjust_preview::uncovered(app, id, raw_key, visible) {
-            let r = gpu.refresh(id.0, &doc, Some(r), display.as_deref());
+            let r = gpu.refresh(key.0, &doc, Some(r), display.as_deref());
             app.perf.record_refresh(&r);
         }
         if let Some(r) = crate::adjust_preview::live_uncovered(app, id, raw_key, visible) {
-            let r = gpu.refresh(id.0, &doc, Some(r), display.as_deref());
+            let r = gpu.refresh(key.0, &doc, Some(r), display.as_deref());
             app.perf.record_refresh(&r);
         }
         // Blend previews keep offscreen pixels untouched until the view reaches them.
@@ -541,7 +558,9 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
     // Display textures for a canvas this large would not fit the GPU: the reduced CPU canvas
     // draws it (checked before the memory budget, which walks the history, every frame).
     if !gpu.fits_canvas(&doc) {
-        crate::background_redraw::cancel(app, id);
+        if !page {
+            crate::background_redraw::cancel(app, id);
+        }
         // Drawn on the CPU canvas: no layer budget applies to it.
         if app.perf.gpu_layer_fit.is_some_and(|f| f.doc == id.0) {
             app.perf.gpu_layer_fit = None;
@@ -552,13 +571,15 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
     }
     let partial = present && damage.is_some();
     gpu_budget(app, &gpu, idx, partial, visible);
-    let defer = crate::background_redraw::enabled(app);
-    let r = gpu.refresh_with(id.0, &doc, if partial { damage } else { None }, display.as_deref(), defer);
+    let defer = crate::background_redraw::enabled(app) && !page;
+    let r = gpu.refresh_with(key.0, &doc, if partial { damage } else { None }, display.as_deref(), defer);
     app.perf.gpu_layer_fit = gpu.layer_fit();
     if r.kind == "lost" || r.kind == crate::gpu_canvas::REFRESH_OVER_BUDGET {
         // The device is gone (`gpu_status` then drops the GPU canvas) or the canvas is over the
         // texture budget: draw this frame on the CPU path.
-        crate::background_redraw::cancel(app, id);
+        if !page {
+            crate::background_redraw::cancel(app, id);
+        }
         if let Some(reason) = r.fallback {
             crate::render_path::note(app, id.0, crate::render_path::Path::Cpu(reason));
         }
@@ -568,6 +589,8 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
         // Composited off the UI thread, the visible part first (#4024).
         let region = if partial { damage.unwrap_or(doc.bounds()) } else { doc.bounds() };
         crate::background_redraw::start(app, ctx, &gpu, doc.clone(), display.clone(), visible, region, r.fallback.clone());
+    } else if page {
+        // Not deferred (see `defer`): the page's texture is current.
     } else if partial {
         // The edit drew its damage; blocks of a running redraw still to come follow the edit.
         crate::background_redraw::restart(app, ctx, &gpu, doc.clone(), display.clone(), visible);
@@ -588,7 +611,7 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
     if r.kind.starts_with("gpu") {
         app.perf.gpu_uploads = r.uploads;
     }
-    let Some(cache) = app.canvases.get_mut(&(id, GPU_OUTPUT)) else { return true };
+    let Some(cache) = app.canvases.get_mut(&(key, GPU_OUTPUT)) else { return true };
     cache.revision = revision;
     cache.preview_key = preview_key;
     cache.on_gpu = true;
@@ -668,6 +691,8 @@ pub(crate) fn retain_gpu_documents(app: &mut PhotocraftApp) {
         // retaining only document ids freed the previews every frame (blank canvas while previewing).
         let mut live: Vec<u64> = app.session.documents().iter().flat_map(|st| [st.doc.id.0, st.doc.id.0 ^ (1u64 << 61), st.doc.id.0 ^ (1u64 << 62)]).collect();
         live.extend(crate::adjust_preview::gpu_keys(app));
+        // Page views composite documents of their own (`page_tabs::render_key`).
+        live.extend(crate::page_tabs::live_render_keys(app));
         gpu.retain(&live);
     }
     crate::background_redraw::retain(app);

@@ -37,6 +37,12 @@ pub(crate) fn window(app: &PhotocraftApp, dialog: u64, ui: &mut egui::Ui, f: &mu
     let Some(idx) = app.session.active_index() else { return };
     let Some(st) = app.session.documents().get(idx) else { return };
     let (doc_id, revision) = (st.doc.id, st.revision);
+    // Opened from a page tab (`page_tabs`), the window previews that page alone, as the tab does.
+    let page = app.ui.views.get(idx).and_then(|v| v.page.zip(crate::page_tabs::page_rect(v, &st.doc)));
+    let on_page = |d: Document| match page.and_then(|(p, _)| crate::page_tabs::page_document(&d, p)) {
+        Some(shown) => shown,
+        None => d,
+    };
 
     // The filtered proxy the canvas already computed for this dialog, when there is one. Matching
     // the dialog keeps a stacked dialog from showing another's preview; the Preview checkbox still
@@ -65,7 +71,7 @@ pub(crate) fn window(app: &PhotocraftApp, dialog: u64, ui: &mut egui::Ui, f: &mu
     let mut cache: Cache = ui.ctx().data_mut(|d| std::mem::take(d.get_temp_mut_or_default::<Cache>(cache_id)));
     // Channel visibility and the active mask can change without a document revision. Both the
     // original (press-and-hold) and filtered textures must follow the canvas's current view.
-    let view = (st.channel_view.clone(), app.session.prefs().interface.show_channels_in_color, st.active_layer);
+    let view = (st.channel_view.clone(), app.session.prefs().interface.show_channels_in_color, st.active_layer, page.map(|(p, _)| p));
     if cache.view.as_ref() != Some(&view) {
         cache = Cache { view: Some(view), ..Default::default() };
     }
@@ -73,7 +79,7 @@ pub(crate) fn window(app: &PhotocraftApp, dialog: u64, ui: &mut egui::Ui, f: &mu
     // Unfiltered proxy: built once per document revision and factor (cheap at the proxy factor).
     let orig_key = TexKey::Original(doc_id, revision, base_k);
     if cache.original.as_ref().map(|c| &c.key) != Some(&orig_key) {
-        let proxy = crate::proxy::proxy_document(&st.doc, base_k);
+        let proxy = on_page(crate::proxy::proxy_document(&st.doc, base_k));
         let tex = upload(ui.ctx(), app, "filter-preview-original", &proxy);
         cache.original = Some(CachedTex { key: orig_key, tex, size: [proxy.size.width, proxy.size.height] });
     }
@@ -82,7 +88,8 @@ pub(crate) fn window(app: &PhotocraftApp, dialog: u64, ui: &mut egui::Ui, f: &mu
         Some((key, filtered_doc)) => {
             let fkey = TexKey::Filtered(key.clone());
             if cache.filtered.as_ref().map(|c| &c.key) != Some(&fkey) {
-                let tex = upload(ui.ctx(), app, "filter-preview-filtered", filtered_doc);
+                let shown = on_page((**filtered_doc).clone());
+                let tex = upload(ui.ctx(), app, "filter-preview-filtered", &shown);
                 cache.filtered = Some(CachedTex { key: fkey, tex, size: [filtered_doc.size.width, filtered_doc.size.height] });
             }
         }
@@ -103,9 +110,15 @@ pub(crate) fn window(app: &PhotocraftApp, dialog: u64, ui: &mut egui::Ui, f: &mu
     // View state, sanitised: a corrupt field must not divide by zero or draw off the texture.
     let mut zoom = f.get(ZOOM_FIELD).and_then(Value::as_f64).map(|v| v as f32).filter(|z| z.is_finite() && *z > 0.0).unwrap_or(DEFAULT_ZOOM);
     zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-    let mut cx = f.get(CENTER_X_FIELD).and_then(Value::as_f64).map(|v| v as f32).filter(|v| v.is_finite()).unwrap_or(doc.x / 2.0);
-    let mut cy = f.get(CENTER_Y_FIELD).and_then(Value::as_f64).map(|v| v as f32).filter(|v| v.is_finite()).unwrap_or(doc.y / 2.0);
-    (cx, cy) = clamp_center(cx, cy, doc.x, doc.y);
+    // A page's window starts on the page's middle and stays on the page.
+    let (mid_x, mid_y) = page.map_or((doc.x / 2.0, doc.y / 2.0), |(_, b)| ((b.x0 + b.x1) as f32 / 2.0, (b.y0 + b.y1) as f32 / 2.0));
+    let on_page_center = |cx: f32, cy: f32| {
+        let (cx, cy) = clamp_center(cx, cy, doc.x, doc.y);
+        page.map_or((cx, cy), |(_, b)| (cx.clamp(b.x0 as f32, b.x1 as f32), cy.clamp(b.y0 as f32, b.y1 as f32)))
+    };
+    let mut cx = f.get(CENTER_X_FIELD).and_then(Value::as_f64).map(|v| v as f32).filter(|v| v.is_finite()).unwrap_or(mid_x);
+    let mut cy = f.get(CENTER_Y_FIELD).and_then(Value::as_f64).map(|v| v as f32).filter(|v| v.is_finite()).unwrap_or(mid_y);
+    (cx, cy) = on_page_center(cx, cy);
 
     let width = ui.available_width().max(140.0);
     let (rect, response) = ui.allocate_exact_size(vec2(width, PREVIEW_H), Sense::click_and_drag());
@@ -134,7 +147,7 @@ pub(crate) fn window(app: &PhotocraftApp, dialog: u64, ui: &mut egui::Ui, f: &mu
     {
         (cx, cy) = point_to_source(p - rect.min, x0, y0, zoom, doc);
     }
-    (cx, cy) = clamp_center(cx, cy, doc.x, doc.y);
+    (cx, cy) = on_page_center(cx, cy);
 
     ui.horizontal(|ui| {
         if crate::icons::button(ui, "minus", 22.0, false, tl!("Zoom out")).clicked() {
@@ -271,7 +284,9 @@ struct CachedTex {
 struct Cache {
     filtered: Option<CachedTex>,
     original: Option<CachedTex>,
-    view: Option<(photocraft_engine::channel_cmds::ChannelView, bool, Option<photocraft_doc::LayerId>)>,
+    /// What the textures show: channel view, Show Channels in Color, active layer, and the page
+    /// they are of (a page tab's).
+    view: Option<(photocraft_engine::channel_cmds::ChannelView, bool, Option<photocraft_doc::LayerId>, Option<u64>)>,
 }
 
 #[cfg(test)]

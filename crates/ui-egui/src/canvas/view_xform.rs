@@ -171,6 +171,34 @@ pub fn fit_view(view: &mut View, doc: &Document, area: Vec2, ppp: f32, aspect: f
     view.fill_pending = false;
 }
 
+/// [`fit_view`] for a page tab ([`View::page`]): its artboard `board` (of a `doc_size`
+/// document) fits `area`, with room around it for the Artboard tool's + buttons, never past
+/// 100%.
+pub fn fit_view_to_board(view: &mut View, board: DRect, doc_size: [u32; 2], area: Vec2, ppp: f32, aspect: f32) {
+    let (w, h) = (board.width().max(1) as f32, board.height().max(1) as f32);
+    let shown_w = w * if aspect.is_finite() && aspect > 0.0 { aspect } else { 1.0 };
+    let fit = ((area.x - 80.0) / shown_w).min((area.y - 80.0) / h) * ppp;
+    view.zoom = crate::zoom_levels::clamp(fit.min(1.0), doc_size);
+    view.center = board_center(board);
+    view.fit_pending = false;
+    view.fill_pending = false;
+}
+
+/// [`fill_view`] for a page tab: its artboard fills `area`, one edge possibly past it.
+pub fn fill_view_to_board(view: &mut View, board: DRect, doc_size: [u32; 2], area: Vec2, ppp: f32, aspect: f32) {
+    let (w, h) = (board.width().max(1) as f32, board.height().max(1) as f32);
+    let shown_w = w * if aspect.is_finite() && aspect > 0.0 { aspect } else { 1.0 };
+    view.zoom = crate::zoom_levels::clamp((area.x / shown_w).max(area.y / h) * ppp, doc_size);
+    view.center = board_center(board);
+    view.fit_pending = false;
+    view.fill_pending = false;
+}
+
+/// The middle of `board`, each edge widened before adding (a board far out overflows an i32 sum).
+fn board_center(board: DRect) -> [f32; 2] {
+    [((f64::from(board.x0) + f64::from(board.x1)) / 2.0) as f32, ((f64::from(board.y0) + f64::from(board.y1)) / 2.0) as f32]
+}
+
 /// Ease a transient presentation camera over 220 ms without changing the requested camera.
 pub(super) fn animated_view(view: &mut View, xf: ViewXform, ppp: f32, animated_zoom: bool, time: f64) -> View {
     if !animated_zoom {

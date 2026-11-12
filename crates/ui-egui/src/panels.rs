@@ -88,6 +88,9 @@ pub(crate) use layer_row::thumb_load_badge;
 #[cfg(test)]
 use layer_row::{layer_thumb_fit, paint_clipping_indicator};
 pub(crate) use layers::blend_options;
+/// The Layers panel, for tests outside `panels` (page tabs list only their page).
+#[cfg(test)]
+pub(crate) use layers::layers as layers_panel;
 #[cfg(test)]
 use layers::{layers, opacity_row_layout, simple_lock_toggle};
 #[cfg(test)]
@@ -330,6 +333,58 @@ mod navigator_wheel_tests {
         let mut out = ctx
             .run_ui(RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(430.0, 460.0))), events, ..Default::default() }, |ui| navigator(app, ui));
         out.textures_delta.clear();
+    }
+
+    /// A page tab's Navigator (`page_tabs`) shows its page: the preview has the page's shape, the
+    /// view box sits on the page, and a click anywhere over the panel moves the view to the
+    /// page's point under it, never off the page.
+    #[test]
+    fn a_page_views_navigator_frames_and_moves_within_its_page() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 100, "height": 50, "artboard": true})).unwrap();
+        let second = app.run("layer.new.artboard", json!({"rect": [200, 0, 100, 50]})).unwrap()["layer"].as_u64().unwrap();
+        crate::page_tabs::set_paged(&mut app, 0, true).unwrap();
+        crate::page_tabs::activate(&mut app, crate::page_tabs::Tab { doc: 0, page: Some(second) });
+        app.sync_views();
+        assert_eq!(app.ui.views[0].page, Some(second));
+        let v = &mut app.ui.views[0];
+        (v.zoom, v.center, v.fit_pending) = (1.0, [250.0, 25.0], false);
+        app.last_canvas_rect = Rect::from_min_size(Pos2::ZERO, vec2(60.0, 30.0));
+        let ctx = egui::Context::default();
+        PhotocraftApp::setup_context(&ctx, crate::theme::ThemeKind::ALL[0]);
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(430.0, 460.0));
+        let mut run = |app: &mut PhotocraftApp, events: Vec<Event>| {
+            let mut out = ctx.run_ui(RawInput { screen_rect: Some(screen), events, ..Default::default() }, |ui| navigator(app, ui));
+            out.textures_delta.clear();
+            out
+        };
+        let out = run(&mut app, vec![]);
+        let rect = last_navigator_preview(&ctx).unwrap();
+        assert!((rect.width() / rect.height() - 2.0).abs() < 0.05, "the page's 2:1, not the 6:1 canvas: {rect:?}");
+        let s = rect.width() / 100.0;
+        let painted = out
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Rect(r) if r.stroke.color == Color32::from_rgb(255, 84, 84) => Some(r.rect),
+                _ => None,
+            })
+            .expect("the view box");
+        // Centre (250, 25) is the page's middle; 60 × 30 points at 100% is 60 × 30 of its pixels.
+        assert!((painted.center() - rect.center()).length() < 1.0, "{painted:?} in {rect:?}");
+        assert!((painted.width() - 60.0 * s).abs() < 1.0);
+        let click = |app: &mut PhotocraftApp, run: &mut dyn FnMut(&mut PhotocraftApp, Vec<Event>) -> egui::FullOutput, at: Pos2| {
+            let press = |pressed| Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+            run(app, vec![Event::PointerMoved(at), press(true)]);
+            run(app, vec![press(false)]);
+        };
+        // The page's left edge in the preview is x = 200 of the document.
+        click(&mut app, &mut run, pos2(rect.left() + 10.0 * s, rect.center().y));
+        assert!((app.ui.views[0].center[0] - 210.0).abs() < 1.0, "{:?}", app.ui.views[0].center);
+        // Left of the preview: the page's edge, not the canvas's.
+        click(&mut app, &mut run, pos2(rect.left() - 5.0, rect.top() + 2.0 * s));
+        assert_eq!(app.ui.views[0].center[0], 200.0);
+        assert!(app.ui.views[0].center[1] >= 0.0 && app.ui.views[0].center[1] <= 50.0);
     }
 
     #[test]

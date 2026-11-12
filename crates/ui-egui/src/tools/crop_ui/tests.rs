@@ -444,6 +444,7 @@ fn space_on_the_canvas_moves_the_frame_not_the_view() {
         fill_pending: false,
         doc_size: [200, 100],
         rotation: 0.0,
+        page: None,
         zoom_animating: false,
         zoom_anchor: None,
         display_camera: None,

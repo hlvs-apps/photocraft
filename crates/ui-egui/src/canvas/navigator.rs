@@ -25,17 +25,30 @@ pub(super) fn navigator_waits_for_drag(app: &PhotocraftApp, idx: usize) -> bool 
 /// The Navigator's preview from the GPU canvas (#4518): the main canvas's texture of the
 /// document, drawn at `rect` with its own mip chain, so an edit costs no CPU composite. `None`
 /// while the canvas isn't showing the plain document on the GPU (the CPU thumbnail then).
-pub fn navigator_gpu_view(app: &PhotocraftApp, idx: usize, rect: Rect, ctx: &egui::Context) -> Option<crate::gpu_canvas::ViewParams> {
+/// `bounds` is what the Navigator shows of the document: all of it, or a page view's page (whose
+/// own texture the canvas then drew).
+pub fn navigator_gpu_view(
+    app: &PhotocraftApp,
+    idx: usize,
+    rect: Rect,
+    bounds: photocraft_geom::Rect,
+    ctx: &egui::Context,
+) -> Option<crate::gpu_canvas::ViewParams> {
     app.gpu.as_ref()?;
     let st = app.session.documents().get(idx)?;
     let params = *app.navigator_gpu.get(&st.doc.id)?;
     let [w, h] = params.doc_size;
-    if w == 0 || h == 0 || !rect.is_positive() || [st.doc.size.width, st.doc.size.height] != params.doc_size {
+    if w == 0 || h == 0 || !rect.is_positive() || bounds.is_empty() || [st.doc.size.width, st.doc.size.height] != params.doc_size {
+        return None;
+    }
+    // The texture the canvas drew last is this view's: its page's, or the document's.
+    let shown = app.ui.views.get(idx).and_then(|v| v.page.filter(|_| crate::page_tabs::page_rect(v, &st.doc).is_some()));
+    if params.doc != shown.map_or(st.doc.id.0, |p| crate::page_tabs::render_key(st.doc.id, p)) {
         return None;
     }
     Some(crate::gpu_canvas::ViewParams {
-        zoom: rect.width() / w as f32,
-        center: [w as f32 / 2.0, h as f32 / 2.0],
+        zoom: rect.width() / bounds.width() as f32,
+        center: [(bounds.x0 as f32 + bounds.x1 as f32) / 2.0, (bounds.y0 as f32 + bounds.y1 as f32) / 2.0],
         rotation: 0.0,
         shadow: false,
         pixel_grid: false,
@@ -57,7 +70,9 @@ pub fn navigator_waits_for_gpu(app: &PhotocraftApp, idx: usize, ctx: &egui::Cont
         return false;
     }
     let Some(id) = app.session.documents().get(idx).map(|st| st.doc.id) else { return false };
-    if app.canvases.keys().any(|(d, _)| *d == id) {
+    // A page view's canvas draws under its page's key.
+    let page = app.ui.views.get(idx).and_then(|v| v.page).map(|p| photocraft_doc::DocId(crate::page_tabs::render_key(id, p)));
+    if app.canvases.keys().any(|(d, _)| *d == id || Some(*d) == page) {
         return false;
     }
     let key = egui::Id::unique(("navigator-waits", id.0));
@@ -77,6 +92,8 @@ pub fn navigator_texture(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
     // Keyed by the document snapshot, not its revision: selecting a layer changes no pixels.
     let (snapshot, id, revision, last_damage) =
         app.session.documents().get(idx).map(|st| (std::sync::Arc::downgrade(&st.doc), st.doc.id, st.revision, st.last_damage))?;
+    // A page view's thumbnail is kept apart from the document's (`page_tabs::render_id`).
+    let id = crate::page_tabs::render_id(app, idx, id);
     let (doc, preview_key) = display_doc(app, idx);
     let (display, display_key) = canvas_display(app, &doc, None);
     let preview_key = preview_key ^ display_key;

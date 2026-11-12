@@ -291,7 +291,8 @@ pub fn ensure(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) -> Optio
     let active = st.active_layer;
     let (revision, last_damage) = (st.revision, st.last_damage);
     let content = revision.wrapping_sub(st.view_revision);
-    let id = st.doc.id.0;
+    // A page view's channel view is its page's (`page_tabs::render_id`).
+    let id = crate::page_tabs::render_id(app, idx, st.doc.id).0;
     if view.is_plain(&st.doc) {
         if let Some(c) = app.channel_views.get_mut(&id) {
             c.valid = false;
@@ -301,7 +302,14 @@ pub fn ensure(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) -> Optio
     // Mask and channel views are drawn over the canvas: show the same live document,
     // otherwise an opaque grayscale mask hides the stroke until it is committed (#2078).
     // The plain-composite path above needs no preview work.
-    let (doc, preview_key) = crate::canvas::filter_channel_preview(app, idx, ctx).unwrap_or_else(|| crate::canvas::display_doc(app, idx));
+    let (doc, preview_key) = match crate::canvas::filter_channel_preview(app, idx, ctx) {
+        // A filter's live result, on a page view its page alone.
+        Some((doc, key)) => match crate::page_tabs::rendered_page(app, idx) {
+            Some(page) => (crate::page_tabs::page_of_shown(app, doc, key, page), key),
+            None => (doc, key),
+        },
+        None => crate::canvas::display_doc(app, idx),
+    };
     // Interface ▸ Show Channels in Color tints single colour channel views on the canvas too,
     // not just the panel thumbnails (#2385). The view key carries the flag and the Layer Mask
     // Display Options, so changing them rebuilds the texture.

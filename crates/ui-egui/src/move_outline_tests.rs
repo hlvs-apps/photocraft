@@ -45,6 +45,7 @@ fn app() -> (PhotocraftApp, LayerId, LayerId) {
         fill_pending: false,
         doc_size: [64, 64],
         rotation: 0.0,
+        page: None,
         zoom_animating: false,
         zoom_anchor: None,
         display_camera: None,

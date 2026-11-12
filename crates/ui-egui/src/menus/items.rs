@@ -33,6 +33,7 @@ pub fn is_live(id: &str) -> bool {
         || crate::preset_panels::handles(id)
         || crate::type_panels_ui::handles(id)
         || crate::timeline_ui::handles(id)
+        || crate::page_tabs::handles(id)
 }
 
 /// Commands outside the catalogue that belong right after a catalogue item: `(id, after)`.
@@ -193,6 +194,11 @@ pub fn menu_items(app: &PhotocraftApp) -> Vec<MenuItem> {
             at,
             MenuItem { id: "---".into(), label: "---".into(), path: vec!["Help".into()], shortcut: None, enabled: false, checked: None, color: None },
         );
+    }
+    // Window › Pages: the active document's pages, after its commands.
+    if let Some(last) = items.iter().rposition(|i| i.path.len() == 2 && i.path[0] == "Window" && i.path[1] == "Pages") {
+        let rows = crate::page_tabs::menu_rows(app);
+        items.splice(last + 1..last + 1, rows);
     }
     // Window: the open documents in tab order, after a separator, the active one checked.
     if let Some(last) = items.iter().rposition(|i| i.path.first().map(String::as_str) == Some("Window")) {

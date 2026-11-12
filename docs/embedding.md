@@ -70,3 +70,12 @@ A typical host:
   stay installed: the interface and text already set in them still draw.
 - The host's `fonts` in `open` are registered before the document opens, so its text lays out in
   them and the open names none of them missing.
+- Page tabs: a document with artboards opens with one tab per artboard (Window › Pages), in page
+  order (the artboards' order, bottom to top), titled with the artboard's name. Each page tab is
+  a view of the one document: it is fitted to its artboard and draws only that artboard; new
+  layers, Paste and Place from it land on its artboard. The document is still one document: `save`
+  and the user's File › Save write it whole (the same bytes as without page tabs), `dirty` is the
+  document's, and undo is shared. Closing a page tab hides that page's view only (Window › Pages
+  shows it again); the last open page tab has no ×, so the host's document is never left without
+  a view. A document without artboards shows its canvas in one tab, as before. Window › Pages ›
+  Artboards as Tabs switches to the whole canvas and back.

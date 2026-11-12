@@ -81,6 +81,7 @@ pub use canvas::guide_select;
 pub use canvas::layer_pick_ui;
 pub use canvas::move_ui;
 pub use canvas::outline;
+pub use canvas::page_tabs;
 pub use canvas::paint_mouse;
 pub use canvas::patch_preview;
 pub use canvas::pattern_preview;
@@ -318,6 +319,12 @@ pub struct PhotocraftApp {
     /// `canvas::display_doc`'s live-adjust and Duotone documents per document: (snapshot,
     /// preview key, the document shown).
     display_memo: HashMap<DocId, (std::sync::Weak<Document>, u64, std::sync::Arc<Document>)>,
+    /// The page view being painted (`page_tabs`): document index and the artboard (layer id) it
+    /// composites alone. Set only while a page view paints.
+    pub(crate) page_render: Option<(usize, u64)>,
+    /// Page documents (`page_tabs::page_document`) by document and page: built once per
+    /// displayed document snapshot and preview key, like `display_memo`.
+    pub(crate) page_docs: HashMap<(DocId, u64), page_tabs::PageDoc>,
     /// The main canvas's last GPU view of each document while it shows the plain document on
     /// the GPU canvas: the Navigator draws the same texture at its own size (#4518).
     navigator_gpu: HashMap<DocId, crate::gpu_canvas::ViewParams>,
@@ -436,6 +443,10 @@ pub struct PhotocraftApp {
     /// Window › Arrange: the first document of the shown run of tiles, when there are more
     /// documents than tiles (`canvas::arranged_cells`).
     pub(crate) arrange_start: usize,
+    /// Open documents with artboards as page tabs (`page_tabs`): one tab per artboard instead of
+    /// one for the whole canvas. The web embed sets it; elsewhere Window › Pages › Artboards as
+    /// Tabs turns page tabs on per document.
+    pub artboards_as_tabs: bool,
     /// Physical pixels per egui point of the canvas last frame (`ctx.pixels_per_point`, which
     /// folds in both the display scale and Interface › UI Scale). The canvas maps document pixels
     /// to physical pixels, so point-space geometry divides the view zoom by this (see

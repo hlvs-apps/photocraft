@@ -101,7 +101,7 @@ fn inactive_blend_rows(ui: &mut egui::Ui, pro: bool) {
     });
 }
 
-pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+pub(crate) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     // A new active layer opens its parent groups and is scrolled into view (#152).
     let reveal = crate::layer_reveal::track(app, ui.ctx());
     let Some(st) = app.session.active() else {
@@ -273,7 +273,16 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             // The drawn rows, top to bottom (#1721): the space between them and below the last
             // one is a drop zone too.
             let mut drawn: Vec<(LayerId, Rect)> = Vec::new();
+            // A page tab lists only its page: its artboard (a top-level row) and what is in it.
+            let page = crate::page_tabs::active(app).and_then(|t| t.page).map(LayerId);
+            let mut on_page = false;
             for &(depth, l) in &rows {
+                if depth == 0 {
+                    on_page = page.is_none_or(|p| p == l.id);
+                }
+                if !on_page {
+                    continue;
+                }
                 // Select › Isolate Layers.
                 if !photocraft_engine::select_extra_cmds::isolation_shows(&doc, &isolated, l.id) {
                     continue;

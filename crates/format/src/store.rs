@@ -382,6 +382,7 @@ pub(crate) fn load_interruptible(src: &dyn ByteSource, opts: &LoadOptions, ctl: 
     let mut loader = Loader {
         fetch: &mut fetch,
         preserve_ids: opts.preserve_ids,
+        preserve_contents_ids: opts.preserve_ids,
         id_map: HashMap::new(),
         contents_id_map: HashMap::new(),
         legacy_linked_contents: HashMap::new(),

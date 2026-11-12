@@ -206,7 +206,12 @@ impl Session {
         let prior = st.layer_target();
         let mut doc = (*before).clone();
         let mut active = st.active_layer;
+        let page = st.page;
         let r = f(&mut doc, &mut active)?;
+        // A page tab's edits land on its page, never loose on the canvas.
+        if let Some(page) = page {
+            crate::layer_place::keep_on_page(&before, &mut doc, page, label)?;
+        }
         if let (Some(k), Some(id)) = (restrict, active) {
             channel_cmds::restrict_to_color(&before, &mut doc, id, k);
         }

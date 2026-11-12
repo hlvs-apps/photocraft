@@ -280,15 +280,20 @@ impl PhotocraftApp {
                 }
             }
         }
-        self.canvases.retain(|(doc, _), _| ids.contains(doc));
+        // Page views' canvases (`page_tabs::render_key`) stay while they can be drawn.
+        let pages = crate::page_tabs::live_render_keys(self);
+        self.canvases.retain(|(doc, _), _| ids.contains(doc) || pages.contains(&doc.0));
         self.navigator_textures.retain(|doc, _| ids.contains(doc));
+        let opened: Vec<DocId> = ids.iter().filter(|id| !self.view_docs.contains(id)).copied().collect();
         self.view_docs = ids;
+        crate::page_tabs::sync(self, &opened);
         self.prune_thumbs();
         self.sync_mask_targets();
         // Channel-view textures outlive a hidden view (cheap re-show), not their document.
         if !self.channel_views.is_empty() {
+            let pages = crate::page_tabs::live_render_keys(self);
             let docs = self.session.documents();
-            self.channel_views.retain(|id, _| docs.iter().any(|d| d.doc.id.0 == *id));
+            self.channel_views.retain(|id, _| docs.iter().any(|d| d.doc.id.0 == *id) || pages.contains(id));
         }
         // Commands may close and reopen a preserved-ID document before the next repaint.
         canvas::retain_gpu_documents(self);

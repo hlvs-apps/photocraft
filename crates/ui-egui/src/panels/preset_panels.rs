@@ -877,6 +877,7 @@ mod tests {
             fill_pending: false,
             doc_size: [64, 48],
             rotation: 0.0,
+            page: None,
             zoom_animating: false,
             zoom_anchor: None,
             display_camera: None,

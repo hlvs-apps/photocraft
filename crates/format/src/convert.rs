@@ -381,6 +381,8 @@ fn comp_m(c: &LayerComp, sink: &mut dyn Sink) -> Result<LayerCompM> {
 pub(crate) struct Loader<'a> {
     pub fetch: &'a mut dyn Fetch,
     pub preserve_ids: bool,
+    /// Keep the stored smart contents ids (else each stored id gets a fresh one, groups kept).
+    pub preserve_contents_ids: bool,
     /// Stored layer id → loaded id (differs when ids are remapped), for layer comp states.
     pub id_map: std::collections::HashMap<u64, LayerId>,
     pub contents_id_map: std::collections::HashMap<u64, SmartContentsId>,
@@ -459,7 +461,8 @@ impl Loader<'_> {
 
     fn contents_id(&mut self, raw: Option<u64>, source: &SmartSourceM) -> SmartContentsId {
         if let Some(raw) = raw {
-            return *self.contents_id_map.entry(raw).or_insert_with(|| if self.preserve_ids { SmartContentsId(raw) } else { SmartContentsId::fresh() });
+            let keep = self.preserve_contents_ids;
+            return *self.contents_id_map.entry(raw).or_insert_with(|| if keep { SmartContentsId(raw) } else { SmartContentsId::fresh() });
         }
         // Legacy embedded blobs may be deduplicated despite representing independent objects.
         // Only a nonempty linked path provides an existing shared-source identity.
@@ -633,27 +636,38 @@ impl Loader<'_> {
 
     pub(crate) fn document(&mut self, m: &DocM) -> Result<Document> {
         self.fetch.check()?;
-        // Reserve every stored id before allocating identities missing from older bundles. If an
-        // id is implausibly large, remap the whole document while retaining shared contents groups.
+        // Reserve every stored id before allocating identities missing from older bundles. If a
+        // layer or document id is implausibly large, remap the whole document while retaining
+        // shared contents groups.
         if self.preserve_ids {
-            fn max_ids(layers: &[LayerM], depth: usize, max: &mut u64) -> Result<()> {
+            fn max_ids(layers: &[LayerM], depth: usize, max: &mut u64, contents: &mut u64) -> Result<()> {
                 if depth > MAX_GROUP_DEPTH && !layers.is_empty() {
                     return Err(too_deep());
                 }
                 for l in layers {
                     *max = (*max).max(l.id);
                     match &l.content {
-                        ContentM::Group { children, .. } => max_ids(children, depth + 1, max)?,
-                        ContentM::Smart { contents_id: Some(id), .. } => *max = (*max).max(*id),
+                        ContentM::Group { children, .. } => max_ids(children, depth + 1, max, contents)?,
+                        ContentM::Smart { contents_id: Some(id), .. } => *contents = (*contents).max(*id),
                         _ => {}
                     }
                 }
                 Ok(())
             }
-            let mut max = m.id;
-            max_ids(&m.layers, 0, &mut max)?;
+            let (mut max, mut contents) = (m.id, 0);
+            max_ids(&m.layers, 0, &mut max, &mut contents)?;
             self.preserve_ids = reserve_ids_through(max);
+            // A smart contents id only says which instances share their contents, and another
+            // writer may mint it as a hash (a host that maps its own documents does): far past
+            // the counter it is kept as it is without moving the counter (ids minted here count
+            // up from it and do not reach it), and it no longer renumbers the document's layers.
+            // Only ids in the top quarter of the range, where placeholders live, are remapped.
+            self.preserve_contents_ids = self.preserve_ids && contents < KEPT_CONTENTS_IDS;
+            if self.preserve_contents_ids && contents > 0 {
+                reserve_ids_through(contents);
+            }
         }
+        self.preserve_contents_ids &= self.preserve_ids;
         let layers = m.layers.iter().map(|l| self.layer(l, 0)).collect::<Result<Vec<_>>>()?;
         let mut channels = Vec::with_capacity(m.channels.len());
         for c in &m.channels {
@@ -753,6 +767,10 @@ impl Loader<'_> {
         Ok(AlphaChannel { name: c.name.clone(), surface: self.surface(&c.surface)?, spot: c.spot, color: c.color, opacity: c.opacity, indicates: c.indicates })
     }
 }
+
+/// Stored smart contents ids below this are kept on load however far past the id counter they
+/// are (see `Loader::document`); hashed ids masked to 62 bits are.
+const KEPT_CONTENTS_IDS: u64 = 1 << 62;
 
 /// Advance the global id counter past `max` so ids loaded from a file never
 /// collide with ids minted later in this process. Returns `false` if `max`

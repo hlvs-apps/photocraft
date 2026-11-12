@@ -106,7 +106,17 @@ pub(crate) fn cache_key(doc: photocraft_doc::DocId, display: Option<u32>) -> (ph
 pub(crate) const GPU_OUTPUT: u32 = u32::MAX;
 
 /// The document to render: the committed one, or a clone with the live adjustment preview applied.
+/// While a page view paints (`page_tabs`), only its page of it.
 pub(crate) fn display_doc(app: &mut PhotocraftApp, idx: usize) -> (std::sync::Arc<Document>, u64) {
+    let (shown, key) = whole_display_doc(app, idx);
+    match crate::page_tabs::rendered_page(app, idx) {
+        Some(page) => (crate::page_tabs::page_of_shown(app, shown, key, page), key),
+        None => (shown, key),
+    }
+}
+
+/// [`display_doc`] of the whole document.
+fn whole_display_doc(app: &mut PhotocraftApp, idx: usize) -> (std::sync::Arc<Document>, u64) {
     if let Some(shown) = crate::type_panels_ui::color_picker::display_doc(app, idx) {
         return shown;
     }
