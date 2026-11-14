@@ -34,6 +34,13 @@ impl PcraftExportCache {
     pub(crate) fn encode(&self, doc: &Document, opts: &SaveOptions) -> photocraft_format::Result<Vec<u8>> {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).save_zip(doc, opts).map(|(bytes, _)| bytes)
     }
+
+    /// The document as a `.pcraft` without previews (no thumbnail, no composite): a recovery copy
+    /// that only ever opens in PhotoCraft again. It shares this cache with File › Save, so after
+    /// the first one only the tiles changed since are compressed, and a save after it reuses them.
+    pub fn snapshot(&self, doc: &Document) -> photocraft_format::Result<Vec<u8>> {
+        self.encode(doc, &SaveOptions::default())
+    }
 }
 
 #[cfg(test)]
@@ -65,6 +72,13 @@ mod tests {
             expected.name = "second.pcraft".into();
             assert_eq!(photocraft_format::load_from_bytes(&next.bytes).unwrap(), expected);
             assert_eq!(next.bytes, export(&doc, "second.pcraft", &ExportOptions::default()).unwrap().bytes);
+            // A recovery snapshot reuses the same cache, opens as the same document and carries no
+            // previews.
+            let snap = cache.snapshot(&doc).unwrap();
+            assert_eq!(photocraft_format::load_from_bytes(&snap).unwrap(), doc);
+            assert_eq!(photocraft_format::read_thumbnail(&snap).unwrap(), None);
+            let (_, stats) = cache.0.lock().unwrap().save_zip(&doc, &SaveOptions::default()).unwrap();
+            assert_eq!(stats.tiles_written, 0, "the snapshot left every tile in the cache");
             let weak = Arc::downgrade(&cache.0);
             drop(options);
             drop(cache);

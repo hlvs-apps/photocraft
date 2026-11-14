@@ -6,8 +6,12 @@
 //! - `open {name, document, fonts}`: the `.pcraft` to edit (an `ArrayBuffer`) under the file name
 //!   File › Save writes back to, and the font files its text uses (`[{family, data}]`), which are
 //!   registered first so the document opens without missing-font warnings.
+//!   With `unsaved: true` (a recovery copy the host kept, below) the document opens as unsaved
+//!   changes: closing asks, and only a save makes it saved.
 //! - `save`: File › Save on that document.
 //! - `saved {revision}`: the host stored the document of that revision; it counts as saved.
+//! - `snapshot`: post a `snapshot` now if the document has changes no snapshot holds yet (the host
+//!   asks when its page is hidden).
 //!
 //! App → host, to `window.parent`:
 //! - `ready {pcraft, rev, version}`: the app runs and waits for `open`; `pcraft` is the `.pcraft`
@@ -17,6 +21,14 @@
 //! - `document {name, revision, document}`: File › Save wrote it (asked for by `save`, or the
 //!   user's own File › Save); the `ArrayBuffer` is transferred.
 //! - `save-failed {error}`.
+//! - `snapshot {revision, document, ms}`: the document with its unsaved changes, for the host to
+//!   keep as a recovery copy and hand back with `open {unsaved: true}` if the page goes away
+//!   unsaved (a crash, a lost network, a tab the browser closes without asking). Posted once the
+//!   changes have rested for [`SNAPSHOT_QUIET_MS`] (longer after a slow snapshot, never during a
+//!   pointer drag) and on `snapshot`; written from the document's own save cache without previews,
+//!   so after the first one only the changed tiles are compressed (`ms`: what it took). It is never
+//!   a save: the document stays unsaved.
+//! - `snapshot-failed {error}`: a snapshot could not be written.
 //! - `start-failed {error}`: the app could not start (no WebGPU or WebGL2); nothing else follows.
 //!
 //! Every message is a plain object with `photocraftEmbed: 1` and a `type`. Only messages from the
@@ -104,9 +116,94 @@ pub type DocumentName = Rc<RefCell<Option<String>>>;
 #[cfg(target_arch = "wasm32")]
 #[derive(Debug)]
 pub enum Command {
-    Open { name: String, document: Vec<u8>, fonts: Vec<(String, Vec<u8>)> },
+    Open { name: String, document: Vec<u8>, fonts: Vec<(String, Vec<u8>)>, unsaved: bool },
     Save,
     Saved { revision: u64 },
+    Snapshot,
+}
+
+/// How long the document's changes rest before a recovery snapshot is posted.
+pub const SNAPSHOT_QUIET_MS: f64 = 2_000.0;
+/// The longest rest a slow snapshot stretches that to.
+pub const SNAPSHOT_MAX_QUIET_MS: f64 = 15_000.0;
+/// How often a snapshot held back by a pointer drag looks again.
+const SNAPSHOT_BUSY_RETRY_MS: f64 = 250.0;
+
+/// What the recovery snapshot schedule does in a frame (see [`SnapshotSchedule::frame`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SnapshotStep {
+    /// Nothing to snapshot: the document is saved, or the last snapshot holds this revision.
+    Idle,
+    /// Write and post a snapshot of the current revision now.
+    Snapshot,
+    /// Look again after this many milliseconds.
+    Wait(f64),
+}
+
+/// When embed mode posts a recovery `snapshot`: once a revision with unsaved changes has rested,
+/// or at once when the host asks, but never twice for one revision and never during a drag. A
+/// slow snapshot makes the next rest longer (three times what it took), so a large document is
+/// not written again and again while it is being worked on.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotSchedule {
+    seen: Option<u64>,
+    changed_at: f64,
+    posted: Option<u64>,
+    requested: bool,
+    last_ms: f64,
+}
+
+impl SnapshotSchedule {
+    /// The host asked for a snapshot (`snapshot`).
+    pub fn request(&mut self) {
+        self.requested = true;
+    }
+
+    /// The rest a revision needs before it is snapshotted.
+    pub fn quiet_ms(&self) -> f64 {
+        (self.last_ms * 3.0).clamp(SNAPSHOT_QUIET_MS, SNAPSHOT_MAX_QUIET_MS)
+    }
+
+    /// One frame: `now_ms` on any monotonic clock, the document's unsaved state and revision, and
+    /// whether a pointer is held down (a drag in progress).
+    pub fn frame(&mut self, now_ms: f64, dirty: bool, revision: u64, pointer_down: bool) -> SnapshotStep {
+        if !dirty {
+            // Saved: the next unsaved frame rests afresh, also at this revision (a document that
+            // opens unsaved changes nothing before its first copy is due).
+            self.posted = None;
+            self.requested = false;
+            self.seen = None;
+            return SnapshotStep::Idle;
+        }
+        if self.seen != Some(revision) {
+            self.seen = Some(revision);
+            self.changed_at = now_ms;
+        }
+        if self.posted == Some(revision) {
+            self.requested = false;
+            return SnapshotStep::Idle;
+        }
+        if pointer_down {
+            return SnapshotStep::Wait(SNAPSHOT_BUSY_RETRY_MS);
+        }
+        let rested = now_ms - self.changed_at;
+        if self.requested || rested >= self.quiet_ms() {
+            return SnapshotStep::Snapshot;
+        }
+        SnapshotStep::Wait(self.quiet_ms() - rested)
+    }
+
+    /// A snapshot of `revision` was posted after `took_ms`.
+    pub fn posted(&mut self, revision: u64, took_ms: f64) {
+        self.posted = Some(revision);
+        self.requested = false;
+        self.last_ms = took_ms.max(0.0);
+    }
+
+    /// A snapshot of `revision` failed: not again for this revision (the next change tries anew).
+    pub fn failed(&mut self, revision: u64) {
+        self.posted(revision, self.last_ms);
+    }
 }
 
 /// The writer of embed mode (`Services::write`): the host's document is handed over in
@@ -146,6 +243,10 @@ pub struct Embed {
     dirty: Option<bool>,
     /// The document's saved revision before this frame's own File › Save, if it makes one.
     frame_saved: u64,
+    /// The host's `open` asked for the document to open unsaved (a recovery copy).
+    open_unsaved: bool,
+    /// When the next recovery snapshot is due.
+    snapshots: SnapshotSchedule,
 }
 
 /// The parent window and the origin both sides share.
@@ -188,6 +289,8 @@ impl Embed {
             warnings: Vec::new(),
             dirty: None,
             frame_saved: 0,
+            open_unsaved: false,
+            snapshots: SnapshotSchedule::default(),
         };
         Some((embed, name, written))
     }
@@ -206,21 +309,31 @@ impl Embed {
         let commands = std::mem::take(&mut *self.commands.borrow_mut());
         for command in commands {
             match command {
-                Command::Open { name, document, fonts } => self.open(app, &name, &document, fonts),
+                Command::Open { name, document, fonts, unsaved } => {
+                    self.open_unsaved = unsaved;
+                    self.open(app, &name, &document, fonts);
+                }
                 Command::Save => self.save(app, ctx),
                 Command::Saved { revision } => self.saved(app, revision),
+                Command::Snapshot => self.snapshots.request(),
             }
         }
         self.frame_saved = self.state(app).map_or(0, |st| st.saved_revision);
     }
 
-    /// Reports what the frame changed: the document now open, a save, the unsaved state.
-    pub fn after_frame(&mut self, app: &mut PhotocraftApp) {
+    /// Reports what the frame changed: the document now open, a save, the unsaved state, and a
+    /// recovery snapshot when one is due.
+    pub fn after_frame(&mut self, app: &mut PhotocraftApp, ctx: &egui::Context) {
         if self.doc.is_none()
             && let Some(name) = self.name.borrow().clone()
             && let Some(st) = app.session.documents().iter().find(|st| st.path.as_deref() == Some(name.as_str()))
         {
             self.doc = Some(st.doc.id);
+            if std::mem::take(&mut self.open_unsaved) {
+                // A recovery copy: unsaved changes until a save, as content that was never saved
+                // (closing asks).
+                self.with_doc(app, |st| st.saved_revision = 0);
+            }
             let msg = message("opened");
             set(&msg, "warnings", &strings(&std::mem::take(&mut self.warnings)));
             self.host.post(&msg, None);
@@ -238,6 +351,42 @@ impl Embed {
             let msg = message("dirty");
             set(&msg, "dirty", &dirty.into());
             self.host.post(&msg, None);
+        }
+        self.snapshot_tick(app, ctx);
+    }
+
+    /// Posts a recovery snapshot when [`SnapshotSchedule`] says one is due, else wakes the next
+    /// frame when it will be.
+    fn snapshot_tick(&mut self, app: &PhotocraftApp, ctx: &egui::Context) {
+        let Some(st) = self.state(app) else { return };
+        let now = js_sys::Date::now();
+        let pointer_down = ctx.input(|i| i.pointer.any_down());
+        match self.snapshots.frame(now, st.is_dirty(), st.revision, pointer_down) {
+            SnapshotStep::Idle => {}
+            SnapshotStep::Wait(ms) => ctx.request_repaint_after(std::time::Duration::from_secs_f64(ms / 1000.0)),
+            SnapshotStep::Snapshot => {
+                let revision = st.revision;
+                match st.pcraft_cache.snapshot(&st.doc) {
+                    Ok(bytes) => {
+                        let took = js_sys::Date::now() - now;
+                        self.snapshots.posted(revision, took);
+                        let data = js_sys::Uint8Array::from(bytes.as_slice());
+                        let buffer = data.buffer();
+                        let msg = message("snapshot");
+                        set(&msg, "revision", &(revision as f64).into());
+                        set(&msg, "document", &buffer);
+                        set(&msg, "ms", &took.round().into());
+                        self.host.post(&msg, Some(&js_sys::Array::of1(&buffer)));
+                    }
+                    Err(e) => {
+                        self.snapshots.failed(revision);
+                        log::error!("photocraft-web: recovery snapshot: {e}");
+                        let msg = message("snapshot-failed");
+                        set(&msg, "error", &e.to_string().into());
+                        self.host.post(&msg, None);
+                    }
+                }
+            }
         }
     }
 
@@ -441,9 +590,11 @@ fn command(data: &wasm_bindgen::JsValue) -> Result<Option<Command>, String> {
                     fonts.push((family, data));
                 }
             }
-            Ok(Some(Command::Open { name, document, fonts }))
+            let unsaved = field("unsaved").as_bool().unwrap_or(false);
+            Ok(Some(Command::Open { name, document, fonts, unsaved }))
         }
         Some("save") => Ok(Some(Command::Save)),
+        Some("snapshot") => Ok(Some(Command::Snapshot)),
         Some("saved") => {
             let revision = field("revision").as_f64().filter(|r| r.is_finite() && *r >= 0.0 && r.fract() == 0.0).ok_or("saved needs a revision")?;
             Ok(Some(Command::Saved { revision: revision as u64 }))
@@ -503,5 +654,63 @@ mod tests {
         assert_eq!(written.borrow().as_deref(), Some(&b"pcraft bytes"[..]));
         let refused = write("d.psd", b"psd").expect_err("export refused");
         assert!(refused.contains("Downloads are turned off"), "{refused}");
+    }
+
+    #[test]
+    fn a_recovery_snapshot_waits_for_the_changes_to_rest_and_never_repeats_a_revision() {
+        let mut s = SnapshotSchedule::default();
+        assert_eq!(s.frame(0.0, false, 1, false), SnapshotStep::Idle, "a saved document needs no copy");
+        // An edit: wait for the rest, then once.
+        assert_eq!(s.frame(1_000.0, true, 2, false), SnapshotStep::Wait(SNAPSHOT_QUIET_MS));
+        assert_eq!(s.frame(2_500.0, true, 2, false), SnapshotStep::Wait(500.0));
+        assert_eq!(s.frame(3_000.0, true, 2, false), SnapshotStep::Snapshot);
+        s.posted(2, 40.0);
+        assert_eq!(s.frame(9_000.0, true, 2, false), SnapshotStep::Idle, "this revision is held already");
+        // Another edit starts the rest again.
+        assert_eq!(s.frame(10_000.0, true, 3, false), SnapshotStep::Wait(SNAPSHOT_QUIET_MS));
+        assert_eq!(s.frame(11_000.0, true, 4, false), SnapshotStep::Wait(SNAPSHOT_QUIET_MS), "every change restarts it");
+        assert_eq!(s.frame(13_000.0, true, 4, false), SnapshotStep::Snapshot);
+    }
+
+    #[test]
+    fn a_drag_holds_a_snapshot_back_and_the_host_can_ask_for_one_at_once() {
+        let mut s = SnapshotSchedule::default();
+        s.frame(0.0, true, 2, false);
+        assert_eq!(s.frame(5_000.0, true, 2, true), SnapshotStep::Wait(SNAPSHOT_BUSY_RETRY_MS), "never during a drag");
+        assert_eq!(s.frame(5_250.0, true, 2, false), SnapshotStep::Snapshot);
+        s.posted(2, 10.0);
+        // The page goes hidden right after an edit: the host asks, no rest needed.
+        s.frame(6_000.0, true, 3, false);
+        s.request();
+        assert_eq!(s.frame(6_010.0, true, 3, false), SnapshotStep::Snapshot);
+        s.posted(3, 10.0);
+        // Asking when the copy is current, or the document saved, does nothing.
+        s.request();
+        assert_eq!(s.frame(6_020.0, true, 3, false), SnapshotStep::Idle);
+        s.request();
+        assert_eq!(s.frame(6_030.0, false, 3, false), SnapshotStep::Idle);
+        assert_eq!(s.frame(6_040.0, true, 4, false), SnapshotStep::Wait(SNAPSHOT_QUIET_MS), "a request does not outlive a save");
+    }
+
+    #[test]
+    fn a_slow_snapshot_stretches_the_rest_and_a_failed_one_waits_for_the_next_change() {
+        let mut s = SnapshotSchedule::default();
+        s.frame(0.0, true, 2, false);
+        assert_eq!(s.frame(2_000.0, true, 2, false), SnapshotStep::Snapshot);
+        s.posted(2, 1_000.0);
+        assert_eq!(s.quiet_ms(), 3_000.0, "three times what the last one took");
+        s.posted(2, 60_000.0);
+        assert_eq!(s.quiet_ms(), SNAPSHOT_MAX_QUIET_MS, "capped");
+        let mut s = SnapshotSchedule::default();
+        s.frame(0.0, true, 5, false);
+        assert_eq!(s.frame(2_000.0, true, 5, false), SnapshotStep::Snapshot);
+        s.failed(5);
+        assert_eq!(s.frame(9_000.0, true, 5, false), SnapshotStep::Idle, "not again for the same revision");
+        assert_eq!(s.frame(9_100.0, true, 6, false), SnapshotStep::Wait(SNAPSHOT_QUIET_MS));
+        // Saved, then unsaved again at the same revision (a copy reopened as unsaved changes): a
+        // fresh rest, then a copy.
+        s.frame(9_200.0, false, 6, false);
+        assert_eq!(s.frame(9_300.0, true, 6, false), SnapshotStep::Wait(SNAPSHOT_QUIET_MS));
+        assert_eq!(s.frame(11_300.0, true, 6, false), SnapshotStep::Snapshot);
     }
 }
