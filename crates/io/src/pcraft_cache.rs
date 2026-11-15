@@ -45,12 +45,12 @@ impl PcraftExportCache {
 
     /// [`Self::prepare_parts`] until `over` says the caller's time is up. Also answers whether
     /// the call got further (hashed something new), so a caller can tell a document that needs
-    /// more steps from one object too large for its budget.
+    /// more steps from a document traversal too large for its budget.
     pub fn prepare_parts_until(&self, doc: &Document, over: &(dyn Fn() -> bool + Sync)) -> (photocraft_format::Result<photocraft_format::Parts>, bool) {
         let mut writer = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let before = writer.known_hashes();
+        let before = writer.hash_progress();
         let result = writer.prepare_parts(doc, &photocraft_format::SaveLimits::default(), &photocraft_raster::Interrupt::cancel_only(over));
-        (result, writer.known_hashes() > before)
+        (result, writer.hash_progress() > before)
     }
 }
 
@@ -60,7 +60,7 @@ pub fn bundle_from_parts(manifest: &[u8], objects: &[(String, Vec<u8>)]) -> phot
     photocraft_format::bundle_from_parts(manifest, objects, &photocraft_raster::Interrupt::NONE)
 }
 
-/// Part `i` of `parts`, compressed as a bundle stores it ([`photocraft_format::Parts::compress`]).
+/// Part `i`: a compressed object or raw large-blob fragment ([`photocraft_format::Parts::compress`]).
 pub fn compress_part(parts: &photocraft_format::Parts, i: usize) -> photocraft_format::Result<Vec<u8>> {
     parts.compress(i, &photocraft_raster::Interrupt::NONE)
 }

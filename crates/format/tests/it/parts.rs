@@ -135,8 +135,78 @@ fn a_large_blob_goes_into_its_part_uncompressed_and_still_opens() {
     doc.metadata.psd_global_blocks.push((*b"8BIM", *b"test", blob.clone()));
     let parts = PcraftWriter::new().prepare_parts(&doc, &SaveLimits::default(), &Interrupt::NONE).unwrap();
     let objects = compress_all(&parts);
-    let (_, raw) = objects.iter().find(|(path, _)| path.starts_with("blobs/")).unwrap();
-    assert!(raw.len() > blob.len(), "kept uncompressed: {} bytes for {}", raw.len(), blob.len());
+    let raw_bytes: usize = objects.iter().filter(|(path, _)| path.starts_with("blobs/")).map(|(_, raw)| raw.len()).sum();
+    assert_eq!(raw_bytes, blob.len(), "raw fragments keep the original bytes");
     let bundle = bundle_from_parts(parts.manifest(), &objects, &Interrupt::NONE).unwrap();
+    assert_eq!(load_from_bytes(&bundle).unwrap(), doc);
+}
+
+#[test]
+fn a_single_large_blob_resumes_hashing_without_extending_the_budget() {
+    let mut doc = Document::new("blob", Size::new(1, 1), ColorMode::Rgb, SampleType::U8);
+    doc.metadata.exif = Some(std::sync::Arc::new(vec![23; 128 << 20]));
+    let mut probe = PcraftWriter::new();
+    let cold = checks(&mut probe, &doc);
+    let warm = checks(&mut probe, &doc);
+    assert!(cold > warm);
+    let budget = warm + 32;
+    assert!(budget < 2048, "warm {warm}, cold {cold}, budget {budget}");
+    let mut writer = PcraftWriter::new();
+    for _ in 0..32 {
+        let used = AtomicUsize::new(0);
+        let over = || used.fetch_add(1, Ordering::Relaxed) >= budget;
+        match writer.prepare_parts(&doc, &SaveLimits::default(), &Interrupt::cancel_only(&over)) {
+            Ok(_) => return,
+            Err(FormatError::Cancelled(_)) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+    panic!("a single blob must make progress at a fixed per-step budget");
+}
+
+#[test]
+fn a_large_blob_has_bounded_recovery_transfers_and_round_trips() {
+    let mut doc = Document::new("blob", Size::new(1, 1), ColorMode::Rgb, SampleType::U8);
+    doc.metadata.exif = Some(std::sync::Arc::new(vec![23; 8 << 20]));
+    let parts = PcraftWriter::new().prepare_parts(&doc, &SaveLimits::default(), &Interrupt::NONE).unwrap();
+    let objects = compress_all(&parts);
+    assert!(objects.len() > 1);
+    assert!(objects.iter().all(|(_, bytes)| bytes.len() <= 256 << 10));
+    let bundle = bundle_from_parts(parts.manifest(), &objects, &Interrupt::NONE).unwrap();
+    assert_eq!(load_from_bytes(&bundle).unwrap(), doc);
+}
+
+#[test]
+fn raw_fragments_reject_missing_corrupt_short_and_ambiguous_objects() {
+    let mut doc = Document::new("blob", Size::new(1, 1), ColorMode::Rgb, SampleType::U8);
+    doc.metadata.exif = Some(std::sync::Arc::new(vec![23; 2 << 20]));
+    let mut writer = PcraftWriter::new();
+    let before = writer.save_zip(&doc, &Default::default()).unwrap().0;
+    let parts = writer.prepare_parts(&doc, &SaveLimits::default(), &Interrupt::NONE).unwrap();
+    let objects = compress_all(&parts);
+    assert_eq!(writer.save_zip(&doc, &Default::default()).unwrap().0, before, "recovery does not change save bytes");
+    let mut missing = objects.clone();
+    missing.remove(1);
+    assert!(bundle_from_parts(parts.manifest(), &missing, &Interrupt::NONE).is_err());
+    let mut short = objects.clone();
+    short[0].1.pop();
+    assert!(bundle_from_parts(parts.manifest(), &short, &Interrupt::NONE).is_err());
+    let mut oversized = objects.clone();
+    oversized[0].1.push(1);
+    assert!(bundle_from_parts(parts.manifest(), &oversized, &Interrupt::NONE).is_err());
+    let mut mixed = objects.clone();
+    mixed.push((objects[0].0.split_once(".part/").unwrap().0.to_owned(), vec![1]));
+    assert!(bundle_from_parts(parts.manifest(), &mixed, &Interrupt::NONE).is_err());
+    let mut corrupt = objects.clone();
+    corrupt[0].1[0] ^= 1;
+    let bundle = bundle_from_parts(parts.manifest(), &corrupt, &Interrupt::NONE).unwrap();
+    assert!(load_from_bytes(&bundle).is_err(), "whole-object hash still validates every fragment");
+    let mut tail = objects.clone();
+    tail.pop();
+    let bundle = bundle_from_parts(parts.manifest(), &tail, &Interrupt::NONE).unwrap();
+    assert!(load_from_bytes(&bundle).is_err(), "missing final fragment cannot restore a partial object");
+    let mut reversed = objects;
+    reversed.reverse();
+    let bundle = bundle_from_parts(parts.manifest(), &reversed, &Interrupt::NONE).unwrap();
     assert_eq!(load_from_bytes(&bundle).unwrap(), doc);
 }

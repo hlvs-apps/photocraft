@@ -42,7 +42,7 @@ PhotoCraft → host:
 | `document` | `name`, `revision`, `document` (an `ArrayBuffer`, transferred) | File › Save wrote the document: asked for by `save`, or the user's own File › Save. |
 | `save-failed` | `error` | `save` could not write the document. |
 | `snapshot-start` | `revision` | A recovery copy of that revision begins (below). |
-| `snapshot-part` | `revision`, `path` (a bundle object path, `tiles/<blake3>.zst` or `blobs/<blake3>.zst`), `data` (`ArrayBuffer`, transferred) | One object of the copy the host does not hold yet, as the bundle stores it. |
+| `snapshot-part` | `revision`, `path` (a bundle object path, or `blobs/<blake3>.zst.part/<8-digit-hex-ordinal>` for a raw fragment), `data` (`ArrayBuffer`, transferred) | One compressed object or bounded raw blob fragment the host does not hold yet. |
 | `snapshot` | `revision`, `manifest` (`ArrayBuffer`, the bundle's `manifest.json`, transferred), `paths` (every object path it names), `parts` (how many this copy sent), `ms` (main-thread time of all its steps), `maxSliceMs` (its longest step), `slices` | The copy is complete: the host holds every object of `paths`, from this copy's `snapshot-part`s or earlier ones. |
 | `snapshot-failed` | `error` | A recovery copy could not be written. |
 | `start-failed` | `error` | The app could not start (the browser has neither WebGPU nor WebGL2). Nothing follows. |
@@ -77,16 +77,20 @@ and hand back later:
   restarting that wait indefinitely; it is checked between pointer gestures, so a copy never
   starts during a drag. The host can ask for one at once (`snapshot`). A saved document gets none,
   and a revision is not copied twice.
-- A copy never stalls the GUI. It is written a step per frame, about 6 ms of main-thread time
+- A copy targets one short step per frame, about 6 ms of main-thread time
   (3 ms during a drag), each right after the browser has drawn a frame and never inside the
   GUI's own frames, against the document as it was at the copy's revision (editing goes on). A
   hidden page draws no frames and throttles its timers: there the steps run on a timer, 100 ms
   each, so a copy the host asked for as its page went is done sooner.
   Each step first hashes tiles and blobs whose hash the document's save cache does not know yet
-  (an interrupted step keeps what it hashed), then compresses objects the host does not hold, one
-  at a time, posting each as a `snapshot-part`. An object too large for one step gets a longer
-  next step (doubled until it fits), so every copy completes; a blob over 1 MiB goes into its
-  part uncompressed. `snapshot` closes the copy with the manifest and every path it names.
+  (an interrupted step keeps completed hashes and partial blob hash state), then prepares records
+  the host does not hold, posting each as a `snapshot-part`. Blobs over 1 MiB are raw fragments
+  of at most 256 KiB; they are joined and zstd-encoded only on explicit Restore. Hash progress
+  includes partial blob work, so large blobs no longer force longer preparation steps. A document
+  traversal that makes no progress can still extend the budget; this is a target, not a hard
+  real-time guarantee. `snapshot` closes the copy with the manifest and every record path it
+  names. The host must commit that manifest last; before the first complete copy, recovery is
+  not available. A replacement leaves the previous complete copy recoverable.
 - Objects are content-addressed, so the host keeps each part as a record of its own: a small
   edit after a complete copy sends only the tiles it changed. The host keeps the newest complete
   copy per document and drops parts no copy names. It is never a save: `dirty` stays `true`.
