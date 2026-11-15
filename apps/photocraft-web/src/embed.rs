@@ -233,6 +233,15 @@ pub const SNAPSHOT_SLICE_MS: f64 = 6.0;
 /// The same during a pointer drag, when the GUI's own frames are busiest.
 pub const SNAPSHOT_DRAG_SLICE_MS: f64 = 3.0;
 const _: () = assert!(SNAPSHOT_DRAG_SLICE_MS < SNAPSHOT_SLICE_MS, "a drag gets the smaller step");
+/// The same while the page is hidden. Nothing is drawn then, and a hidden page's timers run about
+/// once a second, so a copy written then (the host asks for one as its page goes) takes far
+/// larger steps to be done in time.
+pub const SNAPSHOT_HIDDEN_SLICE_MS: f64 = 100.0;
+const _: () = assert!(SNAPSHOT_SLICE_MS < SNAPSHOT_HIDDEN_SLICE_MS, "a hidden page gets the larger step");
+/// A visible page's step waits for the next frame ([`schedule_step`]); a page hidden meanwhile
+/// draws none, and this timer runs the step instead.
+#[cfg(target_arch = "wasm32")]
+const SNAPSHOT_FRAME_FALLBACK_MS: i32 = 250;
 
 /// What a recovery copy step did ([`SnapshotRun::step`]).
 #[derive(Debug)]
@@ -729,10 +738,14 @@ enum Outcome {
     Failed { revision: u64 },
 }
 
-/// Schedules the copy's next step on a browser timer (between frames).
+/// Schedules the copy's next step. On a visible page it runs once the browser has drawn the next
+/// frame: a chain of timers alone may run several steps between two frames (WebKit does), which
+/// adds up to a stall. A hidden page draws no frames: there it runs on a timer, as it does when
+/// the page is hidden before the frame comes ([`SNAPSHOT_FRAME_FALLBACK_MS`]).
 #[cfg(target_arch = "wasm32")]
 fn schedule_step(stepper: Rc<RefCell<Stepper>>, host: Host, ctx: egui::Context) {
     use wasm_bindgen::JsCast as _;
+    use wasm_bindgen::closure::Closure;
     {
         let mut s = stepper.borrow_mut();
         if s.scheduled || s.run.is_none() {
@@ -741,10 +754,58 @@ fn schedule_step(stepper: Rc<RefCell<Stepper>>, host: Host, ctx: egui::Context) 
         s.scheduled = true;
     }
     let Some(window) = web_sys::window() else { return };
-    let next = wasm_bindgen::closure::Closure::once_into_js(move || step_copy(stepper, host, ctx));
-    if window.set_timeout_with_callback_and_timeout_and_arguments_0(next.unchecked_ref(), 0).is_err() {
-        log::error!("photocraft-web: recovery copy: the browser refused a timer");
+    let pending = Rc::new(RefCell::new(PendingStep { step: Some(Box::new(move || step_copy(stepper, host, ctx))), fallback: None }));
+    let timer = |window: &web_sys::Window, pending: Rc<RefCell<PendingStep>>, ms: i32| {
+        let run = Closure::once_into_js(move || PendingStep::run(&pending));
+        window.set_timeout_with_callback_and_timeout_and_arguments_0(run.unchecked_ref(), ms).ok()
+    };
+    if page_hidden(&window) {
+        if timer(&window, pending, 0).is_none() {
+            log::error!("photocraft-web: recovery copy: the browser refused a timer");
+        }
+        return;
     }
+    let after_frame = {
+        let (window, pending) = (window.clone(), pending.clone());
+        Closure::once_into_js(move || {
+            // Right after the frame: a zero timer runs once the browser has drawn it.
+            timer(&window, pending, 0);
+        })
+    };
+    let fallback = timer(&window, pending.clone(), SNAPSHOT_FRAME_FALLBACK_MS);
+    pending.borrow_mut().fallback = fallback;
+    if window.request_animation_frame(after_frame.unchecked_ref()).is_err() && fallback.is_none() {
+        log::error!("photocraft-web: recovery copy: the browser refused a frame and a timer");
+    }
+}
+
+/// A scheduled step, run once by whichever comes first: the frame or the fallback timer.
+#[cfg(target_arch = "wasm32")]
+struct PendingStep {
+    step: Option<Box<dyn FnOnce()>>,
+    fallback: Option<i32>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl PendingStep {
+    fn run(pending: &Rc<RefCell<PendingStep>>) {
+        let (step, fallback) = {
+            let mut p = pending.borrow_mut();
+            (p.step.take(), p.fallback.take())
+        };
+        if let (Some(id), Some(window)) = (fallback, web_sys::window()) {
+            window.clear_timeout_with_handle(id);
+        }
+        if let Some(step) = step {
+            step();
+        }
+    }
+}
+
+/// The page is hidden (another tab, minimised, going away): it draws no frames.
+#[cfg(target_arch = "wasm32")]
+fn page_hidden(window: &web_sys::Window) -> bool {
+    window.document().is_some_and(|d| d.hidden())
 }
 
 /// One step of the copy under way ([`SnapshotRun::step`]), posting its parts, then the next.
@@ -756,7 +817,13 @@ fn step_copy(stepper: Rc<RefCell<Stepper>>, host: Host, ctx: egui::Context) {
         *scheduled = false;
         let (Some(run), Some(cache)) = (run.as_mut(), cache.as_ref()) else { return };
         let revision = run.revision();
-        let budget = if *pointer_down { SNAPSHOT_DRAG_SLICE_MS } else { SNAPSHOT_SLICE_MS };
+        let budget = if web_sys::window().is_some_and(|w| page_hidden(&w)) {
+            SNAPSHOT_HIDDEN_SLICE_MS
+        } else if *pointer_down {
+            SNAPSHOT_DRAG_SLICE_MS
+        } else {
+            SNAPSHOT_SLICE_MS
+        };
         let mut post = |path: &str, data: Vec<u8>| {
             let array = js_sys::Uint8Array::from(data.as_slice());
             let buffer = array.buffer();
