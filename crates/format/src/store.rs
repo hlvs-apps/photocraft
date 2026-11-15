@@ -415,6 +415,27 @@ pub struct SaveStats {
 }
 
 type BlobHashCache = HashMap<usize, (Weak<Vec<u8>>, Hash)>;
+#[derive(Default)]
+struct BlobHashWork {
+    partial: HashMap<usize, (Weak<Vec<u8>>, blake3::Hasher, usize)>,
+    chunks: usize,
+}
+impl BlobHashWork {
+    fn hash(&mut self, data: &Arc<Vec<u8>>, ctl: &Interrupt) -> Result<Hash> {
+        let key = Arc::as_ptr(data) as usize;
+        let (_, hasher, offset) = self.partial.entry(key).or_insert_with(|| (Arc::downgrade(data), blake3::Hasher::new(), 0));
+        let remaining = data.get(*offset..).ok_or_else(|| FormatError::corrupt("blob hash offset"))?;
+        for chunk in remaining.chunks(64 << 10) {
+            ctl.check()?;
+            hasher.update(chunk);
+            *offset += chunk.len();
+            self.chunks = self.chunks.saturating_add(1);
+        }
+        let hash = hasher.finalize().to_hex().to_string();
+        self.partial.remove(&key);
+        Ok(hash)
+    }
+}
 type TileHashCache = HashMap<(usize, SampleType), (Weak<Tile>, Hash)>;
 
 #[derive(Default)]
@@ -426,6 +447,7 @@ struct Collect<'c> {
     blobs: BTreeMap<Hash, Arc<Vec<u8>>>,
     hash_cache: Option<&'c mut TileHashCache>,
     blob_hash_cache: Option<&'c mut BlobHashCache>,
+    blob_hash_work: Option<&'c mut BlobHashWork>,
 }
 
 impl Collect<'_> {
@@ -469,6 +491,9 @@ impl Sink for Collect<'_> {
             return Ok(h);
         }
         let h = hash_for_save(&tile_le(tile, format.sample), &self.ctl)?;
+        if let Some(work) = self.blob_hash_work.as_deref_mut() {
+            work.chunks = work.chunks.saturating_add(1);
+        }
         if !self.tiles.contains_key(&h) {
             self.account(tile.bytes().len())?;
         }
@@ -494,7 +519,10 @@ impl Sink for Collect<'_> {
             self.blobs.entry(h.clone()).or_insert_with(|| data.clone());
             return Ok(h);
         }
-        let h = hash_for_save(data, &self.ctl)?;
+        let h = match self.blob_hash_work.as_deref_mut() {
+            Some(work) => work.hash(data, &self.ctl)?,
+            None => hash_for_save(data, &self.ctl)?,
+        };
         if !self.blobs.contains_key(&h) {
             self.account(data.len())?;
         }
@@ -514,6 +542,169 @@ fn tile_le(t: &Tile, sample: SampleType) -> std::borrow::Cow<'_, [u8]> {
     } else {
         std::borrow::Cow::Borrowed(t.bytes())
     }
+}
+
+/// Objects larger than this go into a snapshot part uncompressed ([`Parts::compress`]).
+pub const PARTS_RAW_BYTES: usize = 1 << 20;
+/// Maximum raw fragment transferred in one recovery step.
+pub const PARTS_FRAGMENT_BYTES: usize = 256 << 10;
+
+/// A recovery snapshot as separate parts ([`PcraftWriter::prepare_parts`]): the bundle's
+/// manifest and the content-addressed objects it names. Small objects use the bundle's zstd
+/// representation; blobs over 1 MiB use raw 256 KiB fragments named
+/// `blobs/<blake3>.zst.part/<eight-digit-hex-ordinal>`. A host commits the manifest only after
+/// all records exist. [`bundle_from_parts`] rejoins fragments on explicit restore. No previews.
+pub struct Parts {
+    manifest: Vec<u8>,
+    objects: Vec<(String, RecoveryObject)>,
+}
+
+enum RecoveryObject {
+    Whole(Object),
+    Raw(Arc<Vec<u8>>, std::ops::Range<usize>),
+}
+
+impl Parts {
+    /// The bundle's `manifest.json`.
+    pub fn manifest(&self) -> &[u8] {
+        &self.manifest
+    }
+
+    /// How many objects the manifest names.
+    pub fn len(&self) -> usize {
+        self.objects.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
+    /// Object `i`'s bundle path, or `None` past the end.
+    pub fn path(&self, i: usize) -> Option<&str> {
+        self.objects.get(i).map(|(path, _)| path.as_str())
+    }
+
+    /// Every object's bundle path, in bundle order.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.objects.iter().map(|(path, _)| path.as_str())
+    }
+
+    /// One recovery record: a compressed whole object, or at most 256 KiB of a large blob.
+    /// Raw fragments are joined only on explicit Restore, never during background snapshots.
+    pub fn compress(&self, i: usize, ctl: &Interrupt) -> Result<Vec<u8>> {
+        let (_, object) = self.objects.get(i).ok_or_else(|| FormatError::corrupt("no such snapshot part"))?;
+        ctl.check()?;
+        match object {
+            RecoveryObject::Whole(object) => object.compressed_with(usize::MAX, ctl),
+            RecoveryObject::Raw(bytes, range) => Ok(bytes.get(range.clone()).ok_or_else(|| FormatError::corrupt("snapshot fragment range"))?.to_vec()),
+        }
+    }
+}
+
+impl PcraftWriter {
+    /// How many tile and blob hashes this writer remembers (it never forgets a live one):
+    /// a caller that interrupted [`Self::prepare_parts`] sees from it whether the call got further.
+    pub fn known_hashes(&self) -> usize {
+        self.hash_cache.len() + self.blob_hash_cache.len()
+    }
+
+    /// Monotonic hashing progress, including chunks of a blob whose hash is not complete yet.
+    pub fn hash_progress(&self) -> usize {
+        self.blob_hash_work.chunks
+    }
+
+    /// Prepares `doc` as [`Parts`]: walks it and hashes the tiles and blobs whose hash this writer
+    /// does not know yet (it remembers those of earlier saves and snapshots of the same
+    /// allocations). Cooperative: when `ctl` trips it returns [`FormatError::Cancelled`] and keeps
+    /// completed hashes and partial blob hash states, so the next call resumes; a caller with a
+    /// time budget per frame calls it again until it returns the parts. Nothing is compressed.
+    pub fn prepare_parts(&mut self, doc: &Document, limits: &SaveLimits, ctl: &Interrupt) -> Result<Parts> {
+        let p = self.prepare_interruptible(doc, &SaveOptions::default(), limits, ctl)?;
+        let mut objects = Vec::new();
+        for (path, object) in p.objects {
+            match object {
+                Object::Blob(bytes) if bytes.len() > PARTS_RAW_BYTES => {
+                    for (i, start) in (0..bytes.len()).step_by(PARTS_FRAGMENT_BYTES).enumerate() {
+                        ctl.check()?;
+                        let end = start.saturating_add(PARTS_FRAGMENT_BYTES).min(bytes.len());
+                        objects.push((format!("{path}.part/{i:08x}"), RecoveryObject::Raw(bytes.clone(), start..end)));
+                    }
+                }
+                object => objects.push((path, RecoveryObject::Whole(object))),
+            }
+        }
+        Ok(Parts { manifest: p.manifest, objects })
+    }
+}
+
+/// Is `path` a bundle object path: `tiles/` or `blobs/`, a BLAKE3 hash in lowercase hex, `.zst`?
+fn is_object_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("tiles/").or_else(|| path.strip_prefix("blobs/")) else { return false };
+    let Some(hash) = rest.strip_suffix(".zst") else { return false };
+    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A `.pcraft` ZIP of parts: `manifest` and the compressed objects it names, as [`Parts`] makes
+/// them. Every object must sit at a bundle object path, once. Loading the bundle checks each
+/// object it reads against its content hash, as every load does, so a damaged part is refused
+/// there rather than opened.
+pub fn bundle_from_parts(manifest: &[u8], objects: &[(String, Vec<u8>)], ctl: &Interrupt) -> Result<Vec<u8>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut fragments: BTreeMap<&str, BTreeMap<usize, &[u8]>> = BTreeMap::new();
+    let mut whole = Vec::new();
+    for (path, data) in objects {
+        ctl.check()?;
+        if !seen.insert(path.as_str()) {
+            return Err(FormatError::corrupt(format!("snapshot part {path:?} twice")));
+        }
+        if let Some((base, index)) = path.split_once(".part/") {
+            if !base.starts_with("blobs/")
+                || !is_object_path(base)
+                || index.len() != 8
+                || !index.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(FormatError::corrupt("invalid snapshot fragment path"));
+            }
+            let index = usize::from_str_radix(index, 16).map_err(|_| FormatError::corrupt("invalid fragment index"))?;
+            if data.is_empty() || data.len() > PARTS_FRAGMENT_BYTES {
+                return Err(FormatError::corrupt("invalid snapshot fragment size"));
+            }
+            fragments.entry(base).or_default().insert(index, data);
+        } else if is_object_path(path) {
+            whole.push((path.as_str(), data.as_slice()));
+        } else {
+            return Err(FormatError::corrupt(format!("not a bundle object path: {path:?}")));
+        }
+    }
+    let mut joined = Vec::new();
+    for (path, chunks) in fragments {
+        if seen.contains(path) {
+            return Err(FormatError::corrupt("both whole and fragmented snapshot object"));
+        }
+        let mut bytes = Vec::new();
+        for (expected, (index, data)) in chunks.iter().enumerate() {
+            ctl.check()?;
+            if expected != *index || (expected + 1 < chunks.len() && data.len() != PARTS_FRAGMENT_BYTES) {
+                return Err(FormatError::corrupt("missing or short snapshot fragment"));
+            }
+            if bytes.len().saturating_add(data.len()) > 1 << 30 {
+                return Err(FormatError::LimitExceeded("snapshot blob bytes".into()));
+            }
+            bytes.try_reserve(data.len()).map_err(|_| FormatError::LimitExceeded("snapshot blob memory".into()))?;
+            bytes.extend_from_slice(data);
+        }
+        let object = Object::Blob(Arc::new(bytes));
+        joined.push((path, object.compressed_at(ruzstd::encoding::CompressionLevel::Uncompressed, usize::MAX, ctl)?));
+    }
+    whole.extend(joined.iter().map(|(path, data)| (*path, data.as_slice())));
+    let objects = whole;
+    let entries = std::iter::once((MANIFEST, manifest.len())).chain(objects.iter().map(|(path, data)| (*path, data.len())));
+    let mut z = ZipWriter::with_entries(entries, usize::MAX, ctl)?;
+    z.add_interruptible(MANIFEST, manifest, ctl)?;
+    for (path, data) in objects {
+        z.add_interruptible(path, data, ctl)?;
+    }
+    z.finish_interruptible(ctl)
 }
 
 /// Default for [`PcraftWriter::set_reverify_budget`]: compressed bytes of already-verified
@@ -536,6 +727,7 @@ pub const DEFAULT_REVERIFY_BUDGET: u64 = 16 * 1024 * 1024;
 pub struct PcraftWriter {
     hash_cache: TileHashCache,
     blob_hash_cache: BlobHashCache,
+    blob_hash_work: BlobHashWork,
     /// Compressed objects by bundle path (ZIP mode).
     compressed: HashMap<String, Arc<Vec<u8>>>,
     compressed_budget: usize,
@@ -550,6 +742,7 @@ impl Default for PcraftWriter {
         Self {
             hash_cache: HashMap::new(),
             blob_hash_cache: HashMap::new(),
+            blob_hash_work: BlobHashWork::default(),
             compressed: HashMap::new(),
             compressed_budget: usize::MAX,
             verified_directory: None,
@@ -1021,18 +1214,23 @@ impl PcraftWriter {
 
     fn prepare_interruptible(&mut self, doc: &Document, opts: &SaveOptions, limits: &SaveLimits, ctl: &Interrupt) -> Result<Prepared> {
         ctl.check()?;
-        // extract_if can stop early, unlike retain. Losing a reuse entry on cancellation
-        // changes only the cache, never the document or archive.
-        for _ in self.hash_cache.extract_if(|_, (w, _)| ctl.cancelled() || w.strong_count() == 0) {
+        // Only hashes of freed allocations go. A live one stays even when `ctl` trips here: an
+        // interrupted prepare keeps every hash it has, so the next call resumes
+        // (`prepare_parts` under a per-frame time budget relies on it).
+        for _ in self.hash_cache.extract_if(|_, (w, _)| w.strong_count() == 0) {
             ctl.check()?;
         }
-        for _ in self.blob_hash_cache.extract_if(|_, (w, _)| ctl.cancelled() || w.strong_count() == 0) {
+        for _ in self.blob_hash_cache.extract_if(|_, (w, _)| w.strong_count() == 0) {
+            ctl.check()?;
+        }
+        for _ in self.blob_hash_work.partial.extract_if(|_, (w, _, _)| w.strong_count() == 0) {
             ctl.check()?;
         }
         convert::check_nesting(&doc.layers, ctl)?;
         let mut c = Collect {
             hash_cache: Some(&mut self.hash_cache),
             blob_hash_cache: Some(&mut self.blob_hash_cache),
+            blob_hash_work: Some(&mut self.blob_hash_work),
             ctl: *ctl,
             limits: *limits,
             ..Default::default()
@@ -1661,12 +1859,16 @@ impl Write for CompressionOutput<'_> {
 }
 impl Object {
     fn compressed_with(&self, max: usize, ctl: &Interrupt) -> Result<Vec<u8>> {
+        self.compressed_at(ruzstd::encoding::CompressionLevel::Fastest, max, ctl)
+    }
+
+    fn compressed_at(&self, level: ruzstd::encoding::CompressionLevel, max: usize, ctl: &Interrupt) -> Result<Vec<u8>> {
         ctl.check()?;
         let bytes = self.content();
         let full = std::cell::Cell::new(false);
         let source = CompressionSource { bytes: &bytes, ctl: *ctl, full: &full };
         let mut output = CompressionOutput { bytes: Vec::new(), max, full: &full };
-        ruzstd::encoding::compress(source, &mut output, ruzstd::encoding::CompressionLevel::Fastest);
+        ruzstd::encoding::compress(source, &mut output, level);
         ctl.check()?;
         if full.get() {
             return Err(FormatError::LimitExceeded("compressed save object bytes or memory".into()));

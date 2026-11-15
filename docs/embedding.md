@@ -41,15 +41,21 @@ PhotoCraft → host:
 | `dirty` | `dirty` (boolean) | Whenever the document's unsaved state changes, and once after `opened`. |
 | `document` | `name`, `revision`, `document` (an `ArrayBuffer`, transferred) | File › Save wrote the document: asked for by `save`, or the user's own File › Save. |
 | `save-failed` | `error` | `save` could not write the document. |
+| `snapshot-start` | `revision` | A recovery copy of that revision begins (below). |
+| `snapshot-part` | `revision`, `path` (a bundle object path, or `blobs/<blake3>.zst.part/<8-digit-hex-ordinal>` for a raw fragment), `data` (`ArrayBuffer`, transferred) | One compressed object or bounded raw blob fragment the host does not hold yet. |
+| `snapshot` | `revision`, `manifest` (`ArrayBuffer`, the bundle's `manifest.json`, transferred), `paths` (every object path it names), `parts` (how many this copy sent), `ms` (main-thread time of all its steps), `maxSliceMs` (its longest step), `slices` | The copy is complete: the host holds every object of `paths`, from this copy's `snapshot-part`s or earlier ones. |
+| `snapshot-failed` | `error` | A recovery copy could not be written. |
 | `start-failed` | `error` | The app could not start (the browser has neither WebGPU nor WebGL2). Nothing follows. |
 
 Host → PhotoCraft (post to `iframe.contentWindow` with `location.origin` as the target origin):
 
 | `type` | Fields | Effect |
 |---|---|---|
-| `open` | `name` (a plain `.pcraft` file name), `document` (`ArrayBuffer`), `fonts` (optional, `[{family, data: ArrayBuffer}]`) | Registers the fonts, then opens the document under `name`. File › Save writes it back in place, in PhotoCraft's own format. One document per app. |
+| `open` | `name` (a plain `.pcraft` file name), `document` (`ArrayBuffer`) or `parts` (`{manifest: ArrayBuffer, objects: [{path, data: ArrayBuffer}]}`, a recovery copy as the host kept it), `fonts` (optional, `[{family, data: ArrayBuffer}]`), `unsaved` (optional boolean) | Registers the fonts, then opens the document under `name`. File › Save writes it back in place, in PhotoCraft's own format. One document per app. `parts` are made into a bundle first; every object is checked against its content hash on the way in. With `unsaved: true` (a recovery copy) the document opens as unsaved changes: `dirty` is `true` from the start and only a save makes it saved. |
 | `save` | | File › Save on that document, whichever tab is active. Answered with `document` or `save-failed`. |
 | `saved` | `revision` | The host stored the document of that revision: it counts as saved (still unsaved if it was edited since). |
+| `snapshot` | | Start a recovery copy now if the document has changes no copy holds yet (for a page going hidden). |
+| `snapshot-reset` | | The host no longer holds the parts this app sent (its copy went, or a part could not be kept): the next copy sends every part again. |
 
 A typical host:
 
@@ -58,6 +64,40 @@ A typical host:
    "Leave site?" prompt is off in embed mode, so the user is asked once);
 3. on its own Save button posts `save`, stores the `document` it gets, and posts `saved` with that
    document's `revision`. The user's own File › Save arrives as `document` the same way.
+
+## Recovery copies
+
+A browser does not always let a page ask before it goes: WebKit closes a tab whose page has not
+answered within 50 ms without the "Leave site?" prompt, and a crash or a lost network asks
+nothing. So while the document has unsaved changes, PhotoCraft posts `snapshot`s the host can keep
+and hand back later:
+
+- A copy starts once the changes have rested for 2 s (three times as long as the last copy's
+  main-thread work, up to 15 s). A five-second pending-edit deadline keeps repeated edits from
+  restarting that wait indefinitely; it is checked between pointer gestures, so a copy never
+  starts during a drag. The host can ask for one at once (`snapshot`). A saved document gets none,
+  and a revision is not copied twice.
+- A copy targets one short step per frame, about 6 ms of main-thread time
+  (3 ms during a drag), each right after the browser has drawn a frame and never inside the
+  GUI's own frames, against the document as it was at the copy's revision (editing goes on). A
+  hidden page draws no frames and throttles its timers: there the steps run on a timer, 100 ms
+  each, so a copy the host asked for as its page went is done sooner.
+  Each step first hashes tiles and blobs whose hash the document's save cache does not know yet
+  (an interrupted step keeps completed hashes and partial blob hash state), then prepares records
+  the host does not hold, posting each as a `snapshot-part`. Blobs over 1 MiB are raw fragments
+  of at most 256 KiB; they are joined and zstd-encoded only on explicit Restore. Hash progress
+  includes partial blob work, so large blobs no longer force longer preparation steps. A document
+  traversal that makes no progress can still extend the budget; this is a target, not a hard
+  real-time guarantee. `snapshot` closes the copy with the manifest and every record path it
+  names. The host must commit that manifest last; before the first complete copy, recovery is
+  not available. A replacement leaves the previous complete copy recoverable.
+- Objects are content-addressed, so the host keeps each part as a record of its own: a small
+  edit after a complete copy sends only the tiles it changed. The host keeps the newest complete
+  copy per document and drops parts no copy names. It is never a save: `dirty` stays `true`.
+- The host drops the copy once the document is saved (the app then forgets what the host held)
+  or the user discards the changes. On the next open it offers it: `open` with the copy's
+  `parts` and `unsaved: true` restores the work as unsaved changes, which the user then saves the
+  normal way; the app counts the restored parts as held, so the next copy sends only changes.
 
 ## What embed mode changes
 

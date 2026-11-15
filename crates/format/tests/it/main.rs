@@ -10,5 +10,6 @@ mod frame_stroke;
 mod interrupt;
 mod interrupt_save;
 mod layer_labels;
+mod parts;
 mod roundtrip;
 mod smart_contents;

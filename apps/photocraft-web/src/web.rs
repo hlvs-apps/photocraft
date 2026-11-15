@@ -414,7 +414,7 @@ impl eframe::App for WebShell {
         }
         self.app.logic_frame(ctx, frame);
         if let Some(embed) = &mut self.embed {
-            embed.after_frame(&mut self.app);
+            embed.after_frame(&mut self.app, ctx);
         }
         self.save_presets(ctx);
         self.app.finish_type_reset_logic(ctx);
@@ -447,7 +447,7 @@ impl eframe::App for WebShell {
         self.app.ui_frame(ui, frame);
         // File › Save from a menu runs in this pass.
         if let Some(embed) = &mut self.embed {
-            embed.after_frame(&mut self.app);
+            embed.after_frame(&mut self.app, ui.ctx());
         }
         self.save_presets(ui.ctx());
         self.app.finish_type_reset_pass(ui.ctx());

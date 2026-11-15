@@ -61,7 +61,7 @@ pub mod pattern_map;
 mod pcraft_cache;
 pub mod pdf;
 mod pdn;
-pub use pcraft_cache::PcraftExportCache;
+pub use pcraft_cache::{PcraftExportCache, bundle_from_parts, compress_part};
 pub mod pixels;
 mod psd_export;
 mod psd_import;
