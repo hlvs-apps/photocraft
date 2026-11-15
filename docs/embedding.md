@@ -41,7 +41,8 @@ PhotoCraft → host:
 | `dirty` | `dirty` (boolean) | Whenever the document's unsaved state changes, and once after `opened`. |
 | `document` | `name`, `revision`, `document` (an `ArrayBuffer`, transferred) | File › Save wrote the document: asked for by `save`, or the user's own File › Save. |
 | `save-failed` | `error` | `save` could not write the document. |
-| `snapshot-start` | `revision` | A recovery copy of that revision begins (below). |
+| `snapshot-start` | `revision` | A recovery copy of that revision is queued (below). |
+| `snapshot-work` | `revision` | The pending GUI paint frames finished; copy work starts on the next turn. No hashing/compression/transfer runs before this marker. |
 | `snapshot-part` | `revision`, `path` (a bundle object path, or `blobs/<blake3>.zst.part/<8-digit-hex-ordinal>` for a raw fragment), `data` (`ArrayBuffer`, transferred) | One compressed object or bounded raw blob fragment the host does not hold yet. |
 | `snapshot` | `revision`, `manifest` (`ArrayBuffer`, the bundle's `manifest.json`, transferred), `paths` (every object path it names), `parts` (how many this copy sent), `ms` (main-thread time of all its steps), `maxSliceMs` (its longest step), `slices` | The copy is complete: the host holds every object of `paths`, from this copy's `snapshot-part`s or earlier ones. |
 | `snapshot-failed` | `error` | A recovery copy could not be written. |
@@ -80,7 +81,9 @@ and hand back later:
 - A copy targets one short step per frame, about 6 ms of main-thread time
   (3 ms during a drag), each right after the browser has drawn a frame and never inside the
   GUI's own frames, against the document as it was at the copy's revision (editing goes on). A
-  hidden page draws no frames and throttles its timers: there the steps run on a timer, 100 ms
+  new copy lets two pending GUI paint frames finish before any hashing, compression or transfer
+  (`snapshot-start` queues it, `snapshot-work` marks readiness, work starts on the next turn). A
+  hidden page skips that paint settling and throttles its timers: there the steps run on a timer, 100 ms
   each, so a copy the host asked for as its page went is done sooner.
   Each step first hashes tiles and blobs whose hash the document's save cache does not know yet
   (an interrupted step keeps completed hashes and partial blob hash state), then prepares records
@@ -98,6 +101,10 @@ and hand back later:
   or the user discards the changes. On the next open it offers it: `open` with the copy's
   `parts` and `unsaved: true` restores the work as unsaved changes, which the user then saves the
   normal way; the app counts the restored parts as held, so the next copy sends only changes.
+
+Snapshot messages also carry `at` (sender `performance.timeOrigin + performance.now()` in ms).
+A host subtracts its own `performance.timeOrigin` to measure the work window even if message
+delivery is delayed; this timestamp is diagnostic and does not enter the saved document.
 
 ## What embed mode changes
 

@@ -574,6 +574,7 @@ impl Embed {
             SnapshotStep::Wait(ms) => ctx.request_repaint_after(std::time::Duration::from_secs_f64(ms / 1000.0)),
             SnapshotStep::Snapshot => {
                 stepper.run = Some(SnapshotRun::new(st.doc.clone(), st.revision));
+                stepper.warmup_paints = Some(2);
                 stepper.cache = Some(st.pcraft_cache.clone());
                 let msg = message("snapshot-start");
                 set(&msg, "revision", &(st.revision as f64).into());
@@ -726,6 +727,8 @@ struct Stepper {
     pointer_down: bool,
     /// The document's revision the last frame saw.
     latest: u64,
+    /// Let pending GUI paint frames finish before starting background copy work.
+    warmup_paints: Option<u8>,
     /// A step is scheduled.
     scheduled: bool,
     /// How the last copy ended, for the schedule (read by the next frame).
@@ -811,6 +814,29 @@ fn page_hidden(window: &web_sys::Window) -> bool {
 /// One step of the copy under way ([`SnapshotRun::step`]), posting its parts, then the next.
 #[cfg(target_arch = "wasm32")]
 fn step_copy(stepper: Rc<RefCell<Stepper>>, host: Host, ctx: egui::Context) {
+    {
+        let mut s = stepper.borrow_mut();
+        s.scheduled = false;
+        let Some(run) = s.run.as_ref() else { return };
+        let revision = run.revision();
+        if let Some(left) = s.warmup_paints {
+            // A heavy edit can leave another expensive GUI paint pending after its first frame.
+            // Do no hashing, compression or transfers in these two paint turns. Hidden pages
+            // have no paint to wait for and begin immediately through the timer fallback.
+            let announce = left <= 1 || web_sys::window().is_some_and(|w| page_hidden(&w));
+            s.warmup_paints = if announce { None } else { Some(left - 1) };
+            drop(s);
+            if announce {
+                let msg = message("snapshot-work");
+                set(&msg, "revision", &(revision as f64).into());
+                host.post(&msg, None);
+            }
+            // Announce before the next turn performs any work: hosts can measure actual copy
+            // work separately from the GUI paints, without omitting a copy's first slice.
+            schedule_step(stepper, host, ctx);
+            return;
+        }
+    }
     let step = {
         let mut guard = stepper.borrow_mut();
         let Stepper { run, cache, known, pointer_down, scheduled, .. } = &mut *guard;
@@ -876,6 +902,13 @@ fn step_copy(stepper: Rc<RefCell<Stepper>>, host: Host, ctx: egui::Context) {
 #[cfg(target_arch = "wasm32")]
 impl Host {
     fn post(&self, msg: &js_sys::Object, transfer: Option<&js_sys::Array>) {
+        if js_sys::Reflect::get(msg, &"type".into()).ok().and_then(|v| v.as_string()).is_some_and(|kind| kind.starts_with("snapshot"))
+            && let Some(performance) = web_sys::window().and_then(|w| w.performance())
+        {
+            // Sender time, not delayed parent delivery time. A host aligns it with its own
+            // performance.timeOrigin to include the complete work interval in frame measurements.
+            set(msg, "at", &(performance.time_origin() + performance.now()).into());
+        }
         let posted = match transfer {
             Some(t) => self.parent.post_message_with_transfer(msg, &self.origin, t),
             None => self.parent.post_message(msg, &self.origin),
