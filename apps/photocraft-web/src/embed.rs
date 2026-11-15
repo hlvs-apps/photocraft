@@ -6,12 +6,15 @@
 //! - `open {name, document, fonts}`: the `.pcraft` to edit (an `ArrayBuffer`) under the file name
 //!   File › Save writes back to, and the font files its text uses (`[{family, data}]`), which are
 //!   registered first so the document opens without missing-font warnings.
-//!   With `unsaved: true` (a recovery copy the host kept, below) the document opens as unsaved
-//!   changes: closing asks, and only a save makes it saved.
+//!   Instead of `document`, `parts {manifest, objects: [{path, data}]}`: a recovery copy as the
+//!   host kept it (below), made into a bundle and checked object by object on the way in.
+//!   With `unsaved: true` (a recovery copy) the document opens as unsaved changes: closing asks,
+//!   and only a save makes it saved.
 //! - `save`: File › Save on that document.
 //! - `saved {revision}`: the host stored the document of that revision; it counts as saved.
-//! - `snapshot`: post a `snapshot` now if the document has changes no snapshot holds yet (the host
-//!   asks when its page is hidden).
+//! - `snapshot`: start a recovery copy now if the document has changes no copy holds yet (the
+//!   host asks when its page is hidden).
+//! - `snapshot-reset`: the host no longer holds the parts this app sent; the next copy sends all.
 //!
 //! App → host, to `window.parent`:
 //! - `ready {pcraft, rev, version}`: the app runs and waits for `open`; `pcraft` is the `.pcraft`
@@ -21,14 +24,16 @@
 //! - `document {name, revision, document}`: File › Save wrote it (asked for by `save`, or the
 //!   user's own File › Save); the `ArrayBuffer` is transferred.
 //! - `save-failed {error}`.
-//! - `snapshot {revision, document, ms}`: the document with its unsaved changes, for the host to
-//!   keep as a recovery copy and hand back with `open {unsaved: true}` if the page goes away
-//!   unsaved (a crash, a lost network, a tab the browser closes without asking). Posted once the
-//!   changes have rested for [`SNAPSHOT_QUIET_MS`] (longer after a slow snapshot, never during a
-//!   pointer drag) and on `snapshot`; written from the document's own save cache without previews,
-//!   so after the first one only the changed tiles are compressed (`ms`: what it took). It is never
-//!   a save: the document stays unsaved.
-//! - `snapshot-failed {error}`: a snapshot could not be written.
+//! - `snapshot-start {revision}`, then `snapshot-part {revision, path, data}` for each object the
+//!   host does not hold yet, then `snapshot {revision, manifest, paths, parts, ms, maxSliceMs,
+//!   slices}`: a recovery copy of the document with its unsaved changes, for the host to keep and
+//!   hand back with `open {parts, unsaved: true}` if the page goes away unsaved (a crash, a lost
+//!   network, a tab the browser closes without asking). A copy starts once the changes have rested
+//!   for [`SNAPSHOT_QUIET_MS`] (see [`SnapshotSchedule`]) and on `snapshot`, and is written a
+//!   [`SnapshotRun`] step per frame of about [`SNAPSHOT_SLICE_MS`], so it never stalls the GUI;
+//!   objects are content-addressed, so a small edit sends only the tiles it changed. It is never a
+//!   save: the document stays unsaved.
+//! - `snapshot-failed {error}`: a copy could not be written.
 //! - `start-failed {error}`: the app could not start (no WebGPU or WebGL2); nothing else follows.
 //!
 //! Every message is a plain object with `photocraftEmbed: 1` and a `type`. Only messages from the
@@ -116,10 +121,19 @@ pub type DocumentName = Rc<RefCell<Option<String>>>;
 #[cfg(target_arch = "wasm32")]
 #[derive(Debug)]
 pub enum Command {
-    Open { name: String, document: Vec<u8>, fonts: Vec<(String, Vec<u8>)>, unsaved: bool },
+    Open { name: String, document: Opened, fonts: Vec<(String, Vec<u8>)>, unsaved: bool },
     Save,
     Saved { revision: u64 },
     Snapshot,
+    SnapshotReset,
+}
+
+/// What `open` hands over: a `.pcraft`, or a recovery copy as the parts the host kept.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug)]
+pub enum Opened {
+    Bundle(Vec<u8>),
+    Parts { manifest: Vec<u8>, objects: Vec<(String, Vec<u8>)> },
 }
 
 /// How long the document's changes rest before a recovery snapshot is posted.
@@ -213,6 +227,141 @@ impl SnapshotSchedule {
     }
 }
 
+/// Main-thread time one recovery copy step may take per frame (a frame is 16.7 ms; the GUI draws
+/// in the rest).
+pub const SNAPSHOT_SLICE_MS: f64 = 6.0;
+/// The same during a pointer drag, when the GUI's own frames are busiest.
+pub const SNAPSHOT_DRAG_SLICE_MS: f64 = 3.0;
+const _: () = assert!(SNAPSHOT_DRAG_SLICE_MS < SNAPSHOT_SLICE_MS, "a drag gets the smaller step");
+
+/// What a recovery copy step did ([`SnapshotRun::step`]).
+#[derive(Debug)]
+pub enum RunStep {
+    /// More steps are needed (call again next frame).
+    Continue,
+    /// The copy is complete: every part the host lacked was posted.
+    Done(Finished),
+    /// The copy could not be written.
+    Failed(String),
+}
+
+/// A complete recovery copy: the manifest and every part it names.
+#[derive(Debug)]
+pub struct Finished {
+    pub revision: u64,
+    pub manifest: Vec<u8>,
+    pub paths: Vec<String>,
+    /// How many parts this copy posted (the rest the host held already).
+    pub parts: usize,
+    /// Main-thread time of all its steps, the longest step, and how many there were.
+    pub work_ms: f64,
+    pub max_slice_ms: f64,
+    pub slices: u32,
+}
+
+/// One recovery copy of one revision, written a slice per frame so the GUI never stalls: the
+/// document is frozen (an `Arc` of it; editing goes on copy-on-write), its tiles and blobs are
+/// hashed with a time budget that resumes where it stopped, and only the parts the host does not
+/// hold yet are compressed, one at a time, and posted as they are made.
+pub struct SnapshotRun {
+    revision: u64,
+    doc: std::sync::Arc<photocraft_doc::Document>,
+    parts: Option<photocraft_format::Parts>,
+    next: usize,
+    sent: std::collections::HashSet<String>,
+    /// The budget of the next step when the last one could not get further (an object too
+    /// large for one step: doubled until it fits, so the copy always completes).
+    stretched_ms: f64,
+    /// A running estimate of one part's compression time.
+    part_ms: f64,
+    work_ms: f64,
+    max_slice_ms: f64,
+    slices: u32,
+}
+
+impl SnapshotRun {
+    pub fn new(doc: std::sync::Arc<photocraft_doc::Document>, revision: u64) -> Self {
+        Self { revision, doc, parts: None, next: 0, sent: Default::default(), stretched_ms: 0.0, part_ms: 0.0, work_ms: 0.0, max_slice_ms: 0.0, slices: 0 }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// One step of about `budget_ms` on the clock `now` (ms): hashing first, then the parts the
+    /// host does not hold (`known`), each posted with `post` as soon as it is compressed.
+    pub fn step(
+        &mut self,
+        cache: &photocraft_io::PcraftExportCache,
+        known: &std::collections::HashSet<String>,
+        budget_ms: f64,
+        now: &(dyn Fn() -> f64 + Sync),
+        post: &mut dyn FnMut(&str, Vec<u8>),
+    ) -> RunStep {
+        let start = now();
+        let deadline = start + budget_ms.max(self.stretched_ms);
+        if self.parts.is_none() {
+            let over = || now() >= deadline;
+            match cache.prepare_parts_until(&self.doc, &over) {
+                (Ok(parts), _) => {
+                    self.parts = Some(parts);
+                    self.stretched_ms = 0.0;
+                }
+                (Err(photocraft_format::FormatError::Cancelled(_)), progressed) => {
+                    self.stretched_ms = if progressed { 0.0 } else { (budget_ms.max(self.stretched_ms)) * 2.0 };
+                    self.account(now() - start);
+                    return RunStep::Continue;
+                }
+                (Err(e), _) => return RunStep::Failed(e.to_string()),
+            }
+        }
+        let Some(parts) = self.parts.as_ref() else { return RunStep::Continue };
+        let mut compressed = false;
+        while let Some(path) = parts.path(self.next) {
+            if known.contains(path) || self.sent.contains(path) {
+                self.next += 1;
+                continue;
+            }
+            // At least one part per step, then only while the next one is likely to fit.
+            if compressed && now() + self.part_ms > deadline {
+                break;
+            }
+            let t = now();
+            let data = match photocraft_io::compress_part(parts, self.next) {
+                Ok(data) => data,
+                Err(e) => return RunStep::Failed(e.to_string()),
+            };
+            let took = now() - t;
+            self.part_ms = if self.part_ms == 0.0 { took } else { self.part_ms * 0.7 + took * 0.3 };
+            post(path, data);
+            self.sent.insert(path.to_owned());
+            self.next += 1;
+            compressed = true;
+        }
+        let complete = parts.path(self.next).is_none();
+        self.account(now() - start);
+        if !complete {
+            return RunStep::Continue;
+        }
+        let Some(parts) = self.parts.take() else { return RunStep::Continue };
+        RunStep::Done(Finished {
+            revision: self.revision,
+            manifest: parts.manifest().to_vec(),
+            paths: parts.paths().map(str::to_owned).collect(),
+            parts: self.sent.len(),
+            work_ms: self.work_ms,
+            max_slice_ms: self.max_slice_ms,
+            slices: self.slices,
+        })
+    }
+
+    fn account(&mut self, slice_ms: f64) {
+        self.work_ms += slice_ms;
+        self.max_slice_ms = self.max_slice_ms.max(slice_ms);
+        self.slices += 1;
+    }
+}
+
 /// The writer of embed mode (`Services::write`): the host's document is handed over in
 /// `written`, any other write fails.
 pub fn writer(name: DocumentName, written: Written) -> impl FnMut(&str, &[u8]) -> Result<(), String> {
@@ -252,6 +401,11 @@ pub struct Embed {
     frame_saved: u64,
     /// The host's `open` asked for the document to open unsaved (a recovery copy).
     open_unsaved: bool,
+    /// The parts the host holds for this document's recovery copy (the last complete copy's): a
+    /// later copy posts only the others.
+    known: std::collections::HashSet<String>,
+    /// The recovery copy being written, a step per frame.
+    run: Option<SnapshotRun>,
     /// When the next recovery snapshot is due.
     snapshots: SnapshotSchedule,
 }
@@ -297,6 +451,8 @@ impl Embed {
             dirty: None,
             frame_saved: 0,
             open_unsaved: false,
+            known: Default::default(),
+            run: None,
             snapshots: SnapshotSchedule::default(),
         };
         Some((embed, name, written))
@@ -318,11 +474,29 @@ impl Embed {
             match command {
                 Command::Open { name, document, fonts, unsaved } => {
                     self.open_unsaved = unsaved;
-                    self.open(app, &name, &document, fonts);
+                    let document = match document {
+                        Opened::Bundle(bytes) => Ok(bytes),
+                        Opened::Parts { manifest, objects } => {
+                            // The host holds these parts: a copy of this document posts only the
+                            // others.
+                            self.known = objects.iter().map(|(path, _)| path.clone()).collect();
+                            photocraft_io::bundle_from_parts(&manifest, &objects).map_err(|e| e.to_string())
+                        }
+                    };
+                    match document {
+                        Ok(bytes) => self.open(app, &name, &bytes, fonts),
+                        Err(e) => self.open_failed(e),
+                    }
                 }
                 Command::Save => self.save(app, ctx),
                 Command::Saved { revision } => self.saved(app, revision),
                 Command::Snapshot => self.snapshots.request(),
+                Command::SnapshotReset => {
+                    // The host no longer holds what this app sent: the next copy sends it all.
+                    self.known.clear();
+                    self.run = None;
+                    self.snapshots.request();
+                }
             }
         }
         self.frame_saved = self.state(app).map_or(0, |st| st.saved_revision);
@@ -362,38 +536,74 @@ impl Embed {
         self.snapshot_tick(app, ctx);
     }
 
-    /// Posts a recovery snapshot when [`SnapshotSchedule`] says one is due, else wakes the next
-    /// frame when it will be.
+    /// Writes recovery copies: starts one when [`SnapshotSchedule`] says one is due, then a
+    /// [`SnapshotRun`] step per frame (about [`SNAPSHOT_SLICE_MS`]) until it is complete, waking
+    /// the next frame as long as one is under way.
     fn snapshot_tick(&mut self, app: &PhotocraftApp, ctx: &egui::Context) {
         let Some(st) = self.state(app) else { return };
         let now = ctx.input(|input| input.time * 1000.0);
         let pointer_down = ctx.input(|i| i.pointer.any_down());
-        match self.snapshots.frame(now, st.is_dirty(), st.revision, pointer_down) {
-            SnapshotStep::Idle => {}
-            SnapshotStep::Wait(ms) => ctx.request_repaint_after(std::time::Duration::from_secs_f64(ms / 1000.0)),
-            SnapshotStep::Snapshot => {
-                let revision = st.revision;
-                let started = js_sys::Date::now();
-                match st.pcraft_cache.snapshot(&st.doc) {
-                    Ok(bytes) => {
-                        let took = js_sys::Date::now() - started;
-                        self.snapshots.posted(revision, took);
-                        let data = js_sys::Uint8Array::from(bytes.as_slice());
-                        let buffer = data.buffer();
-                        let msg = message("snapshot");
-                        set(&msg, "revision", &(revision as f64).into());
-                        set(&msg, "document", &buffer);
-                        set(&msg, "ms", &took.round().into());
-                        self.host.post(&msg, Some(&js_sys::Array::of1(&buffer)));
-                    }
-                    Err(e) => {
-                        self.snapshots.failed(revision);
-                        log::error!("photocraft-web: recovery snapshot: {e}");
-                        let msg = message("snapshot-failed");
-                        set(&msg, "error", &e.to_string().into());
-                        self.host.post(&msg, None);
-                    }
+        if !st.is_dirty() {
+            // Saved: the host drops its copy with the save, so nothing it held counts any more.
+            self.run = None;
+            self.known.clear();
+            self.snapshots.frame(now, false, st.revision, pointer_down);
+            return;
+        }
+        if self.run.is_none() {
+            match self.snapshots.frame(now, true, st.revision, pointer_down) {
+                SnapshotStep::Idle => return,
+                SnapshotStep::Wait(ms) => {
+                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(ms / 1000.0));
+                    return;
                 }
+                SnapshotStep::Snapshot => {
+                    self.run = Some(SnapshotRun::new(st.doc.clone(), st.revision));
+                    let msg = message("snapshot-start");
+                    set(&msg, "revision", &(st.revision as f64).into());
+                    self.host.post(&msg, None);
+                }
+            }
+        }
+        let Some(run) = self.run.as_mut() else { return };
+        let budget = if pointer_down { SNAPSHOT_DRAG_SLICE_MS } else { SNAPSHOT_SLICE_MS };
+        let host = &self.host;
+        let revision = run.revision();
+        let mut post = |path: &str, data: Vec<u8>| {
+            let array = js_sys::Uint8Array::from(data.as_slice());
+            let buffer = array.buffer();
+            let msg = message("snapshot-part");
+            set(&msg, "revision", &(revision as f64).into());
+            set(&msg, "path", &path.into());
+            set(&msg, "data", &buffer);
+            host.post(&msg, Some(&js_sys::Array::of1(&buffer)));
+        };
+        match run.step(&st.pcraft_cache, &self.known, budget, &js_sys::Date::now, &mut post) {
+            RunStep::Continue => ctx.request_repaint(),
+            RunStep::Done(done) => {
+                self.run = None;
+                self.snapshots.posted(done.revision, done.work_ms);
+                let manifest = js_sys::Uint8Array::from(done.manifest.as_slice()).buffer();
+                let msg = message("snapshot");
+                set(&msg, "revision", &(done.revision as f64).into());
+                set(&msg, "manifest", &manifest);
+                set(&msg, "paths", &strings(&done.paths));
+                set(&msg, "parts", &(done.parts as f64).into());
+                set(&msg, "ms", &done.work_ms.round().into());
+                set(&msg, "maxSliceMs", &done.max_slice_ms.round().into());
+                set(&msg, "slices", &done.slices.into());
+                self.host.post(&msg, Some(&js_sys::Array::of1(&manifest)));
+                self.known = done.paths.into_iter().collect();
+                // A newer revision may be due already.
+                ctx.request_repaint();
+            }
+            RunStep::Failed(error) => {
+                self.run = None;
+                self.snapshots.failed(revision);
+                log::error!("photocraft-web: recovery copy: {error}");
+                let msg = message("snapshot-failed");
+                set(&msg, "error", &error.into());
+                self.host.post(&msg, None);
             }
         }
     }
@@ -450,6 +660,13 @@ impl Embed {
             Ok(_) => self.save_failed("the document was not written (a prompt may be waiting in PhotoCraft)".into()),
             Err(e) => self.save_failed(e),
         }
+    }
+
+    fn open_failed(&self, error: String) {
+        log::error!("photocraft-web: open: {error}");
+        let msg = message("open-failed");
+        set(&msg, "error", &error.into());
+        self.host.post(&msg, None);
     }
 
     fn save_failed(&self, error: String) {
@@ -589,7 +806,20 @@ fn command(data: &wasm_bindgen::JsValue) -> Result<Option<Command>, String> {
     match field("type").as_string().as_deref() {
         Some("open") => {
             let name = field("name").as_string().ok_or("open needs a name")?;
-            let document = bytes(field("document"), "open's document")?;
+            let parts = field("parts");
+            let document = if parts.is_object() {
+                let manifest = bytes(Reflect::get(&parts, &"manifest".into()).unwrap_or(wasm_bindgen::JsValue::UNDEFINED), "open's parts manifest")?;
+                let list = Reflect::get(&parts, &"objects".into()).ok().and_then(|l| l.dyn_into::<js_sys::Array>().ok()).ok_or("open's parts need objects")?;
+                let mut objects = Vec::with_capacity(list.length() as usize);
+                for part in list.iter() {
+                    let path = Reflect::get(&part, &"path".into()).ok().and_then(|p| p.as_string()).ok_or("a part needs a path")?;
+                    let data = bytes(Reflect::get(&part, &"data".into()).unwrap_or(wasm_bindgen::JsValue::UNDEFINED), "a part's data")?;
+                    objects.push((path, data));
+                }
+                Opened::Parts { manifest, objects }
+            } else {
+                Opened::Bundle(bytes(field("document"), "open's document")?)
+            };
             let mut fonts = Vec::new();
             if let Ok(list) = field("fonts").dyn_into::<js_sys::Array>() {
                 for font in list.iter() {
@@ -603,6 +833,7 @@ fn command(data: &wasm_bindgen::JsValue) -> Result<Option<Command>, String> {
         }
         Some("save") => Ok(Some(Command::Save)),
         Some("snapshot") => Ok(Some(Command::Snapshot)),
+        Some("snapshot-reset") => Ok(Some(Command::SnapshotReset)),
         Some("saved") => {
             let revision = field("revision").as_f64().filter(|r| r.is_finite() && *r >= 0.0 && r.fract() == 0.0).ok_or("saved needs a revision")?;
             Ok(Some(Command::Saved { revision: revision as u64 }))
@@ -729,5 +960,85 @@ mod tests {
         s.frame(9_200.0, false, 6, false);
         assert_eq!(s.frame(9_300.0, true, 6, false), SnapshotStep::Wait(SNAPSHOT_QUIET_MS));
         assert_eq!(s.frame(11_300.0, true, 6, false), SnapshotStep::Snapshot);
+    }
+
+    /// A 700×300 raster document whose 3×2 tiles all differ.
+    fn tiled_document() -> photocraft_doc::Document {
+        use photocraft_doc::{ColorMode, Document, Layer, LayerContent, Rect, SampleType, Size, Surface};
+        let mut doc = Document::new("copy", Size::new(700, 300), ColorMode::Rgb, SampleType::U8);
+        let mut surface = Surface::new(doc.pixel_format());
+        for ty in 0..2i32 {
+            for tx in 0..3i32 {
+                let shade = (ty * 3 + tx) as f32 / 8.0;
+                let rect = Rect::from_xywh(tx * 256, ty * 256, (700 - tx * 256).min(256) as u32, (300 - ty * 256).min(256) as u32);
+                let n = (rect.width() * rect.height()) as usize;
+                surface.try_write_region(rect, &[shade, 0.4, 1.0 - shade, 1.0].repeat(n)).unwrap();
+            }
+        }
+        doc.layers.push(Layer::new("pixels", LayerContent::Raster(surface)));
+        doc
+    }
+
+    /// Runs `run` to completion with a clock that moves 1 ms each time it is read; the parts it
+    /// posted, how many steps it took, and what it finished with.
+    fn run_to_end(
+        run: &mut SnapshotRun,
+        cache: &photocraft_io::PcraftExportCache,
+        known: &std::collections::HashSet<String>,
+        budget: f64,
+    ) -> (Vec<(String, Vec<u8>)>, u32, Finished) {
+        let ticks = std::sync::atomic::AtomicU64::new(0);
+        let now = || ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as f64;
+        let mut posted = Vec::new();
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            assert!(steps < 10_000, "a copy must complete");
+            match run.step(cache, known, budget, &now, &mut |path, data| posted.push((path.to_owned(), data))) {
+                RunStep::Continue => {}
+                RunStep::Done(done) => return (posted, steps, done),
+                RunStep::Failed(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_recovery_copy_is_written_in_small_steps_and_sends_only_what_the_host_lacks() {
+        let mut doc = tiled_document();
+        let cache = photocraft_io::PcraftExportCache::default();
+        let mut run = SnapshotRun::new(std::sync::Arc::new(doc.clone()), 3);
+        let (posted, steps, done) = run_to_end(&mut run, &cache, &Default::default(), SNAPSHOT_SLICE_MS);
+        assert!(steps > 2, "hashing and six tiles do not fit one {SNAPSHOT_SLICE_MS} ms step: {steps} steps");
+        assert_eq!(done.revision, 3);
+        assert_eq!(done.parts, posted.len());
+        assert_eq!(posted.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), done.paths, "every part once, in bundle order");
+        assert_eq!(done.slices, steps);
+        assert!(done.work_ms >= done.max_slice_ms && done.max_slice_ms > 0.0, "{} ms over {} steps, longest {}", done.work_ms, steps, done.max_slice_ms);
+        let bundle = photocraft_io::bundle_from_parts(&done.manifest, &posted).unwrap();
+        assert_eq!(photocraft_format::load_from_bytes(&bundle).unwrap(), doc);
+
+        // One pixel later: the host holds the first copy's parts, so only the edited tile is sent.
+        doc.layers[0].surface_mut().unwrap().write_pixel(5, 5, &[1.0, 0.0, 0.0, 1.0]);
+        let known: std::collections::HashSet<String> = done.paths.iter().cloned().collect();
+        let mut again = SnapshotRun::new(std::sync::Arc::new(doc.clone()), 4);
+        assert_eq!(again.revision(), 4);
+        let (more, _, next) = run_to_end(&mut again, &cache, &known, SNAPSHOT_SLICE_MS);
+        assert_eq!(more.len(), 1, "only the edited tile: {:?}", more.iter().map(|(p, _)| p).collect::<Vec<_>>());
+        assert_eq!(next.parts, 1);
+        let mut objects: Vec<_> = posted.into_iter().filter(|(p, _)| next.paths.contains(p)).collect();
+        objects.extend(more);
+        let bundle = photocraft_io::bundle_from_parts(&next.manifest, &objects).unwrap();
+        assert_eq!(photocraft_format::load_from_bytes(&bundle).unwrap(), doc);
+    }
+
+    #[test]
+    fn an_object_larger_than_one_step_still_gets_its_copy_written() {
+        // A step budget far below what hashing one tile takes on this clock: the budget doubles
+        // while a step gets no further, so the copy completes anyway.
+        let doc = std::sync::Arc::new(tiled_document());
+        let cache = photocraft_io::PcraftExportCache::default();
+        let mut run = SnapshotRun::new(doc, 1);
+        let (posted, _, done) = run_to_end(&mut run, &cache, &Default::default(), 0.5);
+        assert_eq!(posted.len(), done.paths.len());
     }
 }

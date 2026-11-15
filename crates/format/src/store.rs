@@ -516,6 +516,108 @@ fn tile_le(t: &Tile, sample: SampleType) -> std::borrow::Cow<'_, [u8]> {
     }
 }
 
+/// Objects larger than this go into a snapshot part uncompressed ([`Parts::compress`]).
+pub const PARTS_RAW_BYTES: usize = 1 << 20;
+
+/// A recovery snapshot as separate parts ([`PcraftWriter::prepare_parts`]): the bundle's
+/// manifest and the content-addressed objects it names. Each object is compressed on its own,
+/// exactly as a bundle stores it (`tiles/<blake3>.zst`, `blobs/<blake3>.zst`), so a host can keep
+/// every object as a record of its own, a later snapshot adds only the objects that changed, and
+/// [`bundle_from_parts`] makes a bundle of them again. No previews.
+pub struct Parts {
+    manifest: Vec<u8>,
+    objects: Vec<(String, Object)>,
+}
+
+impl Parts {
+    /// The bundle's `manifest.json`.
+    pub fn manifest(&self) -> &[u8] {
+        &self.manifest
+    }
+
+    /// How many objects the manifest names.
+    pub fn len(&self) -> usize {
+        self.objects.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
+    /// Object `i`'s bundle path, or `None` past the end.
+    pub fn path(&self, i: usize) -> Option<&str> {
+        self.objects.get(i).map(|(path, _)| path.as_str())
+    }
+
+    /// Every object's bundle path, in bundle order.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.objects.iter().map(|(path, _)| path.as_str())
+    }
+
+    /// Object `i` as a bundle stores it: a zstd frame. One object is at most one 256×256 tile or
+    /// one blob, so a caller with a time budget compresses one per step. A blob over
+    /// [`PARTS_RAW_BYTES`] (an embedded encoded image, a smart object: already compressed, as a
+    /// rule) goes into the frame uncompressed, which costs a copy instead of a slow pass.
+    pub fn compress(&self, i: usize, ctl: &Interrupt) -> Result<Vec<u8>> {
+        let (_, object) = self.objects.get(i).ok_or_else(|| FormatError::corrupt("no such snapshot part"))?;
+        let level = if object.content().len() > PARTS_RAW_BYTES {
+            ruzstd::encoding::CompressionLevel::Uncompressed
+        } else {
+            ruzstd::encoding::CompressionLevel::Fastest
+        };
+        object.compressed_at(level, usize::MAX, ctl)
+    }
+}
+
+impl PcraftWriter {
+    /// How many tile and blob hashes this writer remembers (it never forgets a live one):
+    /// a caller that interrupted [`Self::prepare_parts`] sees from it whether the call got further.
+    pub fn known_hashes(&self) -> usize {
+        self.hash_cache.len() + self.blob_hash_cache.len()
+    }
+
+    /// Prepares `doc` as [`Parts`]: walks it and hashes the tiles and blobs whose hash this writer
+    /// does not know yet (it remembers those of earlier saves and snapshots of the same
+    /// allocations). Cooperative: when `ctl` trips it returns [`FormatError::Cancelled`] and keeps
+    /// every hash it finished, so the next call resumes where this one stopped; a caller with a
+    /// time budget per frame calls it again until it returns the parts. Nothing is compressed.
+    pub fn prepare_parts(&mut self, doc: &Document, limits: &SaveLimits, ctl: &Interrupt) -> Result<Parts> {
+        let p = self.prepare_interruptible(doc, &SaveOptions::default(), limits, ctl)?;
+        Ok(Parts { manifest: p.manifest, objects: p.objects.into_iter().collect() })
+    }
+}
+
+/// Is `path` a bundle object path: `tiles/` or `blobs/`, a BLAKE3 hash in lowercase hex, `.zst`?
+fn is_object_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("tiles/").or_else(|| path.strip_prefix("blobs/")) else { return false };
+    let Some(hash) = rest.strip_suffix(".zst") else { return false };
+    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A `.pcraft` ZIP of parts: `manifest` and the compressed objects it names, as [`Parts`] makes
+/// them. Every object must sit at a bundle object path, once. Loading the bundle checks each
+/// object it reads against its content hash, as every load does, so a damaged part is refused
+/// there rather than opened.
+pub fn bundle_from_parts(manifest: &[u8], objects: &[(String, Vec<u8>)], ctl: &Interrupt) -> Result<Vec<u8>> {
+    let mut seen = std::collections::HashSet::new();
+    for (path, _) in objects {
+        ctl.check()?;
+        if !is_object_path(path) {
+            return Err(FormatError::corrupt(format!("not a bundle object path: {path:?}")));
+        }
+        if !seen.insert(path.as_str()) {
+            return Err(FormatError::corrupt(format!("snapshot part {path:?} twice")));
+        }
+    }
+    let entries = std::iter::once((MANIFEST, manifest.len())).chain(objects.iter().map(|(path, data)| (path.as_str(), data.len())));
+    let mut z = ZipWriter::with_entries(entries, usize::MAX, ctl)?;
+    z.add_interruptible(MANIFEST, manifest, ctl)?;
+    for (path, data) in objects {
+        z.add_interruptible(path, data, ctl)?;
+    }
+    z.finish_interruptible(ctl)
+}
+
 /// Default for [`PcraftWriter::set_reverify_budget`]: compressed bytes of already-verified
 /// objects re-read per directory save.
 pub const DEFAULT_REVERIFY_BUDGET: u64 = 16 * 1024 * 1024;
@@ -1021,12 +1123,13 @@ impl PcraftWriter {
 
     fn prepare_interruptible(&mut self, doc: &Document, opts: &SaveOptions, limits: &SaveLimits, ctl: &Interrupt) -> Result<Prepared> {
         ctl.check()?;
-        // extract_if can stop early, unlike retain. Losing a reuse entry on cancellation
-        // changes only the cache, never the document or archive.
-        for _ in self.hash_cache.extract_if(|_, (w, _)| ctl.cancelled() || w.strong_count() == 0) {
+        // Only hashes of freed allocations go. A live one stays even when `ctl` trips here: an
+        // interrupted prepare keeps every hash it has, so the next call resumes
+        // (`prepare_parts` under a per-frame time budget relies on it).
+        for _ in self.hash_cache.extract_if(|_, (w, _)| w.strong_count() == 0) {
             ctl.check()?;
         }
-        for _ in self.blob_hash_cache.extract_if(|_, (w, _)| ctl.cancelled() || w.strong_count() == 0) {
+        for _ in self.blob_hash_cache.extract_if(|_, (w, _)| w.strong_count() == 0) {
             ctl.check()?;
         }
         convert::check_nesting(&doc.layers, ctl)?;
@@ -1661,12 +1764,16 @@ impl Write for CompressionOutput<'_> {
 }
 impl Object {
     fn compressed_with(&self, max: usize, ctl: &Interrupt) -> Result<Vec<u8>> {
+        self.compressed_at(ruzstd::encoding::CompressionLevel::Fastest, max, ctl)
+    }
+
+    fn compressed_at(&self, level: ruzstd::encoding::CompressionLevel, max: usize, ctl: &Interrupt) -> Result<Vec<u8>> {
         ctl.check()?;
         let bytes = self.content();
         let full = std::cell::Cell::new(false);
         let source = CompressionSource { bytes: &bytes, ctl: *ctl, full: &full };
         let mut output = CompressionOutput { bytes: Vec::new(), max, full: &full };
-        ruzstd::encoding::compress(source, &mut output, ruzstd::encoding::CompressionLevel::Fastest);
+        ruzstd::encoding::compress(source, &mut output, level);
         ctl.check()?;
         if full.get() {
             return Err(FormatError::LimitExceeded("compressed save object bytes or memory".into()));

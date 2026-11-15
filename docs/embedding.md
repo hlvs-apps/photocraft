@@ -41,7 +41,9 @@ PhotoCraft → host:
 | `dirty` | `dirty` (boolean) | Whenever the document's unsaved state changes, and once after `opened`. |
 | `document` | `name`, `revision`, `document` (an `ArrayBuffer`, transferred) | File › Save wrote the document: asked for by `save`, or the user's own File › Save. |
 | `save-failed` | `error` | `save` could not write the document. |
-| `snapshot` | `revision`, `document` (an `ArrayBuffer`, transferred), `ms` (what writing it took) | A recovery copy of the document with its unsaved changes (below). |
+| `snapshot-start` | `revision` | A recovery copy of that revision begins (below). |
+| `snapshot-part` | `revision`, `path` (a bundle object path, `tiles/<blake3>.zst` or `blobs/<blake3>.zst`), `data` (`ArrayBuffer`, transferred) | One object of the copy the host does not hold yet, as the bundle stores it. |
+| `snapshot` | `revision`, `manifest` (`ArrayBuffer`, the bundle's `manifest.json`, transferred), `paths` (every object path it names), `parts` (how many this copy sent), `ms` (main-thread time of all its steps), `maxSliceMs` (its longest step), `slices` | The copy is complete: the host holds every object of `paths`, from this copy's `snapshot-part`s or earlier ones. |
 | `snapshot-failed` | `error` | A recovery copy could not be written. |
 | `start-failed` | `error` | The app could not start (the browser has neither WebGPU nor WebGL2). Nothing follows. |
 
@@ -49,10 +51,11 @@ Host → PhotoCraft (post to `iframe.contentWindow` with `location.origin` as th
 
 | `type` | Fields | Effect |
 |---|---|---|
-| `open` | `name` (a plain `.pcraft` file name), `document` (`ArrayBuffer`), `fonts` (optional, `[{family, data: ArrayBuffer}]`), `unsaved` (optional boolean) | Registers the fonts, then opens the document under `name`. File › Save writes it back in place, in PhotoCraft's own format. One document per app. With `unsaved: true` (a recovery copy) the document opens as unsaved changes: `dirty` is `true` from the start and only a save makes it saved. |
+| `open` | `name` (a plain `.pcraft` file name), `document` (`ArrayBuffer`) or `parts` (`{manifest: ArrayBuffer, objects: [{path, data: ArrayBuffer}]}`, a recovery copy as the host kept it), `fonts` (optional, `[{family, data: ArrayBuffer}]`), `unsaved` (optional boolean) | Registers the fonts, then opens the document under `name`. File › Save writes it back in place, in PhotoCraft's own format. One document per app. `parts` are made into a bundle first; every object is checked against its content hash on the way in. With `unsaved: true` (a recovery copy) the document opens as unsaved changes: `dirty` is `true` from the start and only a save makes it saved. |
 | `save` | | File › Save on that document, whichever tab is active. Answered with `document` or `save-failed`. |
 | `saved` | `revision` | The host stored the document of that revision: it counts as saved (still unsaved if it was edited since). |
-| `snapshot` | | Post a `snapshot` now if the document has changes no snapshot holds yet (for a page going hidden). |
+| `snapshot` | | Start a recovery copy now if the document has changes no copy holds yet (for a page going hidden). |
+| `snapshot-reset` | | The host no longer holds the parts this app sent (its copy went, or a part could not be kept): the next copy sends every part again. |
 
 A typical host:
 
@@ -69,17 +72,25 @@ answered within 50 ms without the "Leave site?" prompt, and a crash or a lost ne
 nothing. So while the document has unsaved changes, PhotoCraft posts `snapshot`s the host can keep
 and hand back later:
 
-- A `snapshot` is posted once the changes have rested for 2 s (three times as long as the last
-  snapshot took, up to 15 s). A five-second pending-edit deadline prevents repeated edits from
-  restarting that wait indefinitely. The deadline is checked between pointer gestures; a live
-  drag still defers the snapshot. The host can request one immediately between gestures. A
-  saved document posts none, and an unchanged revision is not posted twice.
-- It is the whole document as a `.pcraft` without previews, written from the document's own save
-  cache, reusing tile hashes and compressed payloads within its memory budget. Large documents
-  can exceed that budget and require recompression. A File › Save after it shares the cache. It is never a save: `dirty` stays `true`.
-- The host keeps the newest one per document, drops it once the document is saved or the user
-  discards the changes, and on the next open offers it: `open` with the copy and `unsaved: true`
-  restores the work as unsaved changes, which the user then saves the normal way.
+- A copy starts once the changes have rested for 2 s (three times as long as the last copy's
+  main-thread work, up to 15 s). A five-second pending-edit deadline keeps repeated edits from
+  restarting that wait indefinitely; it is checked between pointer gestures, so a copy never
+  starts during a drag. The host can ask for one at once (`snapshot`). A saved document gets none,
+  and a revision is not copied twice.
+- A copy never stalls the GUI. It is written a step per frame, about 6 ms of main-thread time
+  (3 ms during a drag), against the document as it was at the copy's revision (editing goes on).
+  Each step first hashes tiles and blobs whose hash the document's save cache does not know yet
+  (an interrupted step keeps what it hashed), then compresses objects the host does not hold, one
+  at a time, posting each as a `snapshot-part`. An object too large for one step gets a longer
+  next step (doubled until it fits), so every copy completes; a blob over 1 MiB goes into its
+  part uncompressed. `snapshot` closes the copy with the manifest and every path it names.
+- Objects are content-addressed, so the host keeps each part as a record of its own: a small
+  edit after a complete copy sends only the tiles it changed. The host keeps the newest complete
+  copy per document and drops parts no copy names. It is never a save: `dirty` stays `true`.
+- The host drops the copy once the document is saved (the app then forgets what the host held)
+  or the user discards the changes. On the next open it offers it: `open` with the copy's
+  `parts` and `unsaved: true` restores the work as unsaved changes, which the user then saves the
+  normal way; the app counts the restored parts as held, so the next copy sends only changes.
 
 ## What embed mode changes
 

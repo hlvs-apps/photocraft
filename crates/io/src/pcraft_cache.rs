@@ -35,12 +35,34 @@ impl PcraftExportCache {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).save_zip(doc, opts).map(|(bytes, _)| bytes)
     }
 
-    /// The document as a `.pcraft` without previews (no thumbnail, no composite): a recovery copy
-    /// that only ever opens in PhotoCraft again. It shares this cache with File › Save, so after
-    /// the first one only the tiles changed since are compressed, and a save after it reuses them.
-    pub fn snapshot(&self, doc: &Document) -> photocraft_format::Result<Vec<u8>> {
-        self.encode(doc, &SaveOptions::default())
+    /// Prepares a recovery snapshot of `doc` as separate parts ([`photocraft_format::Parts`]):
+    /// hashes only what this cache does not know yet, so it shares the tile hashes with File ›
+    /// Save. Stops with `Cancelled` when `ctl` trips and resumes on the next call (a caller gives
+    /// it a time budget per frame); the caller compresses the parts one by one.
+    pub fn prepare_parts(&self, doc: &Document, ctl: &photocraft_raster::Interrupt) -> photocraft_format::Result<photocraft_format::Parts> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).prepare_parts(doc, &photocraft_format::SaveLimits::default(), ctl)
     }
+
+    /// [`Self::prepare_parts`] until `over` says the caller's time is up. Also answers whether
+    /// the call got further (hashed something new), so a caller can tell a document that needs
+    /// more steps from one object too large for its budget.
+    pub fn prepare_parts_until(&self, doc: &Document, over: &(dyn Fn() -> bool + Sync)) -> (photocraft_format::Result<photocraft_format::Parts>, bool) {
+        let mut writer = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = writer.known_hashes();
+        let result = writer.prepare_parts(doc, &photocraft_format::SaveLimits::default(), &photocraft_raster::Interrupt::cancel_only(over));
+        (result, writer.known_hashes() > before)
+    }
+}
+
+/// A `.pcraft` of a recovery copy's parts ([`photocraft_format::bundle_from_parts`]), without
+/// cancellation: made once, while the page opening it shows that it is loading.
+pub fn bundle_from_parts(manifest: &[u8], objects: &[(String, Vec<u8>)]) -> photocraft_format::Result<Vec<u8>> {
+    photocraft_format::bundle_from_parts(manifest, objects, &photocraft_raster::Interrupt::NONE)
+}
+
+/// Part `i` of `parts`, compressed as a bundle stores it ([`photocraft_format::Parts::compress`]).
+pub fn compress_part(parts: &photocraft_format::Parts, i: usize) -> photocraft_format::Result<Vec<u8>> {
+    parts.compress(i, &photocraft_raster::Interrupt::NONE)
 }
 
 #[cfg(test)]
@@ -72,13 +94,12 @@ mod tests {
             expected.name = "second.pcraft".into();
             assert_eq!(photocraft_format::load_from_bytes(&next.bytes).unwrap(), expected);
             assert_eq!(next.bytes, export(&doc, "second.pcraft", &ExportOptions::default()).unwrap().bytes);
-            // A recovery snapshot reuses the same cache, opens as the same document and carries no
-            // previews.
-            let snap = cache.snapshot(&doc).unwrap();
-            assert_eq!(photocraft_format::load_from_bytes(&snap).unwrap(), doc);
-            assert_eq!(photocraft_format::read_thumbnail(&snap).unwrap(), None);
-            let (_, stats) = cache.0.lock().unwrap().save_zip(&doc, &SaveOptions::default()).unwrap();
-            assert_eq!(stats.tiles_written, 0, "the snapshot left every tile in the cache");
+            // Recovery parts share the cache's hashes and make a bundle of the same document.
+            let parts = cache.prepare_parts(&doc, &photocraft_raster::Interrupt::NONE).unwrap();
+            let objects: Vec<_> =
+                (0..parts.len()).map(|i| (parts.path(i).unwrap().to_owned(), parts.compress(i, &photocraft_raster::Interrupt::NONE).unwrap())).collect();
+            let bundle = photocraft_format::bundle_from_parts(parts.manifest(), &objects, &photocraft_raster::Interrupt::NONE).unwrap();
+            assert_eq!(photocraft_format::load_from_bytes(&bundle).unwrap(), doc);
             let weak = Arc::downgrade(&cache.0);
             drop(options);
             drop(cache);
