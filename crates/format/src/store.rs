@@ -595,7 +595,14 @@ impl Parts {
         let (_, object) = self.objects.get(i).ok_or_else(|| FormatError::corrupt("no such snapshot part"))?;
         ctl.check()?;
         match object {
-            RecoveryObject::Whole(object) => object.compressed_with(usize::MAX, ctl),
+            RecoveryObject::Whole(object) => {
+                let level = if object.content().len() > PARTS_RAW_BYTES {
+                    ruzstd::encoding::CompressionLevel::Uncompressed
+                } else {
+                    ruzstd::encoding::CompressionLevel::Fastest
+                };
+                object.compressed_at(level, usize::MAX, ctl)
+            }
             RecoveryObject::Raw(bytes, range) => Ok(bytes.get(range.clone()).ok_or_else(|| FormatError::corrupt("snapshot fragment range"))?.to_vec()),
         }
     }

@@ -210,3 +210,17 @@ fn raw_fragments_reject_missing_corrupt_short_and_ambiguous_objects() {
     let bundle = bundle_from_parts(parts.manifest(), &reversed, &Interrupt::NONE).unwrap();
     assert_eq!(load_from_bytes(&bundle).unwrap(), doc);
 }
+
+#[test]
+fn oversized_float_tiles_keep_the_fast_uncompressed_recovery_path() {
+    let mut doc = Document::new("float tile", Size::new(256, 256), ColorMode::Cmyk, SampleType::F32);
+    let mut surface = Surface::new(doc.pixel_format());
+    surface.try_write_region(Rect::from_xywh(0, 0, 256, 256), &[0.1, 0.2, 0.3, 0.4, 1.0].repeat(256 * 256)).unwrap();
+    doc.layers.push(Layer::new("pixels", LayerContent::Raster(surface)));
+    let parts = PcraftWriter::new().prepare_parts(&doc, &SaveLimits::default(), &Interrupt::NONE).unwrap();
+    let objects = compress_all(&parts);
+    assert_eq!(objects.len(), 1);
+    assert!(objects[0].1.len() > 256 * 256 * 5 * 4, "oversized tiles must retain raw encoding, not run the full compressor");
+    let bundle = bundle_from_parts(parts.manifest(), &objects, &Interrupt::NONE).unwrap();
+    assert_eq!(load_from_bytes(&bundle).unwrap(), doc);
+}
