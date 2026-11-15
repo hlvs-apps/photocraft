@@ -70,11 +70,13 @@ nothing. So while the document has unsaved changes, PhotoCraft posts `snapshot`s
 and hand back later:
 
 - A `snapshot` is posted once the changes have rested for 2 s (three times as long as the last
-  snapshot took, up to 15 s), never during a pointer drag, never twice for one revision, and at
-  once when the host posts `snapshot`. A saved document posts none.
+  snapshot took, up to 15 s). A five-second pending-edit deadline prevents repeated edits from
+  restarting that wait indefinitely. The deadline is checked between pointer gestures; a live
+  drag still defers the snapshot. The host can request one immediately between gestures. A
+  saved document posts none, and an unchanged revision is not posted twice.
 - It is the whole document as a `.pcraft` without previews, written from the document's own save
-  cache, so after the first one only the tiles changed since are compressed, and a File › Save
-  after it reuses them. It is never a save: `dirty` stays `true`.
+  cache, reusing tile hashes and compressed payloads within its memory budget. Large documents
+  can exceed that budget and require recompression. A File › Save after it shares the cache. It is never a save: `dirty` stays `true`.
 - The host keeps the newest one per document, drops it once the document is saved or the user
   discards the changes, and on the next open offers it: `open` with the copy and `unsaved: true`
   restores the work as unsaved changes, which the user then saves the normal way.

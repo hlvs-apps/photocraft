@@ -126,6 +126,8 @@ pub enum Command {
 pub const SNAPSHOT_QUIET_MS: f64 = 2_000.0;
 /// The longest rest a slow snapshot stretches that to.
 pub const SNAPSHOT_MAX_QUIET_MS: f64 = 15_000.0;
+/// Maximum age of pending committed edits between pointer gestures.
+const SNAPSHOT_MAX_PENDING_MS: f64 = 5_000.0;
 /// How often a snapshot held back by a pointer drag looks again.
 const SNAPSHOT_BUSY_RETRY_MS: f64 = 250.0;
 
@@ -148,6 +150,7 @@ pub enum SnapshotStep {
 pub struct SnapshotSchedule {
     seen: Option<u64>,
     changed_at: f64,
+    pending_since: Option<f64>,
     posted: Option<u64>,
     requested: bool,
     last_ms: f64,
@@ -173,6 +176,7 @@ impl SnapshotSchedule {
             self.posted = None;
             self.requested = false;
             self.seen = None;
+            self.pending_since = None;
             return SnapshotStep::Idle;
         }
         if self.seen != Some(revision) {
@@ -183,19 +187,22 @@ impl SnapshotSchedule {
             self.requested = false;
             return SnapshotStep::Idle;
         }
+        let pending_since = *self.pending_since.get_or_insert(now_ms);
         if pointer_down {
             return SnapshotStep::Wait(SNAPSHOT_BUSY_RETRY_MS);
         }
         let rested = now_ms - self.changed_at;
-        if self.requested || rested >= self.quiet_ms() {
+        let remaining = (self.quiet_ms() - rested).min(SNAPSHOT_MAX_PENDING_MS - (now_ms - pending_since));
+        if self.requested || remaining <= 0.0 {
             return SnapshotStep::Snapshot;
         }
-        SnapshotStep::Wait(self.quiet_ms() - rested)
+        SnapshotStep::Wait(remaining)
     }
 
     /// A snapshot of `revision` was posted after `took_ms`.
     pub fn posted(&mut self, revision: u64, took_ms: f64) {
         self.posted = Some(revision);
+        self.pending_since = None;
         self.requested = false;
         self.last_ms = took_ms.max(0.0);
     }
@@ -359,16 +366,17 @@ impl Embed {
     /// frame when it will be.
     fn snapshot_tick(&mut self, app: &PhotocraftApp, ctx: &egui::Context) {
         let Some(st) = self.state(app) else { return };
-        let now = js_sys::Date::now();
+        let now = ctx.input(|input| input.time * 1000.0);
         let pointer_down = ctx.input(|i| i.pointer.any_down());
         match self.snapshots.frame(now, st.is_dirty(), st.revision, pointer_down) {
             SnapshotStep::Idle => {}
             SnapshotStep::Wait(ms) => ctx.request_repaint_after(std::time::Duration::from_secs_f64(ms / 1000.0)),
             SnapshotStep::Snapshot => {
                 let revision = st.revision;
+                let started = js_sys::Date::now();
                 match st.pcraft_cache.snapshot(&st.doc) {
                     Ok(bytes) => {
-                        let took = js_sys::Date::now() - now;
+                        let took = js_sys::Date::now() - started;
                         self.snapshots.posted(revision, took);
                         let data = js_sys::Uint8Array::from(bytes.as_slice());
                         let buffer = data.buffer();
@@ -670,6 +678,15 @@ mod tests {
         assert_eq!(s.frame(10_000.0, true, 3, false), SnapshotStep::Wait(SNAPSHOT_QUIET_MS));
         assert_eq!(s.frame(11_000.0, true, 4, false), SnapshotStep::Wait(SNAPSHOT_QUIET_MS), "every change restarts it");
         assert_eq!(s.frame(13_000.0, true, 4, false), SnapshotStep::Snapshot);
+    }
+
+    #[test]
+    fn continued_edits_cannot_starve_recovery() {
+        let mut s = SnapshotSchedule::default();
+        for revision in 0..5 {
+            assert!(matches!(s.frame(revision as f64 * 1000.0, true, revision, false), SnapshotStep::Wait(_)));
+        }
+        assert_eq!(s.frame(5000.0, true, 5, false), SnapshotStep::Snapshot);
     }
 
     #[test]
