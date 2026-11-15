@@ -78,7 +78,10 @@ and hand back later:
   starts during a drag. The host can ask for one at once (`snapshot`). A saved document gets none,
   and a revision is not copied twice.
 - A copy never stalls the GUI. It is written a step per frame, about 6 ms of main-thread time
-  (3 ms during a drag), against the document as it was at the copy's revision (editing goes on).
+  (3 ms during a drag), each right after the browser has drawn a frame and never inside the
+  GUI's own frames, against the document as it was at the copy's revision (editing goes on). A
+  hidden page draws no frames and throttles its timers: there the steps run on a timer, 100 ms
+  each, so a copy the host asked for as its page went is done sooner.
   Each step first hashes tiles and blobs whose hash the document's save cache does not know yet
   (an interrupted step keeps what it hashed), then compresses objects the host does not hold, one
   at a time, posting each as a `snapshot-part`. An object too large for one step gets a longer
