@@ -401,17 +401,15 @@ pub struct Embed {
     frame_saved: u64,
     /// The host's `open` asked for the document to open unsaved (a recovery copy).
     open_unsaved: bool,
-    /// The parts the host holds for this document's recovery copy (the last complete copy's): a
-    /// later copy posts only the others.
-    known: std::collections::HashSet<String>,
-    /// The recovery copy being written, a step per frame.
-    run: Option<SnapshotRun>,
+    /// The recovery copy being written, stepped by a browser timer between frames.
+    stepper: Rc<RefCell<Stepper>>,
     /// When the next recovery snapshot is due.
     snapshots: SnapshotSchedule,
 }
 
 /// The parent window and the origin both sides share.
 #[cfg(target_arch = "wasm32")]
+#[derive(Clone)]
 struct Host {
     parent: web_sys::Window,
     origin: String,
@@ -451,8 +449,7 @@ impl Embed {
             dirty: None,
             frame_saved: 0,
             open_unsaved: false,
-            known: Default::default(),
-            run: None,
+            stepper: Rc::default(),
             snapshots: SnapshotSchedule::default(),
         };
         Some((embed, name, written))
@@ -479,7 +476,7 @@ impl Embed {
                         Opened::Parts { manifest, objects } => {
                             // The host holds these parts: a copy of this document posts only the
                             // others.
-                            self.known = objects.iter().map(|(path, _)| path.clone()).collect();
+                            self.stepper.borrow_mut().known = objects.iter().map(|(path, _)| path.clone()).collect();
                             photocraft_io::bundle_from_parts(&manifest, &objects).map_err(|e| e.to_string())
                         }
                     };
@@ -493,8 +490,9 @@ impl Embed {
                 Command::Snapshot => self.snapshots.request(),
                 Command::SnapshotReset => {
                     // The host no longer holds what this app sent: the next copy sends it all.
-                    self.known.clear();
-                    self.run = None;
+                    let mut stepper = self.stepper.borrow_mut();
+                    stepper.known.clear();
+                    stepper.run = None;
                     self.snapshots.request();
                 }
             }
@@ -536,74 +534,43 @@ impl Embed {
         self.snapshot_tick(app, ctx);
     }
 
-    /// Writes recovery copies: starts one when [`SnapshotSchedule`] says one is due, then a
-    /// [`SnapshotRun`] step per frame (about [`SNAPSHOT_SLICE_MS`]) until it is complete, waking
-    /// the next frame as long as one is under way.
+    /// Writes recovery copies: starts one when [`SnapshotSchedule`] says one is due, and accounts
+    /// for one that finished. The copy itself is stepped by a browser timer between frames
+    /// ([`step_copy`]), never by GUI frames: a frame of the GUI costs far more than a step (on the
+    /// CPU canvas, tens of milliseconds) and an idle GUI draws none.
     fn snapshot_tick(&mut self, app: &PhotocraftApp, ctx: &egui::Context) {
         let Some(st) = self.state(app) else { return };
         let now = ctx.input(|input| input.time * 1000.0);
         let pointer_down = ctx.input(|i| i.pointer.any_down());
+        let mut stepper = self.stepper.borrow_mut();
+        stepper.pointer_down = pointer_down;
+        stepper.latest = st.revision;
+        match stepper.outcome.take() {
+            Some(Outcome::Posted { revision, work_ms }) => self.snapshots.posted(revision, work_ms),
+            Some(Outcome::Failed { revision }) => self.snapshots.failed(revision),
+            None => {}
+        }
         if !st.is_dirty() {
             // Saved: the host drops its copy with the save, so nothing it held counts any more.
-            self.run = None;
-            self.known.clear();
+            stepper.run = None;
+            stepper.known.clear();
             self.snapshots.frame(now, false, st.revision, pointer_down);
             return;
         }
-        if self.run.is_none() {
-            match self.snapshots.frame(now, true, st.revision, pointer_down) {
-                SnapshotStep::Idle => return,
-                SnapshotStep::Wait(ms) => {
-                    ctx.request_repaint_after(std::time::Duration::from_secs_f64(ms / 1000.0));
-                    return;
-                }
-                SnapshotStep::Snapshot => {
-                    self.run = Some(SnapshotRun::new(st.doc.clone(), st.revision));
-                    let msg = message("snapshot-start");
-                    set(&msg, "revision", &(st.revision as f64).into());
-                    self.host.post(&msg, None);
-                }
-            }
+        if stepper.run.is_some() {
+            return;
         }
-        let Some(run) = self.run.as_mut() else { return };
-        let budget = if pointer_down { SNAPSHOT_DRAG_SLICE_MS } else { SNAPSHOT_SLICE_MS };
-        let host = &self.host;
-        let revision = run.revision();
-        let mut post = |path: &str, data: Vec<u8>| {
-            let array = js_sys::Uint8Array::from(data.as_slice());
-            let buffer = array.buffer();
-            let msg = message("snapshot-part");
-            set(&msg, "revision", &(revision as f64).into());
-            set(&msg, "path", &path.into());
-            set(&msg, "data", &buffer);
-            host.post(&msg, Some(&js_sys::Array::of1(&buffer)));
-        };
-        match run.step(&st.pcraft_cache, &self.known, budget, &js_sys::Date::now, &mut post) {
-            RunStep::Continue => ctx.request_repaint(),
-            RunStep::Done(done) => {
-                self.run = None;
-                self.snapshots.posted(done.revision, done.work_ms);
-                let manifest = js_sys::Uint8Array::from(done.manifest.as_slice()).buffer();
-                let msg = message("snapshot");
-                set(&msg, "revision", &(done.revision as f64).into());
-                set(&msg, "manifest", &manifest);
-                set(&msg, "paths", &strings(&done.paths));
-                set(&msg, "parts", &(done.parts as f64).into());
-                set(&msg, "ms", &done.work_ms.round().into());
-                set(&msg, "maxSliceMs", &done.max_slice_ms.round().into());
-                set(&msg, "slices", &done.slices.into());
-                self.host.post(&msg, Some(&js_sys::Array::of1(&manifest)));
-                self.known = done.paths.into_iter().collect();
-                // A newer revision may be due already.
-                ctx.request_repaint();
-            }
-            RunStep::Failed(error) => {
-                self.run = None;
-                self.snapshots.failed(revision);
-                log::error!("photocraft-web: recovery copy: {error}");
-                let msg = message("snapshot-failed");
-                set(&msg, "error", &error.into());
+        match self.snapshots.frame(now, true, st.revision, pointer_down) {
+            SnapshotStep::Idle => {}
+            SnapshotStep::Wait(ms) => ctx.request_repaint_after(std::time::Duration::from_secs_f64(ms / 1000.0)),
+            SnapshotStep::Snapshot => {
+                stepper.run = Some(SnapshotRun::new(st.doc.clone(), st.revision));
+                stepper.cache = Some(st.pcraft_cache.clone());
+                let msg = message("snapshot-start");
+                set(&msg, "revision", &(st.revision as f64).into());
                 self.host.post(&msg, None);
+                drop(stepper);
+                schedule_step(self.stepper.clone(), self.host.clone(), ctx.clone());
             }
         }
     }
@@ -733,6 +700,110 @@ pub fn start_failed(search: &str, error: &str) {
     let msg = message("start-failed");
     set(&msg, "error", &error.into());
     Host { parent, origin }.post(&msg, None);
+}
+
+/// A recovery copy under way, shared between the GUI's frames (which start it and account for
+/// it) and the browser timer that steps it.
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+struct Stepper {
+    run: Option<SnapshotRun>,
+    /// The document's save cache (shared with File › Save).
+    cache: Option<photocraft_io::PcraftExportCache>,
+    /// The parts the host holds for the document's copy (the last complete copy's): a copy posts
+    /// only the others.
+    known: std::collections::HashSet<String>,
+    /// A pointer drag is under way (the last frame said): smaller steps.
+    pointer_down: bool,
+    /// The document's revision the last frame saw.
+    latest: u64,
+    /// A step is scheduled.
+    scheduled: bool,
+    /// How the last copy ended, for the schedule (read by the next frame).
+    outcome: Option<Outcome>,
+}
+
+#[cfg(target_arch = "wasm32")]
+enum Outcome {
+    Posted { revision: u64, work_ms: f64 },
+    Failed { revision: u64 },
+}
+
+/// Schedules the copy's next step on a browser timer (between frames).
+#[cfg(target_arch = "wasm32")]
+fn schedule_step(stepper: Rc<RefCell<Stepper>>, host: Host, ctx: egui::Context) {
+    use wasm_bindgen::JsCast as _;
+    {
+        let mut s = stepper.borrow_mut();
+        if s.scheduled || s.run.is_none() {
+            return;
+        }
+        s.scheduled = true;
+    }
+    let Some(window) = web_sys::window() else { return };
+    let next = wasm_bindgen::closure::Closure::once_into_js(move || step_copy(stepper, host, ctx));
+    if window.set_timeout_with_callback_and_timeout_and_arguments_0(next.unchecked_ref(), 0).is_err() {
+        log::error!("photocraft-web: recovery copy: the browser refused a timer");
+    }
+}
+
+/// One step of the copy under way ([`SnapshotRun::step`]), posting its parts, then the next.
+#[cfg(target_arch = "wasm32")]
+fn step_copy(stepper: Rc<RefCell<Stepper>>, host: Host, ctx: egui::Context) {
+    let step = {
+        let mut guard = stepper.borrow_mut();
+        let Stepper { run, cache, known, pointer_down, scheduled, .. } = &mut *guard;
+        *scheduled = false;
+        let (Some(run), Some(cache)) = (run.as_mut(), cache.as_ref()) else { return };
+        let revision = run.revision();
+        let budget = if *pointer_down { SNAPSHOT_DRAG_SLICE_MS } else { SNAPSHOT_SLICE_MS };
+        let mut post = |path: &str, data: Vec<u8>| {
+            let array = js_sys::Uint8Array::from(data.as_slice());
+            let buffer = array.buffer();
+            let msg = message("snapshot-part");
+            set(&msg, "revision", &(revision as f64).into());
+            set(&msg, "path", &path.into());
+            set(&msg, "data", &buffer);
+            host.post(&msg, Some(&js_sys::Array::of1(&buffer)));
+        };
+        (revision, run.step(cache, known, budget, &js_sys::Date::now, &mut post))
+    };
+    match step {
+        (_, RunStep::Continue) => schedule_step(stepper, host, ctx),
+        (_, RunStep::Done(done)) => {
+            let manifest = js_sys::Uint8Array::from(done.manifest.as_slice()).buffer();
+            let msg = message("snapshot");
+            set(&msg, "revision", &(done.revision as f64).into());
+            set(&msg, "manifest", &manifest);
+            set(&msg, "paths", &strings(&done.paths));
+            set(&msg, "parts", &(done.parts as f64).into());
+            set(&msg, "ms", &done.work_ms.round().into());
+            set(&msg, "maxSliceMs", &done.max_slice_ms.round().into());
+            set(&msg, "slices", &done.slices.into());
+            host.post(&msg, Some(&js_sys::Array::of1(&manifest)));
+            let mut s = stepper.borrow_mut();
+            s.run = None;
+            s.known = done.paths.into_iter().collect();
+            s.outcome = Some(Outcome::Posted { revision: done.revision, work_ms: done.work_ms });
+            // Edited while the copy was written: a frame starts the next one. Otherwise no frame
+            // (a GUI frame is the costly thing here); the next one accounts for this copy.
+            if s.latest != done.revision {
+                ctx.request_repaint();
+            }
+        }
+        (revision, RunStep::Failed(error)) => {
+            log::error!("photocraft-web: recovery copy: {error}");
+            let msg = message("snapshot-failed");
+            set(&msg, "error", &error.into());
+            host.post(&msg, None);
+            let mut s = stepper.borrow_mut();
+            s.run = None;
+            s.outcome = Some(Outcome::Failed { revision });
+            if s.latest != revision {
+                ctx.request_repaint();
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
