@@ -113,6 +113,10 @@ pub struct LayerCompM {
     pub apply_visibility: bool,
     pub apply_position: bool,
     pub apply_appearance: bool,
+    /// An alternate layout (`photocraft_doc::LayerComp::alternate`). Absent in files written
+    /// before alternate layouts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub alternate: bool,
     #[serde(default)]
     pub states: Vec<CompStateM>,
 }
@@ -127,6 +131,26 @@ pub struct CompStateM {
     pub position: Option<(i32, i32)>,
     #[serde(default)]
     pub appearance: Option<CompAppearanceM>,
+    /// An alternate layout's exact placement of the layer. Absent in files written before
+    /// alternate layouts, and for layers it does not move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<CompPlacementM>,
+}
+
+/// `photocraft_doc::CompPlacement`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompPlacementM {
+    Transform {
+        transform: Affine,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        perspective: Option<[f64; 9]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_box: Option<[f32; 4]>,
+    },
+    Bounds {
+        rect: photocraft_geom::Rect,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

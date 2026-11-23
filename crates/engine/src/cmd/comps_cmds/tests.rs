@@ -288,10 +288,11 @@ fn unreachable_comp_positions_leave_the_layer_in_place() {
             apply_visibility: true,
             apply_position: true,
             apply_appearance: false,
+            alternate: false,
             states: vec![
-                CompLayerState { layer: a, visible: Some(false), position: Some(target), appearance: None },
+                CompLayerState { layer: a, visible: Some(false), position: Some(target), appearance: None, placement: None },
                 // Control: an ordinary position on another layer still moves it.
-                CompLayerState { layer: b, visible: None, position: Some((31, 22)), appearance: None },
+                CompLayerState { layer: b, visible: None, position: Some((31, 22)), appearance: None, placement: None },
             ],
         };
         s.edit("far", |d, _| {
@@ -439,4 +440,282 @@ fn a_recorded_apply_layer_comp_finds_the_comp_by_name() {
     assert_eq!(played["ran"], 0, "{played}");
     assert!(played["failed"]["error"].as_str().unwrap().contains("no layer comp named \"Wanted\""), "{played}");
     assert_eq!((doc(&other).last_applied_comp, doc(&other).layer(ob).unwrap().visible), before, "the document is unchanged");
+}
+
+// ─── Alternate layouts ──────────────────────────────────────────────────────────────────────
+
+/// A document with raster A, B (see `session`), a smart object S and a paragraph type layer T,
+/// plus an empty alternate layout "QR off".
+fn layout_session() -> (Session, [LayerId; 4], u32) {
+    use photocraft_doc::{SmartObject, SmartSource, TextLayer};
+    let (mut s, a, b) = session(8);
+    let (sm, t) = s
+        .edit("setup", |doc, _| {
+            let fmt = doc.pixel_format();
+            let mut cache = photocraft_raster::Surface::new(fmt);
+            cache.fill_rect(Rect::new(20, 10, 28, 14), &photocraft_raster::from_rgba(&fmt, [0.0, 1.0, 0.0, 1.0]));
+            let so = SmartObject::new(SmartSource::Linked { path: "missing.png".into() }, Affine { m: [2.0, 0.0, 0.0, 2.0, 20.0, 10.0] }, Some(cache));
+            let mut sl = Layer::new("S", LayerContent::Smart(so));
+            sl.locks.position = true;
+            let tl = Layer::new(
+                "T",
+                LayerContent::Text(TextLayer {
+                    text: "Hi".into(),
+                    transform: Affine::translate(8.0, 30.0),
+                    shape: TextShape::Box { x: 0.0, y: 0.0, width: 40.0, height: 12.0 },
+                    ..Default::default()
+                }),
+            );
+            let ids = (sl.id, tl.id);
+            doc.layers.push(sl);
+            doc.layers.push(tl);
+            Ok(ids)
+        })
+        .unwrap();
+    let c = s.execute("layerComp.new", json!({"name": "QR off", "alternate": true})).unwrap()["comp"].as_u64().unwrap() as u32;
+    (s, [a, b, sm, t], c)
+}
+
+fn placement_of(s: &Session, id: LayerId) -> Option<CompPlacement> {
+    layer_placement(doc(s).layer(id).unwrap())
+}
+
+#[test]
+fn an_alternate_layout_starts_empty_and_is_shown_not_applied() {
+    let (mut s, [a, ..], c) = layout_session();
+    let comp = doc(&s).comp(c).unwrap();
+    assert!(comp.alternate && comp.states.is_empty() && !comp.apply_appearance);
+    assert_eq!(doc(&s).last_applied_comp, None, "creating it shows nothing");
+    let before = doc(&s).layers.clone();
+    let r = s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    assert_eq!(r["alternate"], true);
+    assert_eq!(doc(&s).comp_edit.as_ref().map(|e| e.comp), Some(c));
+    assert_eq!(doc(&s).last_applied_comp, Some(c));
+    assert_eq!(doc(&s).layers, before, "an empty layout moves nothing");
+    assert_eq!(pos(&s, a), Some((4, 4)));
+    let listed = s.execute("layerComp.list", json!({})).unwrap();
+    assert_eq!(listed["showing"], c);
+    assert_eq!(listed["comps"][0]["alternate"], true);
+}
+
+#[test]
+fn edits_while_a_layout_is_shown_go_into_it_and_leaving_restores_the_document() {
+    let (mut s, [a, b, sm, t], c) = layout_session();
+    let base = doc(&s).layers.clone();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    // Move A by whole pixels, hide B, scale and move S (position-locked: an edit, not the user's
+    // drag, sets it here), widen T's box and move it.
+    s.execute("layer.translate", json!({"layer": a.0, "dx": 3, "dy": 2})).unwrap();
+    let moved_s = Affine { m: [3.0, 0.0, 0.0, 3.0, 12.5, 7.25] };
+    let moved_t = Affine::translate(9.5, 33.0);
+    s.edit("arrange", |d, _| {
+        d.layer_mut(b).unwrap().visible = false;
+        if let LayerContent::Smart(so) = &mut d.layer_mut(sm).unwrap().content {
+            so.transform = moved_s;
+        }
+        if let LayerContent::Text(tx) = &mut d.layer_mut(t).unwrap().content {
+            tx.transform = moved_t;
+            tx.shape = TextShape::Box { x: 0.0, y: 0.0, width: 50.0, height: 12.0 };
+        }
+        Ok(())
+    })
+    .unwrap();
+    let shown = doc(&s).layers.clone();
+    s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+    let d = doc(&s);
+    assert!(d.comp_edit.is_none());
+    assert_eq!(d.last_applied_comp, None);
+    // The document's own arrangement is back, exactly.
+    for (now, was) in d.layers.iter().zip(&base) {
+        assert_eq!(now.visible, was.visible, "{}", now.name);
+        assert_eq!(layer_placement(now), layer_placement(was), "{}", now.name);
+    }
+    // The layout holds what was shown, for the layers it moves only.
+    let comp = d.comp(c).unwrap();
+    assert_eq!(comp.states.len(), 4);
+    let st = |id| comp.state(id).unwrap();
+    assert_eq!(st(a).placement, Some(CompPlacement::Bounds(Rect::new(7, 6, 17, 16))));
+    assert_eq!(st(a).visible, None);
+    assert_eq!((st(b).visible, st(b).placement.clone()), (Some(false), None));
+    assert_eq!(st(sm).placement, Some(CompPlacement::Transform { transform: moved_s, perspective: None, text_box: None }));
+    assert_eq!(st(t).placement, Some(CompPlacement::Transform { transform: moved_t, perspective: None, text_box: Some([0.0, 0.0, 50.0, 12.0]) }));
+
+    // Showing it again puts every layer back where it was shown, exactly, and leaving it
+    // untouched records exactly the same.
+    let recorded = comp.clone();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    for id in [a, b, sm, t] {
+        let now = doc(&s).layer(id).unwrap();
+        let was = shown.iter().find(|l| l.id == id).unwrap();
+        assert_eq!((now.visible, layer_placement(now)), (was.visible, layer_placement(was)), "{}", now.name);
+    }
+    s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+    assert_eq!(doc(&s).comp(c).unwrap(), &recorded);
+
+    // One history: undo walks back through leaving, showing and the edits.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(doc(&s).comp_edit.as_ref().map(|e| e.comp), Some(c));
+    assert_eq!(placement_of(&s, sm), Some(CompPlacement::Transform { transform: moved_s, perspective: None, text_box: None }));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(doc(&s).comp_edit.is_none());
+    assert_eq!(placement_of(&s, sm), layer_placement(base.iter().find(|l| l.id == sm).unwrap()));
+}
+
+#[test]
+fn a_layer_nobody_moved_keeps_following_the_document() {
+    let (mut s, [a, b, ..], c) = layout_session();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    s.edit("hide", |d, _| {
+        d.layer_mut(b).unwrap().visible = false;
+        Ok(())
+    })
+    .unwrap();
+    s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+    assert!(doc(&s).comp(c).unwrap().state(a).is_none());
+    // Moving A in the document moves it in the layout too.
+    s.execute("layer.translate", json!({"layer": a.0, "dx": 5, "dy": 0})).unwrap();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    assert_eq!(pos(&s, a), Some((9, 4)));
+    assert!(!doc(&s).layer(b).unwrap().visible);
+}
+
+#[test]
+fn a_layer_added_while_a_layout_is_shown_is_only_in_it() {
+    let (mut s, _, c) = layout_session();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    let added = LayerId(s.execute("layer.new.layer", json!({})).unwrap()["layer"].as_u64().unwrap());
+    s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+    assert!(!doc(&s).layer(added).unwrap().visible, "hidden in the document");
+    assert_eq!(doc(&s).comp(c).unwrap().state(added).unwrap().visible, Some(true), "visible in the layout");
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    assert!(doc(&s).layer(added).unwrap().visible);
+}
+
+#[test]
+fn delete_hides_a_layer_in_a_shown_layout_instead_of_deleting_it() {
+    let (mut s, [a, ..], c) = layout_session();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    let r = s.execute("layer.delete", json!({"layer": a.0})).unwrap();
+    assert_eq!(r["hidden"], json!([a.0]));
+    assert!(!doc(&s).layer(a).unwrap().visible);
+    s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+    assert!(doc(&s).layer(a).unwrap().visible, "still in the document");
+    assert_eq!(doc(&s).comp(c).unwrap().state(a).unwrap().visible, Some(false));
+    // Outside the layout Delete deletes.
+    s.execute("layer.delete", json!({"layer": a.0})).unwrap();
+    assert!(doc(&s).layer(a).is_none());
+}
+
+#[test]
+fn applying_another_comp_or_deleting_the_layout_leaves_it_first() {
+    let (mut s, [a, ..], c) = layout_session();
+    let plain = s.execute("layerComp.new", json!({"name": "Plain"})).unwrap()["comp"].as_u64().unwrap();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    s.execute("layer.translate", json!({"layer": a.0, "dx": 3, "dy": 0})).unwrap();
+    s.execute("layerComp.apply", json!({"comp": plain})).unwrap();
+    assert!(doc(&s).comp_edit.is_none());
+    assert_eq!(pos(&s, a), Some((4, 4)), "the plain comp applies over the document's arrangement");
+    assert!(doc(&s).comp(c).unwrap().state(a).is_some());
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    assert_eq!(pos(&s, a), Some((7, 4)));
+    s.execute("layerComp.delete", json!({"comp": c})).unwrap();
+    assert!(doc(&s).comp_edit.is_none());
+    assert_eq!(pos(&s, a), Some((4, 4)));
+}
+
+#[test]
+fn update_never_captures_into_an_alternate_layout() {
+    let (mut s, _, c) = layout_session();
+    let plain = s.execute("layerComp.new", json!({"name": "Plain"})).unwrap()["comp"].as_u64().unwrap();
+    assert!(s.execute("layerComp.update", json!({"comp": c})).is_err());
+    let r = s.execute("layerComp.update", json!({"comp": "*"})).unwrap();
+    assert_eq!(r["updated"], json!([plain]));
+    assert!(doc(&s).comp(c).unwrap().states.is_empty());
+}
+
+#[test]
+fn a_save_while_a_layout_is_shown_writes_the_document_arrangement() {
+    let (mut s, [a, b, sm, _], c) = layout_session();
+    let base_a = pos(&s, a);
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    s.execute("layer.translate", json!({"layer": a.0, "dx": 3, "dy": 2})).unwrap();
+    s.edit("hide", |d, _| {
+        d.layer_mut(b).unwrap().visible = false;
+        Ok(())
+    })
+    .unwrap();
+    let bytes = photocraft_format::save_to_bytes(doc(&s), &photocraft_format::SaveOptions::default()).unwrap();
+    // The live document still shows the layout.
+    assert!(doc(&s).comp_edit.is_some());
+    let back = photocraft_format::load_from_bytes(&bytes).unwrap();
+    assert!(back.comp_edit.is_none());
+    let la = back.layers.iter().find(|l| l.name == "A").unwrap();
+    let lb = back.layers.iter().find(|l| l.name == "B").unwrap();
+    assert_eq!(layer_position(la), base_a);
+    assert!(lb.visible);
+    let comp = back.comp(c).unwrap();
+    assert!(comp.alternate);
+    assert_eq!(comp.state(la.id).unwrap().placement, Some(CompPlacement::Bounds(Rect::new(7, 6, 17, 16))));
+    assert_eq!(comp.state(lb.id).unwrap().visible, Some(false));
+    assert!(back.layers.iter().find(|l| l.name == "S").is_some_and(|l| comp.state(l.id).is_none()));
+    let _ = sm;
+}
+
+#[test]
+fn a_raster_layer_takes_its_recorded_size_and_a_locked_one_moves() {
+    let (mut s, [a, _, sm, _], c) = layout_session();
+    s.edit("record", |d, _| {
+        let comp = d.layer_comps.iter_mut().find(|x| x.id == c).unwrap();
+        comp.states = vec![
+            CompLayerState { layer: a, visible: None, position: None, appearance: None, placement: Some(CompPlacement::Bounds(Rect::new(10, 10, 30, 30))) },
+            CompLayerState {
+                layer: sm,
+                visible: None,
+                position: None,
+                appearance: None,
+                placement: Some(CompPlacement::Transform { transform: Affine { m: [0.0, 2.0, -2.0, 0.0, 40.0, 5.0] }, perspective: None, text_box: None }),
+            },
+        ];
+        Ok(())
+    })
+    .unwrap();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    assert_eq!(placement_of(&s, a), Some(CompPlacement::Bounds(Rect::new(10, 10, 30, 30))), "resampled onto the recorded bounds");
+    assert_eq!(
+        placement_of(&s, sm),
+        Some(CompPlacement::Transform { transform: Affine { m: [0.0, 2.0, -2.0, 0.0, 40.0, 5.0] }, perspective: None, text_box: None })
+    );
+    assert!(doc(&s).layer(sm).unwrap().locks.position, "the lock is kept");
+    s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+    assert_eq!(placement_of(&s, a), Some(CompPlacement::Bounds(Rect::new(4, 4, 14, 14))));
+}
+
+#[test]
+fn a_layer_left_where_the_layout_put_it_keeps_its_recorded_placement_exactly() {
+    let (mut s, [a, ..], c) = layout_session();
+    // Bounds no resample of this layer can reach exactly: showing lands near them.
+    let recorded = CompPlacement::Bounds(Rect::new(10, 10, 27, 23));
+    s.edit("record", |d, _| {
+        let comp = d.layer_comps.iter_mut().find(|x| x.id == c).unwrap();
+        comp.states = vec![CompLayerState { layer: a, visible: None, position: None, appearance: None, placement: Some(recorded.clone()) }];
+        Ok(())
+    })
+    .unwrap();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    let shown = placement_of(&s, a).unwrap();
+    // Simulate a resample that lands a pixel off: the layout records what it had, not this.
+    s.edit("land", |d, _| {
+        d.comp_edit.as_mut().unwrap().shown = vec![(a, shown.clone())];
+        Ok(())
+    })
+    .unwrap();
+    s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+    assert_eq!(doc(&s).comp(c).unwrap().state(a).unwrap().placement, Some(recorded.clone()));
+    // Moved while shown: the new place is recorded.
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    s.execute("layer.translate", json!({"layer": a.0, "dx": 2, "dy": 0})).unwrap();
+    let moved = placement_of(&s, a);
+    s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+    assert_eq!(doc(&s).comp(c).unwrap().state(a).unwrap().placement, moved);
+    assert_ne!(moved, Some(recorded));
 }

@@ -143,6 +143,7 @@ fn synthetic(depth: SampleType) -> Document {
         apply_visibility: true,
         apply_position: true,
         apply_appearance: false,
+        alternate: false,
         states,
     });
     d.layers[1].visible = false;
@@ -158,6 +159,7 @@ fn synthetic(depth: SampleType) -> Document {
         apply_visibility: true,
         apply_position: false,
         apply_appearance: true,
+        alternate: false,
         states,
     });
     d.last_applied_comp = Some(12);
@@ -214,6 +216,7 @@ fn synthetic_pcraft_roundtrip_keeps_everything() {
         apply_visibility: true,
         apply_position: true,
         apply_appearance: true,
+        alternate: false,
         states: capture_states(&d),
     });
     let bytes = photocraft_format::save_to_bytes(&d, &Default::default()).unwrap();
@@ -296,7 +299,7 @@ fn out_of_range_comp_offsets_import_and_export_without_panic() {
     let mut d = Document::new("s", Size::new(32, 32), ColorMode::Rgb, SampleType::U8);
     let mut l = Layer::raster("A", PixelFormat::RGBA8);
     l.surface_mut().unwrap().fill_rect(Rect::new(4, 4, 8, 8), &[1.0, 0.0, 0.0, 1.0]);
-    let st = photocraft_doc::CompLayerState { layer: l.id, visible: Some(false), position: Some((i32::MIN, 0)), appearance: None };
+    let st = photocraft_doc::CompLayerState { layer: l.id, visible: Some(false), position: Some((i32::MIN, 0)), appearance: None, placement: None };
     d.layers.push(l);
     d.layer_comps.push(LayerComp {
         id: 1,
@@ -305,6 +308,7 @@ fn out_of_range_comp_offsets_import_and_export_without_panic() {
         apply_visibility: true,
         apply_position: true,
         apply_appearance: false,
+        alternate: false,
         states: vec![st],
     });
     let back = import("x.psd", &to_psd(&d)).unwrap().document;

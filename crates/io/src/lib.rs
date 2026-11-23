@@ -615,6 +615,10 @@ const PCRAFT_PREVIEWS_DONE: f32 = 0.4;
 const PSD_MODEL_DONE: f32 = 0.9;
 
 fn export_stages(doc: &Document, name_or_ext: &str, opts: &ExportOptions, ctl: &photocraft_raster::Interrupt) -> Result<ExportResult, IoError> {
+    // A file holds the document's own arrangement: an alternate layout being shown is left first
+    // (its edits recorded in its comp), whatever the format.
+    let committed = doc.committed();
+    let doc: &Document = &committed;
     let ext = extension(name_or_ext);
     if ext == "pdn" {
         return Err(IoError::Unsupported("PDN is import-only; save as .pcraft to preserve all layers and blend modes".into()));

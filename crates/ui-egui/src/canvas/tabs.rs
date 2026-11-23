@@ -555,7 +555,9 @@ pub(super) fn tab_title(app: &PhotocraftApp, tab: Tab) -> String {
     let layer = active_layer.map(|l| format!("{}, ", l.name)).unwrap_or_default();
     // A save in progress: "name @ 100% (Layer 1, RGB/16) - Saving 45%", as Photoshop does (#3389).
     let saving = crate::jobs_ui::save_progress(app, st.doc.id).map(|s| format!(" - {s}")).unwrap_or_default();
-    format!("{} @ {}% ({layer}{model}/{}){}{saving}", tab_name(app, tab), fmt_zoom(zoom), st.doc.depth.bits(), if st.is_dirty() { "*" } else { "" })
+    // An alternate layout being shown: edits go into it, so every tab of the document names it.
+    let layout = st.doc.editing_comp().map(|c| format!(" [{}]", c.name)).unwrap_or_default();
+    format!("{} @ {}% ({layer}{model}/{}){}{layout}{saving}", tab_name(app, tab), fmt_zoom(zoom), st.doc.depth.bits(), if st.is_dirty() { "*" } else { "" })
 }
 
 /// The Studio strip's tab name: "name *" when unsaved, "name * - Saving 45%" while it saves (#3389).

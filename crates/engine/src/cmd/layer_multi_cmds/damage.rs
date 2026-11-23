@@ -217,6 +217,7 @@ fn doc_pixels_equal(a: &Document, b: &Document) -> bool {
         layer_comps: _,
         last_applied_comp: _,
         last_document_state: _,
+        comp_edit: _,
         measurement: _,
         notes: _,
         text_styles: _,
@@ -319,6 +320,7 @@ pub fn selection_only_change(a: &Document, b: &Document) -> bool {
         layer_comps,
         last_applied_comp,
         last_document_state,
+        comp_edit,
         measurement,
         notes,
         text_styles,
@@ -342,6 +344,7 @@ pub fn selection_only_change(a: &Document, b: &Document) -> bool {
         && *layer_comps == b.layer_comps
         && *last_applied_comp == b.last_applied_comp
         && *last_document_state == b.last_document_state
+        && *comp_edit == b.comp_edit
         && *measurement == b.measurement
         && *notes == b.notes
         && *text_styles == b.text_styles

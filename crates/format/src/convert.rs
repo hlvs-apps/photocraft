@@ -5,15 +5,15 @@ use std::sync::Arc;
 
 use photocraft_color::{PixelFormat, SampleType};
 use photocraft_doc::{
-    AlphaChannel, CompAppearance, CompLayerState, DocId, Document, Effects, FillCache, Group, Layer, LayerComp, LayerContent, LayerId, LayerMask, Metadata,
-    NamedPath, Pattern, ShapeLayer, SmartContentsId, SmartObject, SmartSource, TextLayer,
+    AlphaChannel, CompAppearance, CompLayerState, CompPlacement, DocId, Document, Effects, FillCache, Group, Layer, LayerComp, LayerContent, LayerId,
+    LayerMask, Metadata, NamedPath, Pattern, ShapeLayer, SmartContentsId, SmartObject, SmartSource, TextLayer,
 };
 use photocraft_geom::{TILE_SIZE, TileCoord};
 use photocraft_raster::{Surface, Tile, decode_pixel, encode_pixel};
 
 use crate::manifest::{
-    ChannelM, CompAppearanceM, CompStateM, ContentM, DocM, EffectsM, FillCacheM, Hash, LayerCompM, LayerM, MaskM, MetadataM, NamedPathM, PatternM,
-    SmartSourceM, SurfaceM, TileRef,
+    ChannelM, CompAppearanceM, CompPlacementM, CompStateM, ContentM, DocM, EffectsM, FillCacheM, Hash, LayerCompM, LayerM, MaskM, MetadataM, NamedPathM,
+    PatternM, SmartSourceM, SurfaceM, TileRef,
 };
 use crate::{FormatError, Result};
 
@@ -339,7 +339,7 @@ fn effects_m(e: &Effects, sink: &mut dyn Sink) -> Result<EffectsM> {
 fn comp_m(c: &LayerComp, sink: &mut dyn Sink) -> Result<LayerCompM> {
     sink.check()?;
     // Destructured so a new `LayerComp` field fails to compile here until it is saved.
-    let LayerComp { id, name, comment, apply_visibility, apply_position, apply_appearance, states } = c;
+    let LayerComp { id, name, comment, apply_visibility, apply_position, apply_appearance, alternate, states } = c;
     Ok(LayerCompM {
         id: *id,
         name: name.clone(),
@@ -347,15 +347,22 @@ fn comp_m(c: &LayerComp, sink: &mut dyn Sink) -> Result<LayerCompM> {
         apply_visibility: *apply_visibility,
         apply_position: *apply_position,
         apply_appearance: *apply_appearance,
+        alternate: *alternate,
         states: states
             .iter()
             .map(|s| {
                 sink.check()?;
-                let CompLayerState { layer, visible, position, appearance } = s;
+                let CompLayerState { layer, visible, position, appearance, placement } = s;
                 Ok(CompStateM {
                     layer: layer.0,
                     visible: *visible,
                     position: *position,
+                    placement: placement.as_ref().map(|p| match p {
+                        CompPlacement::Transform { transform, perspective, text_box } => {
+                            CompPlacementM::Transform { transform: *transform, perspective: *perspective, text_box: *text_box }
+                        }
+                        CompPlacement::Bounds(rect) => CompPlacementM::Bounds { rect: *rect },
+                    }),
                     appearance: appearance
                         .as_ref()
                         .map(|a| {
@@ -494,7 +501,13 @@ impl Loader<'_> {
             // States of layers deleted before the save keep their (now dangling) id, which
             // `layerComp.updateWarnings` reports; it must not collide with a live layer.
             let layer = self.id_map.get(&s.layer).copied().unwrap_or(LayerId(u64::MAX - s.layer.min(u64::MAX / 2)));
-            states.push(CompLayerState { layer, visible: s.visible, position: s.position, appearance });
+            let placement = s.placement.as_ref().map(|p| match p {
+                CompPlacementM::Transform { transform, perspective, text_box } => {
+                    CompPlacement::Transform { transform: *transform, perspective: *perspective, text_box: *text_box }
+                }
+                CompPlacementM::Bounds { rect } => CompPlacement::Bounds(*rect),
+            });
+            states.push(CompLayerState { layer, visible: s.visible, position: s.position, appearance, placement });
         }
         Ok(LayerComp {
             id: m.id,
@@ -503,6 +516,7 @@ impl Loader<'_> {
             apply_visibility: m.apply_visibility,
             apply_position: m.apply_position,
             apply_appearance: m.apply_appearance,
+            alternate: m.alternate,
             states,
         })
     }
@@ -756,6 +770,7 @@ impl Loader<'_> {
             layer_comps,
             last_applied_comp: m.last_applied_comp,
             last_document_state,
+            comp_edit: None,
             measurement: m.measurement.clone(),
             notes: m.notes.clone(),
             text_styles: m.text_styles.clone(),
@@ -819,7 +834,8 @@ mod tests {
             apply_visibility: true,
             apply_position: false,
             apply_appearance: false,
-            states: layers.iter().map(|l| CompLayerState { layer: l.id, visible: Some(true), position: None, appearance: None }).collect(),
+            alternate: false,
+            states: layers.iter().map(|l| CompLayerState { layer: l.id, visible: Some(true), position: None, appearance: None, placement: None }).collect(),
         };
         assert!(matches!(comp_m(&comp, &mut CancelAfter(std::cell::Cell::new(0))), Err(FormatError::Cancelled(_))));
     }

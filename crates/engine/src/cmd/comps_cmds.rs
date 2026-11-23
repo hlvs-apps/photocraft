@@ -5,9 +5,17 @@
 //! which of them applying restores (see [`photocraft_doc::comps`]). Comps live in the document,
 //! so every change here is one undoable history step. Commands that act on "the" comp take
 //! `"comp": id | name` and default to the comp applied (or created) last.
+//!
+//! An alternate layout (`LayerComp::alternate`) is shown rather than applied: `layerComp.apply`
+//! shows it ([`show_layout`]), edits to visibility and placement go into it while it is shown,
+//! and `layerComp.restoreLastDocumentState` (or applying any other comp) leaves it
+//! (`Document::leave_comp_edit`). Delete Layer hides a layer in it instead of deleting it.
 
-use photocraft_doc::comps::{capture_states, layer_position, next_comp_id};
-use photocraft_doc::{CompLayerState, Document, LayerComp, LayerId};
+use photocraft_algo::transform::{Homography, Interp, warp_surface};
+use photocraft_doc::comps::{CompPlacement, capture_states, layer_placement, layer_position, next_comp_id, position_bounds};
+use photocraft_doc::text::TextShape;
+use photocraft_doc::{CompEdit, CompLayerState, Document, Layer, LayerComp, LayerContent, LayerId, Locks};
+use photocraft_geom::Affine;
 use serde_json::{Value, json};
 
 use crate::commands::CommandSpec;
@@ -29,7 +37,7 @@ fn has_comps(s: &Session) -> std::result::Result<(), String> {
 
 fn has_last_state(s: &Session) -> std::result::Result<(), String> {
     let d = s.active().ok_or("no document open")?;
-    if d.doc.last_document_state.is_some() { Ok(()) } else { Err("no comp has been applied over the document state".into()) }
+    if d.doc.last_document_state.is_some() || d.doc.comp_edit.is_some() { Ok(()) } else { Err("no comp has been applied over the document state".into()) }
 }
 
 fn export_comps(s: &Session) -> std::result::Result<(), String> {
@@ -66,14 +74,23 @@ fn flag(p: &Value, key: &str, default: bool) -> bool {
 
 /// Restores `comp`'s recorded state (only what its options select; `all` forces everything).
 /// Layers deleted since the capture are skipped. Position-locked layers still move, as in
-/// Photoshop, because the comp is not a user drag.
+/// Photoshop, because the comp is not a user drag. An alternate layout's exact placements go
+/// with "position" ([`apply_placement`]).
 pub fn apply_comp(doc: &mut Document, comp: &LayerComp, all: bool) {
     let (vis, pos, app) = if all { (true, true, true) } else { (comp.apply_visibility, comp.apply_position, comp.apply_appearance) };
     // Walk order (parents before children): a moved artboard carries its children, which are
     // then placed absolutely, so the result does not depend on how far the parent moved.
     let order: Vec<LayerId> = doc.walk().into_iter().map(|(_, _, l)| l.id).collect();
+    let mut placed = Vec::new();
     for id in order {
         let Some(st) = comp.state(id) else { continue };
+        if pos && let Some(p) = &st.placement {
+            // A placement the layer cannot take (another kind of layer now, a degenerate
+            // transform, a pixel budget) leaves it where it is: a comp never fails to apply.
+            if apply_placement(doc, id, p).unwrap_or(false) {
+                placed.push(id);
+            }
+        }
         if pos
             && let Some((x, y)) = st.position
             && let Some((cx, cy)) = doc.layer(id).and_then(layer_position)
@@ -99,6 +116,130 @@ pub fn apply_comp(doc: &mut Document, comp: &LayerComp, all: bool) {
             l.effects = a.effects.clone();
         }
     }
+    if !placed.is_empty() {
+        // Type and shapes draw again from their new placement (smart objects re-render as after
+        // any transform, keeping their warped rendering when the source cannot).
+        let snapshot = doc.clone();
+        for id in placed {
+            if let Some(l) = doc.layer_mut(id) {
+                crate::transform_cmds::refresh_text(&snapshot, l);
+            }
+        }
+    }
+}
+
+/// The homogeneous form of an affine map.
+fn homography(a: &Affine) -> Homography {
+    let [a, b, c, d, e, f] = a.m;
+    Homography([a, c, e, b, d, f, 0.0, 0.0, 1.0])
+}
+
+/// The map of the document that takes layer `l` from where it is to placement `p` (document
+/// pixels to document pixels), with its affine form when it has one. None when `l` cannot take
+/// `p`: another kind of layer, nothing to place, a degenerate transform.
+fn placement_step(l: &Layer, p: &CompPlacement) -> Option<(Homography, Option<Affine>)> {
+    match (p, &l.content) {
+        (CompPlacement::Transform { transform, perspective, .. }, LayerContent::Smart(sm)) => {
+            let from = crate::smart_cmds::placement(sm);
+            let to = perspective.map(Homography).unwrap_or_else(|| homography(transform));
+            let h = to.mul(&from.inverse()?);
+            let affine = match (perspective, sm.perspective) {
+                (None, None) => Some(transform.mul(&sm.transform.inverse()?)),
+                _ => None,
+            };
+            Some((h, affine))
+        }
+        (CompPlacement::Transform { transform, .. }, LayerContent::Text(t)) => {
+            let a = transform.mul(&t.transform.inverse()?);
+            Some((homography(&a), Some(a)))
+        }
+        (CompPlacement::Bounds(r), LayerContent::Raster(_) | LayerContent::Shape(_)) => {
+            let cur = position_bounds(l);
+            if cur.is_empty() || r.is_empty() {
+                return None;
+            }
+            let (sx, sy) = (f64::from(r.width()) / f64::from(cur.width()), f64::from(r.height()) / f64::from(cur.height()));
+            let a = Affine { m: [sx, 0.0, 0.0, sy, f64::from(r.x0) - f64::from(cur.x0) * sx, f64::from(r.y0) - f64::from(cur.y0) * sy] };
+            Some((homography(&a), Some(a)))
+        }
+        _ => None,
+    }
+}
+
+/// Puts layer `id` at placement `p` exactly: a smart object's or type layer's transform becomes
+/// the recorded one (its masks, filter mask and rendering moved along, as Free Transform moves
+/// them), a raster or shape layer is transformed onto the recorded bounds. Locks do not stop it.
+/// Returns whether the layer moved. The caller re-renders type and shapes.
+pub fn apply_placement(doc: &mut Document, id: LayerId, p: &CompPlacement) -> Result<bool> {
+    let l = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
+    if layer_placement(l).as_ref() == Some(p) {
+        return Ok(false);
+    }
+    let Some((h, affine)) = placement_step(l, p) else { return Ok(false) };
+    let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+    let taken = crate::smart_cmds::take_caches(std::slice::from_mut(l));
+    let locks = std::mem::take(&mut l.locks);
+    let moved = crate::transform_cmds::transform_layer(None, Locks::default(), l, &h, affine, Interp::Bicubic);
+    l.locks = locks;
+    moved?;
+    // The recorded values themselves, not the product's rounding: showing an alternate layout
+    // and leaving it untouched records exactly what it had.
+    match (p, &mut l.content) {
+        (CompPlacement::Transform { transform, perspective, .. }, LayerContent::Smart(sm)) => {
+            sm.transform = *transform;
+            sm.perspective = *perspective;
+        }
+        (CompPlacement::Transform { transform, text_box, .. }, LayerContent::Text(t)) => {
+            t.transform = *transform;
+            if let (Some([x, y, width, height]), TextShape::Box { .. }) = (text_box, &t.shape) {
+                t.shape = TextShape::Box { x: *x, y: *y, width: *width, height: *height };
+            }
+            t.cache = None;
+        }
+        _ => {}
+    }
+    crate::smart_cmds::restore_unrendered(doc, taken, |c| warp_surface(c, c.content_bounds(), &h, Interp::Bicubic))?;
+    Ok(true)
+}
+
+/// Shows alternate layout `comp` (see the module docs): leaves the one shown, keeps every layer
+/// as the document has it, and puts the layers where the layout records them.
+fn show_layout(doc: &mut Document, comp: &LayerComp) {
+    doc.leave_comp_edit();
+    let base = doc
+        .walk()
+        .into_iter()
+        .map(|(_, _, l)| {
+            let mut b = l.clone();
+            if let Some(ch) = b.children_mut() {
+                ch.clear();
+            }
+            b
+        })
+        .collect();
+    apply_comp(doc, comp, false);
+    let shown = comp
+        .states
+        .iter()
+        .filter(|s| s.placement.is_some())
+        .filter_map(|s| doc.layer(s.layer).and_then(layer_placement).map(|p| (s.layer, p)))
+        .collect();
+    doc.comp_edit = Some(CompEdit { comp: comp.id, base, shown });
+    doc.last_applied_comp = Some(comp.id);
+}
+
+/// Delete Layer while an alternate layout is shown: the layers are hidden in the layout, never
+/// deleted from the document (a layer deleted from one arrangement would be gone from both).
+/// Leave the layout to delete.
+pub(crate) fn hide_in_layout(s: &mut Session, p: &Value) -> Result<Value> {
+    let ids = crate::layer_multi_cmds::targets(s, p)?;
+    s.edit("Hide Layer in Alternate Layout", |doc, _| {
+        for id in &ids {
+            doc.layer_mut(*id).ok_or(EngineError::NoLayer(*id))?.visible = false;
+        }
+        Ok(())
+    })?;
+    Ok(json!({"hidden": ids.iter().map(|l| l.0).collect::<Vec<_>>()}))
 }
 
 fn new_comp(s: &mut Session, p: &Value) -> Result<Value> {
@@ -109,12 +250,18 @@ fn new_comp(s: &mut Session, p: &Value) -> Result<Value> {
         (1..=names.len() + 1).map(|n| format!("Layer Comp {n}")).find(|n| !names.contains(&n.as_str())).unwrap_or_else(|| "Layer Comp".into())
     });
     let comment = p.get("comment").and_then(Value::as_str).unwrap_or_default().to_string();
-    let (v, pos, a) = (flag(p, "visibility", true), flag(p, "position", true), flag(p, "appearance", true));
+    let alternate = flag(p, "alternate", false);
+    // An alternate layout starts empty (every layer where the document has it) and never carries
+    // appearance.
+    let (v, pos, a) = (flag(p, "visibility", true), flag(p, "position", true), !alternate && flag(p, "appearance", true));
     let id = s.edit("New Layer Comp", |doc, _| {
         let id = next_comp_id(doc);
-        let comp = LayerComp { id, name, comment, apply_visibility: v, apply_position: pos, apply_appearance: a, states: capture_states(doc) };
+        let states = if alternate { Vec::new() } else { capture_states(doc) };
+        let comp = LayerComp { id, name, comment, apply_visibility: v, apply_position: pos, apply_appearance: a, alternate, states };
         doc.layer_comps.push(comp);
-        doc.last_applied_comp = Some(id);
+        if !alternate {
+            doc.last_applied_comp = Some(id);
+        }
         Ok(id)
     })?;
     Ok(json!({"comp": id}))
@@ -128,7 +275,17 @@ fn update_comp(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, format!("unknown \"what\" `{what}` (all|visibility|position|appearance)")));
     }
     let every = p.get("comp").and_then(Value::as_str) == Some("*");
-    let ids: Vec<u32> = if every { d.doc.layer_comps.iter().map(|c| c.id).collect() } else { vec![comp_param(&d.doc, p, cmd)?] };
+    // An alternate layout records itself while it is shown; capturing every layer's state into
+    // it would stop the layers it does not move from following the document.
+    let ids: Vec<u32> = if every {
+        d.doc.layer_comps.iter().filter(|c| !c.alternate).map(|c| c.id).collect()
+    } else {
+        let id = comp_param(&d.doc, p, cmd)?;
+        if d.doc.comp(id).is_some_and(|c| c.alternate) {
+            return Err(bad(cmd, "an alternate layout records what it shows: show it (Apply), change it, then return to the document"));
+        }
+        vec![id]
+    };
     let label = match what {
         "visibility" => "Update Layer Comp Visibility",
         "position" => "Update Layer Comp Position",
@@ -146,7 +303,8 @@ fn update_comp(s: &mut Session, p: &Value) -> Result<Value> {
             // One property: refresh it on every live layer, keep the others as recorded.
             let mut states: Vec<CompLayerState> = Vec::with_capacity(now.len());
             for n in &now {
-                let mut st = c.state(n.layer).cloned().unwrap_or(CompLayerState { layer: n.layer, visible: None, position: None, appearance: None });
+                let mut st =
+                    c.state(n.layer).cloned().unwrap_or(CompLayerState { layer: n.layer, visible: None, position: None, appearance: None, placement: None });
                 match what {
                     "visibility" => st.visible = n.visible,
                     "position" => st.position = n.position,
@@ -177,8 +335,20 @@ fn matches_last_comp(doc: &Document, now: &[CompLayerState]) -> bool {
 }
 
 fn apply(s: &mut Session, id: u32, label: &str) -> Result<Value> {
+    if s.active().and_then(|d| d.doc.comp(id)).is_some_and(|c| c.alternate) {
+        s.edit("Show Alternate Layout", |doc, _| {
+            let comp = doc.comp(id).cloned().ok_or_else(|| EngineError::Other(format!("no layer comp with id {id}")))?;
+            show_layout(doc, &comp);
+            Ok(())
+        })?;
+        let d = s.active().ok_or(EngineError::NoDocument)?;
+        let missing = d.doc.comp(id).map(|c| c.missing_layers(&d.doc).len()).unwrap_or(0);
+        return Ok(json!({"comp": id, "missingLayers": missing, "alternate": true}));
+    }
     s.edit(label, |doc, _| {
         let comp = doc.comp(id).cloned().ok_or_else(|| EngineError::Other(format!("no layer comp with id {id}")))?;
+        // Any other comp applies over the document's own arrangement.
+        doc.leave_comp_edit();
         // Ordinary edits can leave last_applied_comp pointing at an outdated layout (#919).
         // Preserve the edited layout, but keep the original backup while cycling unedited comps.
         let states = capture_states(doc);
@@ -190,6 +360,7 @@ fn apply(s: &mut Session, id: u32, label: &str) -> Result<Value> {
                 apply_visibility: true,
                 apply_position: true,
                 apply_appearance: true,
+                alternate: false,
                 states,
             });
         }
@@ -242,6 +413,9 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let id = comp_param(&d.doc, p, "layerComp.delete")?;
     s.edit("Delete Layer Comp", |doc, _| {
+        if doc.comp_edit.as_ref().is_some_and(|e| e.comp == id) {
+            doc.leave_comp_edit();
+        }
         doc.layer_comps.retain(|c| c.id != id);
         if doc.last_applied_comp == Some(id) {
             doc.last_applied_comp = None;
@@ -347,6 +521,13 @@ fn set_options(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn restore_last(s: &mut Session) -> Result<Value> {
+    if s.active().is_some_and(|d| d.doc.comp_edit.is_some()) {
+        s.edit("Leave Alternate Layout", |doc, _| {
+            doc.leave_comp_edit();
+            Ok(())
+        })?;
+        return Ok(Value::Null);
+    }
     s.edit("Restore Last Document State", |doc, _| {
         let last = doc.last_document_state.clone().ok_or_else(|| EngineError::Other("no Last Document State".into()))?;
         apply_comp(doc, &last, true);
@@ -401,11 +582,15 @@ fn list(s: &mut Session) -> Result<Value> {
             json!({
                 "id": c.id, "name": c.name, "comment": c.comment,
                 "visibility": c.apply_visibility, "position": c.apply_position, "appearance": c.apply_appearance,
+                "alternate": c.alternate,
                 "layers": c.states.len(), "missingLayers": c.missing_layers(&d.doc).len(),
             })
         })
         .collect();
-    Ok(json!({"comps": comps, "lastApplied": d.doc.last_applied_comp, "hasLastDocumentState": d.doc.last_document_state.is_some()}))
+    Ok(json!({
+        "comps": comps, "lastApplied": d.doc.last_applied_comp, "hasLastDocumentState": d.doc.last_document_state.is_some(),
+        "showing": d.doc.comp_edit.as_ref().map(|e| e.comp),
+    }))
 }
 
 /// File › Export › Layer Comps to Files: one file per comp, named
@@ -426,6 +611,7 @@ fn comps_to_files(s: &mut Session, p: &Value) -> Result<Value> {
     let mut files = Vec::new();
     for (i, c) in doc.layer_comps.iter().enumerate().filter(|(_, c)| chosen.contains(&c.id)) {
         let mut one = (*doc).clone();
+        one.leave_comp_edit();
         apply_comp(&mut one, c, false);
         one.last_applied_comp = Some(c.id);
         let path = join(&dir, &format!("{}_{:04}_{}.{format}", sanitize(&prefix), i, sanitize(&c.name)));
@@ -449,7 +635,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "layerComp.new",
             "New Layer Comp…",
             &[],
-            r##"{"name":str="Layer Comp N","comment":str="","visibility":bool=true,"position":bool=true,"appearance":bool=true} → {comp}"##,
+            r##"{"name":str="Layer Comp N","comment":str="","visibility":bool=true,"position":bool=true,"appearance":bool=true,"alternate":bool=false (an alternate layout: starts empty, is shown and edited by Apply, records exact placement; never appearance)} → {comp}"##,
             has_doc,
             new_comp
         ),
@@ -461,7 +647,14 @@ pub fn specs() -> Vec<CommandSpec> {
             has_comps,
             update_comp
         ),
-        spec!("layerComp.apply", "Apply Layer Comp", &[], r##"{"comp":id|name? (default: last applied)} → {comp, missingLayers}"##, has_comps, apply_cmd),
+        spec!(
+            "layerComp.apply",
+            "Apply Layer Comp",
+            &[],
+            r##"{"comp":id|name? (default: last applied)} → {comp, missingLayers, alternate?} (an alternate layout is shown for editing instead; Restore Last Document State leaves it)"##,
+            has_comps,
+            apply_cmd
+        ),
         spec!("layerComp.previous", "Apply Previous Layer Comp", &[], "{}", has_comps, |s, _| step(s, -1)),
         spec!("layerComp.next", "Apply Next Layer Comp", &[], "{}", has_comps, |s, _| step(s, 1)),
         spec!("layerComp.delete", "Delete Layer Comp", &[], r##"{"comp":id|name?}"##, has_comps, delete),
@@ -492,7 +685,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 "layerComp.list",
                 "List Layer Comps",
                 &[],
-                "{} → {comps:[{id,name,comment,visibility,position,appearance,layers,missingLayers}],lastApplied,hasLastDocumentState}",
+                "{} → {comps:[{id,name,comment,visibility,position,appearance,alternate,layers,missingLayers}],lastApplied,hasLastDocumentState,showing (the alternate layout shown, or null)}",
                 has_doc,
                 |s, _| list(s)
             )

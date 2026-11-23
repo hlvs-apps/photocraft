@@ -30,7 +30,7 @@ pub use adjust::Adjustment;
 pub use advanced::{AdvancedBlending, Knockout};
 pub use analysis::{CountGroup, Measurement, MeasurementScale, Note, Ruler};
 pub use blend_if::{BlendIf, BlendRange};
-pub use comps::{Artboard, ArtboardBackground, CompAppearance, CompLayerState, LayerComp};
+pub use comps::{Artboard, ArtboardBackground, CompAppearance, CompEdit, CompLayerState, CompPlacement, LayerComp};
 pub use effects::{
     Bevel, BevelContour, BevelStyle, BevelTechnique, BevelTexture, Contour, Effect, FxCommon, FxPaint, GlobalLight, Glow, GlowSource, GlowTechnique, Gradient,
     GradientStyle, Satin, Shadow, StrokeFx, StrokePosition,
@@ -912,6 +912,11 @@ pub struct Document {
     /// "Last Document State": layer state saved when a comp is applied over the document's own
     /// state, restored by `layerComp.restoreLastDocumentState`. Its id is 0.
     pub last_document_state: Option<LayerComp>,
+    /// The alternate layout being shown and edited, with the layers as the document had them
+    /// (see [`comps::CompEdit`]). Part of the document so showing and leaving it are history
+    /// steps, like Quick Mask. Never saved: a save writes the document with it left
+    /// ([`Document::committed`]).
+    pub comp_edit: Option<CompEdit>,
     /// Image › Analysis: measurement scale, Count tool groups and the Ruler line.
     pub measurement: Measurement,
     /// Note tool annotations (PSD `Anno`).
@@ -988,6 +993,7 @@ impl Document {
             layer_comps: Vec::new(),
             last_applied_comp: None,
             last_document_state: None,
+            comp_edit: None,
             measurement: Measurement::default(),
             notes: Vec::new(),
             text_styles: TextStyles::default(),

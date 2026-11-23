@@ -523,26 +523,37 @@ fn build() -> Vec<CommandSpec> {
                 Ok(json!({ "layer": nid.0 }))
             }
         ),
-        cmd!("layer.delete", "Delete Layer", ["Layer", "Delete"], None, r##"{"layer":id?} (no layer: every selected layer)"##, has_layer, |s, p| {
-            if crate::layer_multi_cmds::multi(s, p) {
-                return crate::layer_multi_cmds::delete_selected(s);
+        cmd!(
+            "layer.delete",
+            "Delete Layer",
+            ["Layer", "Delete"],
+            None,
+            r##"{"layer":id?} (no layer: every selected layer; while an alternate layout is shown: hidden in it instead)"##,
+            has_layer,
+            |s, p| {
+                if s.active().is_some_and(|d| d.doc.comp_edit.is_some()) {
+                    return crate::comps_cmds::hide_in_layout(s, p);
+                }
+                if crate::layer_multi_cmds::multi(s, p) {
+                    return crate::layer_multi_cmds::delete_selected(s);
+                }
+                let id = layer_param(s, p)?;
+                s.edit("Delete Layer", |doc, active| {
+                    let neighbours = crate::layer_multi_cmds::deletion_neighbours(doc, id);
+                    let before = crate::clip_group::Before::read(doc, &[id]);
+                    doc.remove(id).ok_or(EngineError::NoLayer(id))?;
+                    crate::clip_group::settle(doc, &[], &before, false);
+                    if doc.layers.is_empty() {
+                        return Err(EngineError::Other("a document must keep at least one layer".into()));
+                    }
+                    if active.is_some_and(|current| doc.layer(current).is_none()) {
+                        *active = neighbours.into_iter().find(|candidate| doc.layer(*candidate).is_some());
+                    }
+                    Ok(())
+                })?;
+                Ok(Value::Null)
             }
-            let id = layer_param(s, p)?;
-            s.edit("Delete Layer", |doc, active| {
-                let neighbours = crate::layer_multi_cmds::deletion_neighbours(doc, id);
-                let before = crate::clip_group::Before::read(doc, &[id]);
-                doc.remove(id).ok_or(EngineError::NoLayer(id))?;
-                crate::clip_group::settle(doc, &[], &before, false);
-                if doc.layers.is_empty() {
-                    return Err(EngineError::Other("a document must keep at least one layer".into()));
-                }
-                if active.is_some_and(|current| doc.layer(current).is_none()) {
-                    *active = neighbours.into_iter().find(|candidate| doc.layer(*candidate).is_some());
-                }
-                Ok(())
-            })?;
-            Ok(Value::Null)
-        }),
+        ),
         cmd!(
             "layer.select",
             "Select Layer",

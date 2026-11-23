@@ -1221,6 +1221,10 @@ impl PcraftWriter {
 
     fn prepare_interruptible(&mut self, doc: &Document, opts: &SaveOptions, limits: &SaveLimits, ctl: &Interrupt) -> Result<Prepared> {
         ctl.check()?;
+        // An alternate layout being shown is not the document's arrangement: every save (and
+        // recovery copy) writes the document with it left, its edits recorded in its comp.
+        let committed = doc.committed();
+        let doc: &Document = &committed;
         // Only hashes of freed allocations go. A live one stays even when `ctl` trips here: an
         // interrupted prepare keeps every hash it has, so the next call resumes
         // (`prepare_parts` under a per-frame time budget relies on it).
