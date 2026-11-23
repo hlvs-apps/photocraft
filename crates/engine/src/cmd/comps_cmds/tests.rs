@@ -719,3 +719,43 @@ fn a_layer_left_where_the_layout_put_it_keeps_its_recorded_placement_exactly() {
     assert_eq!(doc(&s).comp(c).unwrap().state(a).unwrap().placement, moved);
     assert_ne!(moved, Some(recorded));
 }
+
+#[test]
+fn painting_in_an_alternate_layout_is_refused_without_history_or_pixel_changes() {
+    for rect in [Rect::new(15, 5, 18, 8), Rect::new(1, 1, 8, 8)] {
+        let (mut s, [a, ..], c) = layout_session();
+        s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+        s.execute("layer.translate", json!({"layer": a.0, "dx": 10, "dy": 0})).unwrap();
+        let before = doc(&s).clone();
+        let steps = s.active().unwrap().history.entries().len();
+        let result = s.edit("Paint", |d, _| {
+            let fmt = d.pixel_format();
+            d.layer_mut(a).unwrap().surface_mut().unwrap().fill_rect(rect, &photocraft_raster::from_rgba(&fmt, [0.0, 1.0, 0.0, 1.0]));
+            Ok(())
+        });
+        assert!(result.unwrap_err().to_string().contains("Back to the document"));
+        assert_eq!(doc(&s), &before);
+        assert_eq!(s.active().unwrap().history.entries().len(), steps);
+    }
+}
+
+#[test]
+fn mask_paint_in_an_alternate_layout_is_refused_atomically() {
+    let (mut s, [a, ..], c) = layout_session();
+    s.edit("mask", |d, _| {
+        d.layer_mut(a).unwrap().mask = Some(photocraft_doc::LayerMask::reveal_all());
+        Ok(())
+    })
+    .unwrap();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    s.execute("layer.translate", json!({"layer": a.0, "dx": 10, "dy": 0})).unwrap();
+    let before = doc(&s).clone();
+    let steps = s.active().unwrap().history.entries().len();
+    let result = s.edit("Paint mask", |d, _| {
+        d.layer_mut(a).unwrap().mask.as_mut().unwrap().surface.fill_rect(Rect::new(15, 5, 18, 8), &[0.0]);
+        Ok(())
+    });
+    assert!(result.unwrap_err().to_string().contains("Back to the document"));
+    assert_eq!(doc(&s), &before);
+    assert_eq!(s.active().unwrap().history.entries().len(), steps);
+}

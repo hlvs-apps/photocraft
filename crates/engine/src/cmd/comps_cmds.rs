@@ -202,6 +202,56 @@ pub fn apply_placement(doc: &mut Document, id: LayerId, p: &CompPlacement) -> Re
     Ok(true)
 }
 
+/// Reject content mutations that leaving an alternate layout would discard. This runs
+/// against a candidate document before it enters history, including direct Session edits.
+/// A placement change is allowed only when its pixels/masks are exactly that transform
+/// of the previous content. Shared text and style edits are unaffected.
+pub(crate) fn validate_layout_edit(before: &Document, after: &Document) -> Result<()> {
+    let Some(edit) = &before.comp_edit else { return Ok(()) };
+    if after.comp_edit.as_ref().map(|e| e.comp) != Some(edit.comp) {
+        return Ok(());
+    }
+    fn content_at_risk(a: &Layer, b: &Layer) -> bool {
+        let pixels = match (&a.content, &b.content) {
+            (LayerContent::Raster(a), LayerContent::Raster(b)) => a != b,
+            (LayerContent::Shape(a), LayerContent::Shape(b)) => a != b,
+            (LayerContent::Smart(a), LayerContent::Smart(b)) => a.filter_mask != b.filter_mask,
+            _ => false,
+        };
+        pixels || a.mask != b.mask || a.vector_mask != b.vector_mask
+    }
+    for (_, _, layer) in after.walk() {
+        let Some(old) = before.layer(layer.id) else { continue };
+        if !content_at_risk(old, layer) {
+            continue;
+        }
+        let mut expected = before.clone();
+        if let Some(placement) = layer_placement(layer) {
+            // Integer translation is lossless; resampling it again changes edge pixels.
+            let shift = match (layer_placement(old), &placement) {
+                (Some(CompPlacement::Bounds(a)), CompPlacement::Bounds(b)) if a.width() == b.width() && a.height() == b.height() => {
+                    b.x0.checked_sub(a.x0).zip(b.y0.checked_sub(a.y0))
+                }
+                _ => None,
+            };
+            if let Some((dx, dy)) = shift {
+                if let Some(l) = expected.layer_mut(layer.id) {
+                    crate::commands::translate_layer(before, l, dx, dy);
+                    crate::vector_cmds::translate_vectors(before, l, f64::from(dx), f64::from(dy));
+                }
+            } else {
+                apply_placement(&mut expected, layer.id, &placement)?;
+            }
+        }
+        if expected.layer(layer.id).is_some_and(|l| content_at_risk(l, layer)) {
+            return Err(EngineError::Other(
+                "Pixel, shape and mask edits cannot be kept while an alternate layout is shown. Choose Back to the document, then make this edit.".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Shows alternate layout `comp` (see the module docs): leaves the one shown, keeps every layer
 /// as the document has it, and puts the layers where the layout records them.
 fn show_layout(doc: &mut Document, comp: &LayerComp) {
@@ -218,12 +268,8 @@ fn show_layout(doc: &mut Document, comp: &LayerComp) {
         })
         .collect();
     apply_comp(doc, comp, false);
-    let shown = comp
-        .states
-        .iter()
-        .filter(|s| s.placement.is_some())
-        .filter_map(|s| doc.layer(s.layer).and_then(layer_placement).map(|p| (s.layer, p)))
-        .collect();
+    let shown =
+        comp.states.iter().filter(|s| s.placement.is_some()).filter_map(|s| doc.layer(s.layer).and_then(layer_placement).map(|p| (s.layer, p))).collect();
     doc.comp_edit = Some(CompEdit { comp: comp.id, base, shown });
     doc.last_applied_comp = Some(comp.id);
 }
