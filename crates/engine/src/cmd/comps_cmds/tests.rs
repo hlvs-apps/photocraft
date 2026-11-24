@@ -861,3 +861,22 @@ fn a_layout_with_a_scope_leaves_the_other_pages_to_the_document() {
     s.execute("layer.delete", json!({"layer": in_two.0})).unwrap();
     assert!(doc(&s).layer(in_two).is_none(), "outside the scope Delete deletes");
 }
+
+#[test]
+fn a_layer_added_while_a_layout_is_shown_can_be_painted_and_keeps_its_pixels() {
+    let (mut s, _, c) = layout_session();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    let added = LayerId(s.execute("layer.new.layer", json!({})).unwrap()["layer"].as_u64().unwrap());
+    // Filled while shown (the content guard lets a layer of the layout's own be painted).
+    s.edit("fill", |d, _| {
+        let fmt = d.pixel_format();
+        d.layer_mut(added).unwrap().surface_mut().unwrap().fill_rect(Rect::new(0, 0, 64, 48), &photocraft_raster::from_rgba(&fmt, [1.0, 1.0, 0.0, 1.0]));
+        Ok(())
+    })
+    .unwrap();
+    s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+    let l = doc(&s).layer(added).unwrap();
+    assert!(!l.visible, "hidden in the document");
+    assert_eq!(l.surface().unwrap().content_bounds(), Rect::new(0, 0, 64, 48), "its pixels are kept");
+    assert_eq!(doc(&s).comp(c).unwrap().state(added).unwrap().visible, Some(true));
+}

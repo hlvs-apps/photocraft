@@ -242,8 +242,10 @@ pub(crate) fn validate_layout_edit(before: &Document, after: &Document) -> Resul
     let comp = before.editing_comp();
     for (_, _, layer) in after.walk() {
         let Some(old) = before.layer(layer.id) else { continue };
-        // Outside the layout's reach the document is edited as usual.
-        if !content_at_risk(old, layer) || comp.is_some_and(|c| !c.applies_to(before, layer.id)) {
+        // Outside the layout's reach the document is edited as usual, and a layer added while the
+        // layout is shown belongs to it alone: leaving it keeps its content (it is only hidden in
+        // the document), so it may be painted on.
+        if !content_at_risk(old, layer) || comp.is_some_and(|c| !c.applies_to(before, layer.id)) || !edit.base.iter().any(|b| b.id == layer.id) {
             continue;
         }
         let mut expected = before.clone();
