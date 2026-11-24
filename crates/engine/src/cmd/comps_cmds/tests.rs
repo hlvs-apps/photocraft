@@ -880,3 +880,47 @@ fn a_layer_added_while_a_layout_is_shown_can_be_painted_and_keeps_its_pixels() {
     assert_eq!(l.surface().unwrap().content_bounds(), Rect::new(0, 0, 64, 48), "its pixels are kept");
     assert_eq!(doc(&s).comp(c).unwrap().state(added).unwrap().visible, Some(true));
 }
+
+#[test]
+fn moving_between_layout_scopes_is_refused_without_leaking_placement() {
+    let (mut s, a, _) = session(8);
+    let outside = s
+        .edit("outside", |d, _| {
+            let g = Layer::group("Outside", vec![]);
+            let id = g.id;
+            d.layers.push(g);
+            Ok(id)
+        })
+        .unwrap();
+    let c = s.execute("layerComp.new", json!({"alternate": true, "scope": [a.0]})).unwrap()["comp"].as_u64().unwrap();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    s.execute("layer.translate", json!({"layer": a.0, "dx": 10, "dy": 0})).unwrap();
+    let before = doc(&s).clone();
+    let steps = s.active().unwrap().history.entries().len();
+    let result = s.edit("Reparent", |d, _| {
+        let i = d.layers.iter().position(|l| l.id == a).unwrap();
+        let layer = d.layers.remove(i);
+        d.layer_mut(outside).unwrap().children_mut().unwrap().push(layer);
+        Ok(())
+    });
+    assert!(result.is_err(), "reparenting must not leak alternate coordinates into the base");
+    assert_eq!(doc(&s), &before);
+    assert_eq!(s.active().unwrap().history.entries().len(), steps);
+    assert_eq!(doc(&s).committed().layer(a).and_then(layer_position), Some((4, 4)));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(pos(&s, a), Some((4, 4)));
+}
+
+#[test]
+fn deleting_across_layout_scopes_is_not_silently_partial() {
+    let (mut s, a, b) = session(8);
+    let c = s.execute("layerComp.new", json!({"alternate": true, "scope": [a.0]})).unwrap()["comp"].as_u64().unwrap();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    s.execute("layer.select", json!({"layer": a.0})).unwrap();
+    s.execute("layer.select", json!({"layer": b.0, "mode": "add"})).unwrap();
+    let before = doc(&s).clone();
+    let steps = s.active().unwrap().history.entries().len();
+    assert!(s.execute("layer.delete", json!({})).is_err());
+    assert_eq!(doc(&s), &before);
+    assert_eq!(s.active().unwrap().history.entries().len(), steps);
+}

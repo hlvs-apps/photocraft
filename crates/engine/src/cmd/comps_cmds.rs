@@ -242,6 +242,11 @@ pub(crate) fn validate_layout_edit(before: &Document, after: &Document) -> Resul
     let comp = before.editing_comp();
     for (_, _, layer) in after.walk() {
         let Some(old) = before.layer(layer.id) else { continue };
+        if comp.is_some_and(|c| c.applies_to(before, layer.id) != c.applies_to(after, layer.id)) {
+            return Err(EngineError::Other(
+                "Moving layers between pages with different alternate layouts cannot be kept while a layout is shown. Choose Back to the document, then move the layer.".into(),
+            ));
+        }
         // Outside the layout's reach the document is edited as usual, and a layer added while the
         // layout is shown belongs to it alone: leaving it keeps its content (it is only hidden in
         // the document), so it may be painted on.
@@ -326,6 +331,12 @@ pub(crate) fn hide_in_layout(s: &mut Session, p: &Value) -> Result<Option<Value>
     let ids = crate::layer_multi_cmds::targets(s, p)?;
     let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
     let Some(comp) = doc.editing_comp() else { return Ok(None) };
+    let reached = ids.iter().filter(|id| comp.applies_to(doc, **id)).count();
+    if reached != 0 && reached != ids.len() {
+        return Err(EngineError::Other(
+            "The selection spans pages with different alternate layouts. Select layers in one layout, or choose Back to the document before deleting.".into(),
+        ));
+    }
     let ids: Vec<LayerId> = ids.into_iter().filter(|id| comp.applies_to(doc, *id)).collect();
     if ids.is_empty() {
         return Ok(None);

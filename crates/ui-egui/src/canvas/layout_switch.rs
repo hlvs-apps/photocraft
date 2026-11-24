@@ -27,12 +27,13 @@ pub struct Segment {
 pub fn segments(doc: &Document, page: Option<u64>) -> Option<Vec<Segment>> {
     let layouts: Vec<&LayerComp> = doc.layer_comps.iter().filter(|c| c.alternate).collect();
     let first = layouts.first()?;
-    let shown = doc.comp_edit.as_ref().map(|e| e.comp);
+    let reaches = |c: &LayerComp| c.scope.is_empty() || page.is_some_and(|p| c.scope.contains(&LayerId(p))) || (page.is_none() && doc.artboards().is_empty());
+    // The shown layout is document-wide, but this page can still be using the base.
+    let shown = doc.comp_edit.as_ref().map(|e| e.comp).filter(|id| layouts.iter().any(|c| c.id == *id && reaches(c)));
     let label = if first.document_label.is_empty() { tl!("Document").to_string() } else { first.document_label.clone() };
     let mut out = vec![Segment { label, comp: None, selected: shown.is_none(), disabled: None }];
     for c in layouts {
-        let reaches = c.scope.is_empty() || page.is_some_and(|p| c.scope.contains(&LayerId(p))) || (page.is_none() && doc.artboards().is_empty());
-        let disabled = (!reaches).then(|| crate::i18n::fmt(tl!("\u{201c}{name}\u{201d} does not apply to this page"), &[("name", &c.name)]));
+        let disabled = (!reaches(c)).then(|| crate::i18n::fmt(tl!("\u{201c}{name}\u{201d} does not apply to this page"), &[("name", &c.name)]));
         out.push(Segment { label: c.name.clone(), comp: Some(c.id), selected: shown == Some(c.id), disabled });
     }
     Some(out)
@@ -102,7 +103,7 @@ mod tests {
 
     #[test]
     fn the_switch_names_both_arrangements_and_is_off_where_the_layout_does_not_reach() {
-        let (s, c, a, b) = doc_with_layout(true);
+        let (mut s, c, a, b) = doc_with_layout(true);
         let doc = &s.active().unwrap().doc;
         let on_a = segments(doc, Some(a)).unwrap();
         assert_eq!(on_a.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(), ["With QR", "Without QR"]);
@@ -110,6 +111,9 @@ mod tests {
         assert_eq!(action(&on_a[1]), Some(("layerComp.apply", json!({"comp": c}))));
         let on_b = segments(doc, Some(b)).unwrap();
         assert!(on_b[1].disabled.is_some(), "a page without the layout cannot switch to it");
+        s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+        let on_b = segments(&s.active().unwrap().doc, Some(b)).unwrap();
+        assert!(on_b[0].selected && !on_b[1].selected && on_b[1].disabled.is_some(), "an unaffected page shows the base as selected");
         let mut plain = Session::new();
         plain.execute("file.new", json!({"width": 8, "height": 8})).unwrap();
         assert!(segments(&plain.active().unwrap().doc, None).is_none(), "no layout, no switch");
