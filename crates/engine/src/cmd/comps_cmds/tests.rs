@@ -289,6 +289,8 @@ fn unreachable_comp_positions_leave_the_layer_in_place() {
             apply_position: true,
             apply_appearance: false,
             alternate: false,
+            scope: Vec::new(),
+            document_label: String::new(),
             states: vec![
                 CompLayerState { layer: a, visible: Some(false), position: Some(target), appearance: None, placement: None },
                 // Control: an ordinary position on another layer still moves it.
@@ -758,4 +760,104 @@ fn mask_paint_in_an_alternate_layout_is_refused_atomically() {
     assert!(result.unwrap_err().to_string().contains("Back to the document"));
     assert_eq!(doc(&s), &before);
     assert_eq!(s.active().unwrap().history.entries().len(), steps);
+}
+
+/// A group around raster A with a pixel mask and a vector mask (a COMPOSITE_GROUP's frame), an
+/// alternate layout, and the group's id.
+fn masked_group_session() -> (Session, LayerId, LayerId, u32) {
+    use photocraft_doc::{LayerMask, Path, Subpath, VectorMask, vector::Knot};
+    let (mut s, a, _) = session(8);
+    let g = s
+        .edit("group", |doc, _| {
+            let i = doc.layers.iter().position(|l| l.id == a).unwrap();
+            let inner = doc.layers.remove(i);
+            let mut g = Layer::group("G", vec![inner]);
+            let mut m = LayerMask::reveal_all();
+            m.surface.fill_rect(Rect::new(2, 2, 20, 20), &[0.0]);
+            g.mask = Some(m);
+            let k = Knot::corner;
+            g.vector_mask = Some(VectorMask {
+                path: Path {
+                    subpaths: vec![Subpath { knots: vec![k(3.0, 3.0), k(18.0, 3.0), k(18.0, 18.0)], closed: true, ..Default::default() }],
+                    ..Default::default()
+                },
+                enabled: true,
+                linked: true,
+                density: 1.0,
+                feather: 0.0,
+            });
+            let id = g.id;
+            doc.layers.insert(i, g);
+            Ok(id)
+        })
+        .unwrap();
+    let c = s.execute("layerComp.new", json!({"name": "QR off", "alternate": true})).unwrap()["comp"].as_u64().unwrap() as u32;
+    (s, g, a, c)
+}
+
+#[test]
+fn moving_a_masked_group_in_a_layout_records_its_mask_frame_and_its_children() {
+    let (mut s, g, a, c) = masked_group_session();
+    let base_mask = doc(&s).layer(g).unwrap().vector_mask.clone();
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    // The Move tool on the group: its masks and its child move by whole pixels (the content
+    // guard accepts that as placement).
+    s.execute("layer.translate", json!({"layer": g.0, "dx": 5, "dy": 2})).unwrap();
+    s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+    let comp = doc(&s).comp(c).unwrap();
+    assert_eq!(comp.state(g).unwrap().placement, Some(CompPlacement::Mask { bounds: [8.0, 5.0, 23.0, 20.0] }), "the group's own frame");
+    assert_eq!(comp.state(a).unwrap().placement, Some(CompPlacement::Bounds(Rect::new(9, 6, 19, 16))), "and its child");
+    assert_eq!(doc(&s).layer(g).unwrap().vector_mask, base_mask, "the document's mask is back");
+    // Shown again, the masks go where the layout puts them.
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    assert_eq!(placement_of(&s, g), Some(CompPlacement::Mask { bounds: [8.0, 5.0, 23.0, 20.0] }));
+    assert_eq!(placement_of(&s, a), Some(CompPlacement::Bounds(Rect::new(9, 6, 19, 16))));
+}
+
+#[test]
+fn a_layout_with_a_scope_leaves_the_other_pages_to_the_document() {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 32})).unwrap();
+    let one = LayerId(s.execute("layer.new.artboard", json!({"rect": [0, 0, 30, 30], "name": "One"})).unwrap()["layer"].as_u64().unwrap());
+    let two = LayerId(s.execute("layer.new.artboard", json!({"rect": [34, 0, 30, 30], "name": "Two"})).unwrap()["layer"].as_u64().unwrap());
+    let (in_one, in_two) = s
+        .edit("layers", |doc, _| {
+            let fmt = doc.pixel_format();
+            let mut x = Layer::raster("x", fmt);
+            x.surface_mut().unwrap().fill_rect(Rect::new(2, 2, 8, 8), &photocraft_raster::from_rgba(&fmt, [1.0, 0.0, 0.0, 1.0]));
+            let mut y = Layer::raster("y", fmt);
+            y.surface_mut().unwrap().fill_rect(Rect::new(36, 2, 42, 8), &photocraft_raster::from_rgba(&fmt, [0.0, 1.0, 0.0, 1.0]));
+            let ids = (x.id, y.id);
+            doc.layer_mut(one).unwrap().children_mut().unwrap().push(x);
+            doc.layer_mut(two).unwrap().children_mut().unwrap().push(y);
+            Ok(ids)
+        })
+        .unwrap();
+    let c = s.execute("layerComp.new", json!({"name": "Without QR", "alternate": true, "scope": [one.0], "documentLabel": "With QR"})).unwrap()["comp"]
+        .as_u64()
+        .unwrap() as u32;
+    assert!(s.execute("layerComp.new", json!({"alternate": true, "scope": [in_one.0]})).is_err(), "a scope names top-level layers");
+    let listed = s.execute("layerComp.list", json!({})).unwrap();
+    assert_eq!(listed["comps"][0]["scope"], json!([one.0]));
+    assert_eq!(listed["comps"][0]["documentLabel"], "With QR");
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    s.execute("layer.translate", json!({"layer": in_one.0, "dx": 3, "dy": 0})).unwrap();
+    // On the page it does not reach the document is edited as usual: a move stays, pixels may
+    // be painted, and Delete deletes.
+    s.execute("layer.translate", json!({"layer": in_two.0, "dx": 4, "dy": 0})).unwrap();
+    s.edit("paint", |d, _| {
+        let fmt = d.pixel_format();
+        d.layer_mut(in_two).unwrap().surface_mut().unwrap().fill_rect(Rect::new(40, 10, 44, 14), &photocraft_raster::from_rgba(&fmt, [0.0, 0.0, 1.0, 1.0]));
+        Ok(())
+    })
+    .unwrap();
+    s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+    let comp = doc(&s).comp(c).unwrap();
+    assert!(comp.state(in_one).is_some());
+    assert!(comp.state(in_two).is_none(), "nothing is recorded outside the scope");
+    assert_eq!(pos(&s, in_one), Some((2, 2)), "inside: the document's place is back");
+    assert_eq!(pos(&s, in_two), Some((40, 2)), "outside: the edit stays");
+    s.execute("layerComp.apply", json!({"comp": c})).unwrap();
+    s.execute("layer.delete", json!({"layer": in_two.0})).unwrap();
+    assert!(doc(&s).layer(in_two).is_none(), "outside the scope Delete deletes");
 }

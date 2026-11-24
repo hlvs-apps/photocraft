@@ -117,6 +117,12 @@ pub struct LayerCompM {
     /// before alternate layouts.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub alternate: bool,
+    /// An alternate layout's reach: top-level layer ids (as in `LayerM::id`); absent = all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<u64>,
+    /// An alternate layout's name for the document's own arrangement; absent = "".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub document_label: String,
     #[serde(default)]
     pub states: Vec<CompStateM>,
 }
@@ -150,6 +156,9 @@ pub enum CompPlacementM {
     },
     Bounds {
         rect: photocraft_geom::Rect,
+    },
+    Mask {
+        bounds: [f64; 4],
     },
 }
 

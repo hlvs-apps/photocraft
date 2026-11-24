@@ -25,7 +25,18 @@ fn document() -> (Document, Layer, Layer) {
 }
 
 fn comp(id: u32, alternate: bool, states: Vec<CompLayerState>) -> LayerComp {
-    LayerComp { id, name: format!("C{id}"), comment: String::new(), apply_visibility: true, apply_position: true, apply_appearance: false, alternate, states }
+    LayerComp {
+        id,
+        name: format!("C{id}"),
+        comment: String::new(),
+        apply_visibility: true,
+        apply_position: true,
+        apply_appearance: false,
+        alternate,
+        scope: Vec::new(),
+        document_label: String::new(),
+        states,
+    }
 }
 
 #[test]
@@ -57,6 +68,21 @@ fn alternate_layouts_and_exact_placements_round_trip() {
         ],
     ));
     doc.layer_comps.push(comp(8, false, vec![CompLayerState { layer: a.id, visible: Some(true), position: Some((4, 4)), appearance: None, placement: None }]));
+    // A layout reaching one top-level layer, naming the document's arrangement, with a mask frame.
+    let mut scoped = comp(
+        9,
+        true,
+        vec![CompLayerState {
+            layer: t.id,
+            visible: None,
+            position: None,
+            appearance: None,
+            placement: Some(CompPlacement::Mask { bounds: [1.25, 2.5, 30.125, 40.0625] }),
+        }],
+    );
+    scoped.scope = vec![t.id];
+    scoped.document_label = "With QR".into();
+    doc.layer_comps.push(scoped);
     let bytes = photocraft_format::save_to_bytes(&doc, &Default::default()).unwrap();
     let back = photocraft_format::load_from_bytes(&bytes).unwrap();
     assert_eq!(back.layer_comps, doc.layer_comps, "every double comes back bit for bit");

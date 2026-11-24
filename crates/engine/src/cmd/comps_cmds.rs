@@ -12,7 +12,7 @@
 //! (`Document::leave_comp_edit`). Delete Layer hides a layer in it instead of deleting it.
 
 use photocraft_algo::transform::{Homography, Interp, warp_surface};
-use photocraft_doc::comps::{CompPlacement, capture_states, layer_placement, layer_position, next_comp_id, position_bounds};
+use photocraft_doc::comps::{CompPlacement, capture_states, layer_placement, layer_position, mask_bounds, next_comp_id, position_bounds};
 use photocraft_doc::text::TextShape;
 use photocraft_doc::{CompEdit, CompLayerState, Document, Layer, LayerComp, LayerContent, LayerId, Locks};
 use photocraft_geom::Affine;
@@ -84,6 +84,10 @@ pub fn apply_comp(doc: &mut Document, comp: &LayerComp, all: bool) {
     let mut placed = Vec::new();
     for id in order {
         let Some(st) = comp.state(id) else { continue };
+        // Outside an alternate layout's reach the document stays as it is.
+        if !comp.applies_to(doc, id) {
+            continue;
+        }
         if pos && let Some(p) = &st.placement {
             // A placement the layer cannot take (another kind of layer now, a degenerate
             // transform, a pixel budget) leaves it where it is: a comp never fails to apply.
@@ -138,6 +142,16 @@ fn homography(a: &Affine) -> Homography {
 /// pixels to document pixels), with its affine form when it has one. None when `l` cannot take
 /// `p`: another kind of layer, nothing to place, a degenerate transform.
 fn placement_step(l: &Layer, p: &CompPlacement) -> Option<(Homography, Option<Affine>)> {
+    if let CompPlacement::Mask { bounds } = p {
+        let [x0, y0, x1, y1] = mask_bounds(l)?;
+        let [u0, v0, u1, v1] = *bounds;
+        let (sx, sy) = ((u1 - u0) / (x1 - x0), (v1 - v0) / (y1 - y0));
+        if !(sx.is_finite() && sy.is_finite() && sx > 0.0 && sy > 0.0) {
+            return None;
+        }
+        let a = Affine { m: [sx, 0.0, 0.0, sy, u0 - x0 * sx, v0 - y0 * sy] };
+        return Some((homography(&a), Some(a)));
+    }
     match (p, &l.content) {
         (CompPlacement::Transform { transform, perspective, .. }, LayerContent::Smart(sm)) => {
             let from = crate::smart_cmds::placement(sm);
@@ -177,6 +191,11 @@ pub fn apply_placement(doc: &mut Document, id: LayerId, p: &CompPlacement) -> Re
     }
     let Some((h, affine)) = placement_step(l, p) else { return Ok(false) };
     let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
+    if let (CompPlacement::Mask { .. }, Some(a)) = (p, affine) {
+        // Only the layer's own masks: a group's children have states of their own.
+        move_own_masks(l, &h, &a)?;
+        return Ok(true);
+    }
     let taken = crate::smart_cmds::take_caches(std::slice::from_mut(l));
     let locks = std::mem::take(&mut l.locks);
     let moved = crate::transform_cmds::transform_layer(None, Locks::default(), l, &h, affine, Interp::Bicubic);
@@ -220,9 +239,11 @@ pub(crate) fn validate_layout_edit(before: &Document, after: &Document) -> Resul
         };
         pixels || a.mask != b.mask || a.vector_mask != b.vector_mask
     }
+    let comp = before.editing_comp();
     for (_, _, layer) in after.walk() {
         let Some(old) = before.layer(layer.id) else { continue };
-        if !content_at_risk(old, layer) {
+        // Outside the layout's reach the document is edited as usual.
+        if !content_at_risk(old, layer) || comp.is_some_and(|c| !c.applies_to(before, layer.id)) {
             continue;
         }
         let mut expected = before.clone();
@@ -231,6 +252,12 @@ pub(crate) fn validate_layout_edit(before: &Document, after: &Document) -> Resul
             let shift = match (layer_placement(old), &placement) {
                 (Some(CompPlacement::Bounds(a)), CompPlacement::Bounds(b)) if a.width() == b.width() && a.height() == b.height() => {
                     b.x0.checked_sub(a.x0).zip(b.y0.checked_sub(a.y0))
+                }
+                // A group's masks moved by whole pixels (Move tool): the same lossless shift.
+                (Some(CompPlacement::Mask { bounds: a }), CompPlacement::Mask { bounds: b }) => {
+                    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                    let same = (b[2] - b[0] - (a[2] - a[0])).abs() < 1e-9 && (b[3] - b[1] - (a[3] - a[1])).abs() < 1e-9;
+                    (same && dx.fract() == 0.0 && dy.fract() == 0.0 && dx.abs() < 1e9 && dy.abs() < 1e9).then_some((dx as i32, dy as i32))
                 }
                 _ => None,
             };
@@ -248,6 +275,21 @@ pub(crate) fn validate_layout_edit(before: &Document, after: &Document) -> Resul
                 "Pixel, shape and mask edits cannot be kept while an alternate layout is shown. Choose Back to the document, then make this edit.".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+/// Moves `l`'s own pixel and vector masks by `h` (its affine form `a`), nothing else.
+fn move_own_masks(l: &mut Layer, h: &Homography, a: &Affine) -> Result<()> {
+    if let Some(m) = l.mask.as_mut() {
+        m.surface = crate::transform_cmds::warp_gray(&m.surface, h, Interp::Bicubic)?;
+    }
+    if let Some(vm) = l.vector_mask.as_mut() {
+        vm.path = vm.path.transform(a);
+    }
+    if let Some((x, y)) = l.effects.reference {
+        let p = a.apply(photocraft_geom::Point::new(x, y));
+        l.effects.reference = Some((p.x, p.y));
     }
     Ok(())
 }
@@ -277,15 +319,22 @@ fn show_layout(doc: &mut Document, comp: &LayerComp) {
 /// Delete Layer while an alternate layout is shown: the layers are hidden in the layout, never
 /// deleted from the document (a layer deleted from one arrangement would be gone from both).
 /// Leave the layout to delete.
-pub(crate) fn hide_in_layout(s: &mut Session, p: &Value) -> Result<Value> {
+/// None when no target is within the shown layout's reach (outside it Delete deletes).
+pub(crate) fn hide_in_layout(s: &mut Session, p: &Value) -> Result<Option<Value>> {
     let ids = crate::layer_multi_cmds::targets(s, p)?;
+    let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
+    let Some(comp) = doc.editing_comp() else { return Ok(None) };
+    let ids: Vec<LayerId> = ids.into_iter().filter(|id| comp.applies_to(doc, *id)).collect();
+    if ids.is_empty() {
+        return Ok(None);
+    }
     s.edit("Hide Layer in Alternate Layout", |doc, _| {
         for id in &ids {
             doc.layer_mut(*id).ok_or(EngineError::NoLayer(*id))?.visible = false;
         }
         Ok(())
     })?;
-    Ok(json!({"hidden": ids.iter().map(|l| l.0).collect::<Vec<_>>()}))
+    Ok(Some(json!({"hidden": ids.iter().map(|l| l.0).collect::<Vec<_>>()})))
 }
 
 fn new_comp(s: &mut Session, p: &Value) -> Result<Value> {
@@ -297,13 +346,29 @@ fn new_comp(s: &mut Session, p: &Value) -> Result<Value> {
     });
     let comment = p.get("comment").and_then(Value::as_str).unwrap_or_default().to_string();
     let alternate = flag(p, "alternate", false);
+    let document_label = p.get("documentLabel").and_then(Value::as_str).unwrap_or_default().to_string();
+    let scope: Vec<LayerId> = match p.get("scope") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(a)) if a.len() <= 10_000 => {
+            let mut ids = Vec::with_capacity(a.len());
+            for v in a {
+                let id = v.as_u64().map(LayerId).ok_or_else(|| bad("layerComp.new", "`scope` holds top-level layer ids"))?;
+                if !d.doc.layers.iter().any(|l| l.id == id) {
+                    return Err(bad("layerComp.new", format!("layer {} is not a top-level layer of the document", id.0)));
+                }
+                ids.push(id);
+            }
+            ids
+        }
+        Some(_) => return Err(bad("layerComp.new", "`scope` is a list of top-level layer ids")),
+    };
     // An alternate layout starts empty (every layer where the document has it) and never carries
     // appearance.
     let (v, pos, a) = (flag(p, "visibility", true), flag(p, "position", true), !alternate && flag(p, "appearance", true));
     let id = s.edit("New Layer Comp", |doc, _| {
         let id = next_comp_id(doc);
         let states = if alternate { Vec::new() } else { capture_states(doc) };
-        let comp = LayerComp { id, name, comment, apply_visibility: v, apply_position: pos, apply_appearance: a, alternate, states };
+        let comp = LayerComp { id, name, comment, apply_visibility: v, apply_position: pos, apply_appearance: a, alternate, scope, document_label, states };
         doc.layer_comps.push(comp);
         if !alternate {
             doc.last_applied_comp = Some(id);
@@ -407,6 +472,8 @@ fn apply(s: &mut Session, id: u32, label: &str) -> Result<Value> {
                 apply_position: true,
                 apply_appearance: true,
                 alternate: false,
+                scope: Vec::new(),
+                document_label: String::new(),
                 states,
             });
         }
@@ -628,7 +695,7 @@ fn list(s: &mut Session) -> Result<Value> {
             json!({
                 "id": c.id, "name": c.name, "comment": c.comment,
                 "visibility": c.apply_visibility, "position": c.apply_position, "appearance": c.apply_appearance,
-                "alternate": c.alternate,
+                "alternate": c.alternate, "scope": c.scope.iter().map(|l| l.0).collect::<Vec<_>>(), "documentLabel": c.document_label,
                 "layers": c.states.len(), "missingLayers": c.missing_layers(&d.doc).len(),
             })
         })
@@ -681,7 +748,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "layerComp.new",
             "New Layer Comp…",
             &[],
-            r##"{"name":str="Layer Comp N","comment":str="","visibility":bool=true,"position":bool=true,"appearance":bool=true,"alternate":bool=false (an alternate layout: starts empty, is shown and edited by Apply, records exact placement; never appearance)} → {comp}"##,
+            r##"{"name":str="Layer Comp N","comment":str="","visibility":bool=true,"position":bool=true,"appearance":bool=true,"alternate":bool=false (an alternate layout: starts empty, is shown and edited by Apply, records exact placement; never appearance),"scope":[top-level layer id]? (an alternate layout's reach: those artboards only),"documentLabel":str? (what a switch calls the document's own arrangement)} → {comp}"##,
             has_doc,
             new_comp
         ),
@@ -731,7 +798,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 "layerComp.list",
                 "List Layer Comps",
                 &[],
-                "{} → {comps:[{id,name,comment,visibility,position,appearance,alternate,layers,missingLayers}],lastApplied,hasLastDocumentState,showing (the alternate layout shown, or null)}",
+                "{} → {comps:[{id,name,comment,visibility,position,appearance,alternate,scope,documentLabel,layers,missingLayers}],lastApplied,hasLastDocumentState,showing (the alternate layout shown, or null)}",
                 has_doc,
                 |s, _| list(s)
             )

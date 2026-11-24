@@ -339,7 +339,7 @@ fn effects_m(e: &Effects, sink: &mut dyn Sink) -> Result<EffectsM> {
 fn comp_m(c: &LayerComp, sink: &mut dyn Sink) -> Result<LayerCompM> {
     sink.check()?;
     // Destructured so a new `LayerComp` field fails to compile here until it is saved.
-    let LayerComp { id, name, comment, apply_visibility, apply_position, apply_appearance, alternate, states } = c;
+    let LayerComp { id, name, comment, apply_visibility, apply_position, apply_appearance, alternate, scope, document_label, states } = c;
     Ok(LayerCompM {
         id: *id,
         name: name.clone(),
@@ -348,6 +348,8 @@ fn comp_m(c: &LayerComp, sink: &mut dyn Sink) -> Result<LayerCompM> {
         apply_position: *apply_position,
         apply_appearance: *apply_appearance,
         alternate: *alternate,
+        scope: scope.iter().map(|l| l.0).collect(),
+        document_label: document_label.clone(),
         states: states
             .iter()
             .map(|s| {
@@ -362,6 +364,7 @@ fn comp_m(c: &LayerComp, sink: &mut dyn Sink) -> Result<LayerCompM> {
                             CompPlacementM::Transform { transform: *transform, perspective: *perspective, text_box: *text_box }
                         }
                         CompPlacement::Bounds(rect) => CompPlacementM::Bounds { rect: *rect },
+                        CompPlacement::Mask { bounds } => CompPlacementM::Mask { bounds: *bounds },
                     }),
                     appearance: appearance
                         .as_ref()
@@ -506,6 +509,7 @@ impl Loader<'_> {
                     CompPlacement::Transform { transform: *transform, perspective: *perspective, text_box: *text_box }
                 }
                 CompPlacementM::Bounds { rect } => CompPlacement::Bounds(*rect),
+                CompPlacementM::Mask { bounds } => CompPlacement::Mask { bounds: *bounds },
             });
             states.push(CompLayerState { layer, visible: s.visible, position: s.position, appearance, placement });
         }
@@ -517,6 +521,9 @@ impl Loader<'_> {
             apply_position: m.apply_position,
             apply_appearance: m.apply_appearance,
             alternate: m.alternate,
+            // A top-level layer the scope names that is gone keeps a dangling id, as states do.
+            scope: m.scope.iter().map(|l| self.id_map.get(l).copied().unwrap_or(LayerId(u64::MAX - l.min(&(u64::MAX / 2))))).collect(),
+            document_label: m.document_label.clone(),
             states,
         })
     }
@@ -835,6 +842,8 @@ mod tests {
             apply_position: false,
             apply_appearance: false,
             alternate: false,
+            scope: Vec::new(),
+            document_label: String::new(),
             states: layers.iter().map(|l| CompLayerState { layer: l.id, visible: Some(true), position: None, appearance: None, placement: None }).collect(),
         };
         assert!(matches!(comp_m(&comp, &mut CancelAfter(std::cell::Cell::new(0))), Err(FormatError::Cancelled(_))));

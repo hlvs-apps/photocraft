@@ -531,8 +531,10 @@ fn build() -> Vec<CommandSpec> {
             r##"{"layer":id?} (no layer: every selected layer; while an alternate layout is shown: hidden in it instead)"##,
             has_layer,
             |s, p| {
-                if s.active().is_some_and(|d| d.doc.comp_edit.is_some()) {
-                    return crate::comps_cmds::hide_in_layout(s, p);
+                if s.active().is_some_and(|d| d.doc.comp_edit.is_some())
+                    && let Some(hidden) = crate::comps_cmds::hide_in_layout(s, p)?
+                {
+                    return Ok(hidden);
                 }
                 if crate::layer_multi_cmds::multi(s, p) {
                     return crate::layer_multi_cmds::delete_selected(s);

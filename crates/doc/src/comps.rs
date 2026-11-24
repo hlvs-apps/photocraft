@@ -50,6 +50,11 @@ pub enum CompPlacement {
     /// A layer drawn from its own pixels (a raster layer, a shape's rendering): its content
     /// bounds in document pixels. Showing it transforms the layer onto them.
     Bounds(Rect),
+    /// A layer without a place of its own whose masks frame it (a group, an adjustment or fill
+    /// layer): the bounds `[x0, y0, x1, y1]` of its vector mask's anchors and control points, else
+    /// of its pixel mask's content. Showing it moves and scales its own masks onto them (a group's
+    /// children carry states of their own).
+    Mask { bounds: [f64; 4] },
 }
 
 /// An alternate layout being shown: the comp and every layer as the document had it when it was
@@ -86,6 +91,13 @@ pub struct LayerComp {
     /// shown and edited rather than applied over the document (see the module docs). Not part of
     /// a PSD comp: a PSD writes it as an ordinary comp of what it records there.
     pub alternate: bool,
+    /// An alternate layout's reach: the top-level layers (artboards, pages) it applies to; empty
+    /// is the whole document. Outside it the layout records nothing and showing it changes nothing,
+    /// so the document is edited there as usual.
+    pub scope: Vec<LayerId>,
+    /// How a switch between the document and this alternate layout names the document's own
+    /// arrangement ("" = Document).
+    pub document_label: String,
     /// Per-layer state, in document walk order.
     pub states: Vec<CompLayerState>,
 }
@@ -102,6 +114,11 @@ impl LayerComp {
     }
     pub fn state(&self, id: LayerId) -> Option<&CompLayerState> {
         self.states.iter().find(|s| s.layer == id)
+    }
+    /// Whether the comp reaches layer `id` of `doc` (see [`Self::scope`]): always for an empty
+    /// scope, else when its top-level layer is in the scope.
+    pub fn applies_to(&self, doc: &Document, id: LayerId) -> bool {
+        self.scope.is_empty() || doc.path_of(id).and_then(|p| doc.layers.get(*p.first()?)).is_some_and(|top| self.scope.contains(&top.id))
     }
     /// Ids of recorded layers that no longer exist in `doc` (Photoshop's warning triangle).
     pub fn missing_layers(&self, doc: &Document) -> Vec<LayerId> {
@@ -158,8 +175,23 @@ pub fn layer_placement(l: &Layer) -> Option<CompPlacement> {
             let r = position_bounds(l);
             (!r.is_empty()).then_some(CompPlacement::Bounds(r))
         }
+        LayerContent::Group(g) if g.artboard.is_none() => mask_bounds(l).map(|bounds| CompPlacement::Mask { bounds }),
+        LayerContent::Adjustment(_) | LayerContent::Fill(_) => mask_bounds(l).map(|bounds| CompPlacement::Mask { bounds }),
         _ => None,
     }
+}
+
+/// [`CompPlacement::Mask`]'s bounds of `l`: its vector mask's anchors and control points, else
+/// its pixel mask's content; None without either.
+pub fn mask_bounds(l: &Layer) -> Option<[f64; 4]> {
+    if let Some((x0, y0, x1, y1)) = l.vector_mask.as_ref().and_then(|vm| vm.path.control_bounds())
+        && x1 > x0
+        && y1 > y0
+    {
+        return Some([x0, y0, x1, y1]);
+    }
+    let r = l.mask.as_ref()?.surface.content_bounds();
+    (!r.is_empty()).then(|| [f64::from(r.x0), f64::from(r.y0), f64::from(r.x1), f64::from(r.y1)])
 }
 
 impl Document {
@@ -180,7 +212,15 @@ impl Document {
         let edit = self.comp_edit.take()?;
         let base: HashMap<LayerId, &Layer> = edit.base.iter().map(|l| (l.id, l)).collect();
         let shown: HashMap<LayerId, &CompPlacement> = edit.shown.iter().map(|(id, p)| (*id, p)).collect();
-        let live: Vec<(LayerId, bool, Option<CompPlacement>)> = self.walk().into_iter().map(|(_, _, l)| (l.id, l.visible, layer_placement(l))).collect();
+        // Outside the layout's reach the document was edited as usual: nothing is recorded there
+        // and nothing put back.
+        let reach = self.comp(edit.comp).map(|c| c.scope.clone()).unwrap_or_default();
+        let inside = |doc: &Document, id: LayerId| {
+            reach.is_empty() || doc.path_of(id).and_then(|p| doc.layers.get(*p.first()?)).is_some_and(|top| reach.contains(&top.id))
+        };
+        let live: Vec<(LayerId, bool, Option<CompPlacement>)> =
+            self.walk().into_iter().filter(|(_, _, l)| inside(self, l.id)).map(|(_, _, l)| (l.id, l.visible, layer_placement(l))).collect();
+        let reached: HashSet<LayerId> = live.iter().map(|(id, _, _)| *id).collect();
         if let Some(comp) = self.layer_comps.iter_mut().find(|c| c.id == edit.comp) {
             let ids: HashSet<LayerId> = live.iter().map(|(id, _, _)| *id).collect();
             let mut states = Vec::with_capacity(live.len());
@@ -206,10 +246,11 @@ impl Document {
                     states.push(st);
                 }
             }
+            // States of layers deleted meanwhile, or now outside its reach, stay as they were.
             states.extend(comp.states.iter().filter(|s| !ids.contains(&s.layer)).cloned());
             comp.states = states;
         }
-        restore_tree(&mut self.layers, &base);
+        restore_tree(&mut self.layers, &base, &reached);
         if self.last_applied_comp == Some(edit.comp) {
             self.last_applied_comp = None;
         }
@@ -229,15 +270,18 @@ impl Document {
     }
 }
 
-/// [`Document::leave_comp_edit`]'s restore, over a stack and its groups.
-fn restore_tree(layers: &mut [Layer], base: &HashMap<LayerId, &Layer>) {
+/// [`Document::leave_comp_edit`]'s restore, over a stack and its groups: the layers the layout
+/// reaches (`reached`) only.
+fn restore_tree(layers: &mut [Layer], base: &HashMap<LayerId, &Layer>, reached: &HashSet<LayerId>) {
     for l in layers.iter_mut() {
-        match base.get(&l.id) {
-            None => l.visible = false,
-            Some(b) => restore_layout(l, b),
+        if reached.contains(&l.id) {
+            match base.get(&l.id) {
+                None => l.visible = false,
+                Some(b) => restore_layout(l, b),
+            }
         }
         if let Some(ch) = l.children_mut() {
-            restore_tree(ch, base);
+            restore_tree(ch, base, reached);
         }
     }
 }
@@ -434,6 +478,8 @@ mod tests {
             apply_position: false,
             apply_appearance: false,
             alternate: false,
+            scope: Vec::new(),
+            document_label: String::new(),
             states: vec![],
         };
         c.set_captured_info(5);
@@ -453,6 +499,8 @@ mod tests {
             apply_position: true,
             apply_appearance: true,
             alternate: false,
+            scope: Vec::new(),
+            document_label: String::new(),
             states,
         });
         assert_eq!(d.layer_comps[0].id, 1);
@@ -477,6 +525,8 @@ mod tests {
             apply_position: true,
             apply_appearance: false,
             alternate: true,
+            scope: Vec::new(),
+            document_label: String::new(),
             states,
         }
     }

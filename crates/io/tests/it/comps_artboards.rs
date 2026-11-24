@@ -144,6 +144,8 @@ fn synthetic(depth: SampleType) -> Document {
         apply_position: true,
         apply_appearance: false,
         alternate: false,
+        scope: Vec::new(),
+        document_label: String::new(),
         states,
     });
     d.layers[1].visible = false;
@@ -160,6 +162,8 @@ fn synthetic(depth: SampleType) -> Document {
         apply_position: false,
         apply_appearance: true,
         alternate: false,
+        scope: Vec::new(),
+        document_label: String::new(),
         states,
     });
     d.last_applied_comp = Some(12);
@@ -217,6 +221,8 @@ fn synthetic_pcraft_roundtrip_keeps_everything() {
         apply_position: true,
         apply_appearance: true,
         alternate: false,
+        scope: Vec::new(),
+        document_label: String::new(),
         states: capture_states(&d),
     });
     let bytes = photocraft_format::save_to_bytes(&d, &Default::default()).unwrap();
@@ -309,6 +315,8 @@ fn out_of_range_comp_offsets_import_and_export_without_panic() {
         apply_position: true,
         apply_appearance: false,
         alternate: false,
+        scope: Vec::new(),
+        document_label: String::new(),
         states: vec![st],
     });
     let back = import("x.psd", &to_psd(&d)).unwrap().document;
