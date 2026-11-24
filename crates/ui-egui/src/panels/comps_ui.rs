@@ -4,6 +4,11 @@
 //! (layers deleted since capture) and the three apply toggles (visibility, position,
 //! appearance). Footer: previous / next comp, update, new, delete. Every action is a
 //! `layerComp.*` engine command; the selection is `UiState::layer_comp_selected`.
+//!
+//! An alternate layout (an embedding app's second arrangement of the same layers) has a layout
+//! icon and no appearance toggle; its apply marker shows it for editing. While one is shown a
+//! banner above the rows says so and leads back to the document (the Last Document State row
+//! does the same).
 
 use egui::{Align2, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::{Value, json};
@@ -67,6 +72,21 @@ fn run(app: &mut PhotocraftApp, id: &str, p: Value) {
     }
 }
 
+/// An alternate layout's icon before its name (accented while it is shown), with its hover
+/// help; returns where the name starts (unchanged for an ordinary comp).
+fn layout_icon(ui: &mut egui::Ui, resp: &egui::Response, rect: Rect, name_x: f32, comp: &photocraft_doc::LayerComp, shown: bool) -> f32 {
+    if !comp.alternate {
+        return name_x;
+    }
+    let t = Tokens::get(ui.ctx());
+    let r = Rect::from_center_size(pos2(name_x + 7.0, rect.center().y), vec2(14.0, 14.0));
+    crate::icons::paint(ui, r, "panels-top-left", 12.0, if shown { t.accent } else { t.icon });
+    if ui.rect_contains_pointer(r) {
+        resp.clone().on_hover_text(tl!("Alternate layout: click the box to show and change it; the document keeps its own arrangement."));
+    }
+    name_x + 18.0
+}
+
 #[derive(Clone, Copy)]
 struct DragComp {
     document: photocraft_doc::DocId,
@@ -91,6 +111,24 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let mut action: Option<(&'static str, Value)> = None;
     let mut select: Option<u32> = None;
     let row_h = 26.0;
+    // The Last Document State row restores it after a comp was applied, and leaves an alternate
+    // layout that is shown.
+    let can_restore = (doc.last_document_state.is_some() && applied.is_some()) || doc.comp_edit.is_some();
+    if let Some(shown) = doc.editing_comp() {
+        // Edits now change the layout, not the document: say so where the comps are.
+        ui.label(
+            egui::RichText::new(crate::i18n::fmt(
+                tl!("Showing \u{201c}{name}\u{201d}: visibility, position, size and rotation you change apply to this layout only."),
+                &[("name", &shown.name)],
+            ))
+            .color(t.accent)
+            .size(11.5),
+        );
+        if ui.button(tl!("Back to the document")).clicked() {
+            action = Some(("layerComp.restoreLastDocumentState", json!({})));
+        }
+        ui.add_space(4.0);
+    }
     egui::ScrollArea::vertical().id_salt("comps-rows").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
         // Last Document State.
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
@@ -111,7 +149,7 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             egui::FontId::proportional(12.0),
             t.text_dim,
         );
-        if resp.clicked() && doc.last_document_state.is_some() && applied.is_some() {
+        if resp.clicked() && can_restore {
             action = Some(("layerComp.restoreLastDocumentState", json!({})));
         }
         ui.painter().line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, t.separator));
@@ -164,12 +202,14 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             if applied == Some(c.id) {
                 crate::icons::paint(ui, marker, "check", 10.0, t.accent);
             }
-            // The three apply toggles, right-aligned.
-            let toggles = [
+            // The three apply toggles, right-aligned. An alternate layout records placement and
+            // visibility only.
+            let all_toggles = [
                 ("eye", tl!("Visibility"), c.apply_visibility, "visibility"),
                 ("move", tl!("Position"), c.apply_position, "position"),
                 ("sparkles", tl!("Appearance (Layer Style)"), c.apply_appearance, "appearance"),
             ];
+            let toggles = &all_toggles[..3 - usize::from(c.alternate)];
             let mut x = rect.right() - 14.0;
             let mut toggle_hit = false;
             for (icon, tip, on, key) in toggles.iter().rev() {
@@ -192,6 +232,7 @@ pub fn panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             }
             let missing = c.missing_layers(&doc).len();
             let mut name_x = rect.left() + 30.0;
+            name_x = layout_icon(ui, &resp, rect, name_x, c, applied == Some(c.id));
             if missing > 0 {
                 let r = Rect::from_center_size(pos2(name_x + 7.0, rect.center().y), vec2(14.0, 14.0));
                 crate::icons::paint(ui, r, "triangle-alert", 12.0, t.warning);
@@ -319,6 +360,24 @@ mod tests {
         assert_eq!(doc.layer_comps.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Second", "Third", "First"]);
         assert_eq!(doc.last_applied_comp, applied);
         assert_eq!(app.ui.layer_comp_selected, Some(first));
+    }
+
+    #[test]
+    fn a_shown_alternate_layout_has_a_banner_that_leads_back_to_the_document() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = PhotocraftApp::new(Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 16, "height": 16})).unwrap();
+        let c = app.run("layerComp.new", json!({"name": "QR off", "alternate": true})).unwrap()["comp"].as_u64().unwrap() as u32;
+        let mut h = Harness::builder().with_size(vec2(360.0, 300.0)).build_ui_state(|ui, app| panel(app, ui), app);
+        h.run_steps(3);
+        assert!(h.query_by_label("Back to the document").is_none(), "nothing is shown yet");
+        h.state_mut().run("layerComp.apply", json!({"comp": c})).unwrap();
+        h.run_steps(3);
+        assert_eq!(h.state().session.active().unwrap().doc.comp_edit.as_ref().map(|e| e.comp), Some(c));
+        h.get_by_label("Back to the document").click();
+        h.run_steps(3);
+        let doc = &h.state().session.active().unwrap().doc;
+        assert!(doc.comp_edit.is_none() && doc.last_applied_comp.is_none());
     }
 
     #[test]

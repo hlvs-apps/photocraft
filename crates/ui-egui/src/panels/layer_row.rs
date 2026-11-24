@@ -168,7 +168,8 @@ pub(super) fn layer_row(
         + 28.0
         + if l.is_group() { crate::layer_tree_ui::TRIANGLE_W } else { 0.0 }
         + if l.clipped { 12.0 } else { 0.0 }
-        + crate::layer_row_ui::reserved_width(l);
+        + crate::layer_row_ui::reserved_width(l)
+        + crate::layer_row_ui::layout_width(crate::layer_row_ui::layout_of(doc, l));
     let ts = if base == 0.0 { 0.0 } else { crate::mask_thumbs_ui::thumb_size(l, base, rect.width() - others) };
     let fixed = others + if ts == 0.0 { 0.0 } else { ts + 6.0 + crate::mask_thumbs_ui::width(l, ts) };
     // A layer inside a group (or an artboard) indents one step more than its depth, past the
@@ -192,7 +193,9 @@ pub(super) fn layer_row(
     paint_target_brackets(app, &painter, &t, &rc);
     // Right-hand indicators first; the name gets what is left and ends in "…" (#144).
     let fx_open = app.session.active().is_none_or(|d| !d.fx_collapsed.contains(&l.id));
-    let (name_right, indicators, fx_toggled) = crate::layer_row_ui::indicators(ui, &painter, rect, x, l, fx_open, actions);
+    let layout = crate::layer_row_ui::layout_of(doc, l);
+    let state = crate::layer_row_ui::RowState { fx_open, alternate: layout };
+    let (name_right, indicators, fx_toggled) = crate::layer_row_ui::indicators(ui, &painter, rect, x, l, state, actions);
     // Dragging the fx badge drags all the layer's effects, not the layer (Photoshop). Like the eye,
     // it takes the drag from the row; clicks still reach the row.
     if let Some(&(_, badge)) = indicators.iter().find(|(k, _)| *k == crate::layer_row_ui::Indicator::Fx)

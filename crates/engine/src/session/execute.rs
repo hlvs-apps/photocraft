@@ -218,6 +218,7 @@ impl Session {
         if let Some(id) = filter_mask_layer {
             smart_cmds::refresh_after_filter_mask_edit(&mut doc, id)?;
         }
+        crate::comps_cmds::validate_layout_edit(&before, &doc)?;
         st.doc = Arc::new(doc);
         st.active_layer = active;
         fix_selection(st);

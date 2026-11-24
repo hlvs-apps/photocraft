@@ -3526,3 +3526,8 @@ curves	Smooth	Glätten
 	The last page tab stays open. File › Close closes the document.	Die letzte Seiten-Registerkarte bleibt geöffnet. Datei › Schließen schließt das Dokument.
 	The page is already the first.	Die Seite ist bereits die erste.
 	The page is already the last.	Die Seite ist bereits die letzte.
+	Showing “{name}”: visibility, position, size and rotation you change apply to this layout only.	„{name}“ wird angezeigt: Sichtbarkeit, Position, Größe und Drehung, die Sie ändern, gelten nur für dieses Layout.
+	Back to the document	Zurück zum Dokument
+	Alternate layout: click the box to show and change it; the document keeps its own arrangement.	Alternatives Layout: Klicken Sie auf das Kästchen, um es anzuzeigen und zu ändern; das Dokument behält seine eigene Anordnung.
+	Placed or shown differently in “{name}”	In „{name}“ anders platziert oder sichtbar
+	“{name}” does not apply to this page	„{name}“ gilt nicht für diese Seite

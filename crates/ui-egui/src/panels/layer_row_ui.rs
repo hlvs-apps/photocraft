@@ -1,7 +1,8 @@
 //! Layers panel row: the right-hand indicators and the name between them and the thumbnails
 //! (#144).
 //!
-//! The indicators (lock, fx badge with its effects triangle, link, the blend-mode label) are
+//! The indicators (lock, fx badge with its effects triangle, link, the alternate-layout badge,
+//! the blend-mode label) are
 //! laid out first, from the row's right edge inward; the name gets the width that is left and
 //! is cut with an ellipsis, so a long name never runs under an indicator at any panel width or
 //! UI scale. The blend-mode label is optional: it is dropped before the name gets too narrow.
@@ -37,6 +38,8 @@ pub enum Indicator {
     Fx,
     SmartFilters,
     Link,
+    /// The layer is placed or shown differently in the alternate layout being shown.
+    Layout,
     Blend,
 }
 
@@ -107,6 +110,26 @@ pub fn reserved_width(l: &Layer) -> f32 {
     w
 }
 
+/// What a row's indicators show besides the layer itself.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RowState<'a> {
+    /// The layer's effects rows are open (the triangle points down).
+    pub fx_open: bool,
+    /// The alternate layout being shown places or shows the layer differently: its name.
+    pub alternate: Option<&'a str>,
+}
+
+/// Width the alternate-layout badge takes (see [`layout_of`]).
+pub fn layout_width(layout: Option<&str>) -> f32 {
+    if layout.is_some() { ICON_W + GAP } else { 0.0 }
+}
+
+/// The name of the alternate layout being shown when it places or shows `l` differently from
+/// the document (the comp has a state for it), for the row's badge.
+pub fn layout_of<'a>(doc: &'a photocraft_doc::Document, l: &Layer) -> Option<&'a str> {
+    doc.editing_comp().filter(|c| c.state(l.id).is_some()).map(|c| c.name.as_str())
+}
+
 /// Group indentation for a row at `depth`: 14 pt a level, squeezed when the panel is so narrow
 /// that it would leave the name less than [`MIN_NAME_W`] (`fixed` = everything else in the row).
 pub fn indent(depth: usize, row_width: f32, fixed: f32) -> f32 {
@@ -146,9 +169,10 @@ pub fn indicators(
     row: Rect,
     name_left: f32,
     l: &Layer,
-    fx_open: bool,
+    state: RowState<'_>,
     actions: &mut Vec<(String, Value)>,
 ) -> (f32, Vec<(Indicator, Rect)>, bool) {
+    let RowState { fx_open, alternate } = state;
     let t = Tokens::get(ui.ctx());
     let locked = l.locks.any();
     let fx_font = theme::semibold(11.0);
@@ -178,6 +202,9 @@ pub fn indicators(
     if l.link_group.is_some() {
         items.push((Indicator::Link, ICON_W));
     }
+    if alternate.is_some() {
+        items.push((Indicator::Layout, ICON_W));
+    }
     if let Some(g) = &blend_galley {
         items.push((Indicator::Blend, g.size().x));
     }
@@ -194,6 +221,7 @@ pub fn indicators(
             }
             Indicator::Lock => icons::paint(ui, Rect::from_center_size(r.center(), vec2(ICON_W, ICON_W)), "lock", 12.0, t.text_faint),
             Indicator::Link => icons::paint(ui, Rect::from_center_size(r.center(), vec2(ICON_W, ICON_W)), "link-2", 12.0, t.text_faint),
+            Indicator::Layout => layout_badge(ui, r, l, alternate.unwrap_or_default(), t.accent),
             Indicator::Fx => {
                 if let Some(g) = fx_galley.clone() {
                     painter.galley(pos2(r.left(), cy - g.size().y / 2.0), g, t.text_dim);
@@ -233,6 +261,13 @@ pub fn indicators(
         }
     }
     (name_right, rects, clicked)
+}
+
+/// The alternate-layout badge with its hover help.
+fn layout_badge(ui: &egui::Ui, r: Rect, l: &Layer, name: &str, color: egui::Color32) {
+    icons::paint(ui, Rect::from_center_size(r.center(), vec2(ICON_W, ICON_W)), "panels-top-left", 12.0, color);
+    let tip = crate::i18n::fmt(tl!("Placed or shown differently in \u{201c}{name}\u{201d}"), &[("name", name)]);
+    ui.interact(r, ui.scope_id().with(("row-layout", l.id.0)), Sense::hover()).on_hover_text(tip);
 }
 
 /// A small disclosure triangle: pointing down when open, right when closed.

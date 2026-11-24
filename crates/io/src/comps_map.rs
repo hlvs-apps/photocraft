@@ -198,6 +198,9 @@ pub(crate) fn decode_comps(resource: Option<&[u8]>, doc: &Document) -> (Vec<Laye
                 apply_visibility: false,
                 apply_position: false,
                 apply_appearance: false,
+                alternate: false,
+                scope: Vec::new(),
+                document_label: String::new(),
                 states: Vec::new(),
             };
             comp.set_captured_info(int(c, "capturedInfo").unwrap_or(0) as i32);
@@ -220,6 +223,9 @@ pub(crate) fn decode_comps(resource: Option<&[u8]>, doc: &Document) -> (Vec<Laye
         apply_visibility: true,
         apply_position: true,
         apply_appearance: false,
+        alternate: false,
+        scope: Vec::new(),
+        document_label: String::new(),
         states: Vec::new(),
     };
     for (_, _, l) in doc.walk() {
@@ -255,7 +261,7 @@ pub(crate) fn decode_comps(resource: Option<&[u8]>, doc: &Document) -> (Vec<Laye
                 if visible.is_none() && s.offset.is_none() {
                     continue;
                 }
-                c.states.push(CompLayerState { layer: l.id, visible, position, appearance: None });
+                c.states.push(CompLayerState { layer: l.id, visible, position, appearance: None, placement: None });
             }
         }
     }
@@ -386,7 +392,10 @@ mod tests {
             apply_visibility: true,
             apply_position: true,
             apply_appearance: false,
-            states: vec![CompLayerState { layer: lid, visible: Some(false), position: Some((10, 1)), appearance: None }],
+            alternate: false,
+            scope: Vec::new(),
+            document_label: String::new(),
+            states: vec![CompLayerState { layer: lid, visible: Some(false), position: Some((10, 1)), appearance: None, placement: None }],
         });
         d.last_applied_comp = Some(7);
         let res = write_comps_resource(&d).unwrap();
@@ -434,6 +443,9 @@ mod tests {
             apply_visibility: true,
             apply_position: true,
             apply_appearance: false,
+            alternate: false,
+            scope: Vec::new(),
+            document_label: String::new(),
             states: Vec::new(),
         };
         // c4 records positions only: it never takes a visibility.
@@ -545,7 +557,10 @@ mod tests {
             apply_visibility: true,
             apply_position: true,
             apply_appearance: false,
-            states: vec![CompLayerState { layer: l.id, visible: Some(false), position, appearance: None }],
+            alternate: false,
+            scope: Vec::new(),
+            document_label: String::new(),
+            states: vec![CompLayerState { layer: l.id, visible: Some(false), position, appearance: None, placement: None }],
         };
         for p in [(i32::MIN, 0), (0, i32::MIN)] {
             let cm = write_cmls(&[comp(Some(p))], None, &l, 1).unwrap();

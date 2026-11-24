@@ -28,6 +28,7 @@ mod gesture;
 pub mod gpu_canvas;
 pub mod guide_select;
 pub mod layer_pick_ui;
+pub mod layout_switch;
 pub mod move_ui;
 mod navigator;
 pub mod outline;
@@ -2116,6 +2117,10 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
             zoom_out: &zoom_out,
         };
         paint_primary_overlays(app, ui, &mut view, &input);
+    }
+    if primary {
+        // The document's alternate layouts, switched from the canvas (its Layer Comps work too).
+        layout_switch::show(app, &ctx, rect, idx, view.page);
     }
     let tail = CanvasTailInput {
         ctx: &ctx,
